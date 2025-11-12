@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 module bridge::bridge;
+
 use bridge::chain_ids;
 use bridge::committee::{Self, BridgeCommittee};
 use bridge::limiter::{Self, TransferLimiter};
@@ -81,7 +82,7 @@ public struct TokenDepositedEventV2 has copy, drop {
     target_address: vector<u8>,
     token_type: u8,
     amount: u64,
-    timestamp: u64,
+    timestamp_ms: u64,
 }
 
 public struct EmergencyOpEvent has copy, drop {
@@ -199,11 +200,7 @@ public fun committee_registration(
         .register(system_state, bridge_pubkey_bytes, http_rest_url, ctx);
 }
 
-public fun update_node_url(
-    bridge: &mut Bridge,
-    new_url: vector<u8>,
-    ctx: &TxContext,
-) {
+public fun update_node_url(bridge: &mut Bridge, new_url: vector<u8>, ctx: &TxContext) {
     load_inner_mut(bridge).committee.update_node_url(new_url, ctx);
 }
 
@@ -227,10 +224,7 @@ public fun send_token<T>(
 ) {
     let inner = load_inner_mut(bridge);
     assert!(!inner.paused, EBridgeUnavailable);
-    assert!(
-        chain_ids::is_valid_route(inner.chain_id, target_chain),
-        EInvalidBridgeRoute,
-    );
+    assert!(chain_ids::is_valid_route(inner.chain_id, target_chain), EInvalidBridgeRoute);
     assert!(target_address.length() == EVM_ADDRESS_LENGTH, EInvalidEvmAddress);
 
     let bridge_seq_num = inner.get_current_seq_num_and_increment(
@@ -290,10 +284,7 @@ public fun send_token_v2<T>(
 ) {
     let inner = load_inner_mut(bridge);
     assert!(!inner.paused, EBridgeUnavailable);
-    assert!(
-        chain_ids::is_valid_route(inner.chain_id, target_chain),
-        EInvalidBridgeRoute,
-    );
+    assert!(chain_ids::is_valid_route(inner.chain_id, target_chain), EInvalidBridgeRoute);
     assert!(target_address.length() == EVM_ADDRESS_LENGTH, EInvalidEvmAddress);
 
     let bridge_seq_num = inner.get_current_seq_num_and_increment(
@@ -355,14 +346,8 @@ public fun approve_token_transfer(
     // verify signatures
     inner.committee.verify_signatures(message, signatures);
 
-    assert!(
-        message.message_type() == message_types::token(),
-        EMustBeTokenMessage,
-    );
-    assert!(
-        message.message_version() == MESSAGE_VERSION,
-        EUnexpectedMessageVersion,
-    );
+    assert!(message.message_type() == message_types::token(), EMustBeTokenMessage);
+    assert!(message.message_version() == MESSAGE_VERSION, EUnexpectedMessageVersion);
     let token_payload = message.extract_token_bridge_payload();
     let target_chain = token_payload.token_target_chain();
     assert!(
@@ -378,10 +363,7 @@ public fun approve_token_transfer(
         let record = &mut inner.token_transfer_records[message_key];
 
         assert!(record.message == message, EMalformedMessageError);
-        assert!(
-            !record.claimed,
-            EInvariantSuiInitializedTokenTransferShouldNotBeClaimed,
-        );
+        assert!(!record.claimed, EInvariantSuiInitializedTokenTransferShouldNotBeClaimed);
 
         // If record already has verified signatures, it means the message has been approved
         // Then we exit early.
@@ -467,10 +449,7 @@ public fun execute_system_message(
     let message_type = message.message_type();
 
     // TODO: test version mismatch
-    assert!(
-        message.message_version() == MESSAGE_VERSION,
-        EUnexpectedMessageVersion,
-    );
+    assert!(message.message_version() == MESSAGE_VERSION, EUnexpectedMessageVersion);
     let inner = load_inner_mut(bridge);
 
     assert!(message.source_chain() == inner.chain_id, EUnexpectedChainID);
@@ -508,11 +487,7 @@ public fun execute_system_message(
 //
 
 #[allow(unused_function)]
-fun get_token_transfer_action_status(
-    bridge: &Bridge,
-    source_chain: u8,
-    bridge_seq_num: u64,
-): u8 {
+fun get_token_transfer_action_status(bridge: &Bridge, source_chain: u8, bridge_seq_num: u64): u8 {
     let inner = load_inner(bridge);
     let key = message::create_key(
         source_chain,
@@ -597,18 +572,12 @@ fun claim_token_internal<T>(
         message_types::token(),
         bridge_seq_num,
     );
-    assert!(
-        inner.token_transfer_records.contains(key),
-        EMessageNotFoundInRecords,
-    );
+    assert!(inner.token_transfer_records.contains(key), EMessageNotFoundInRecords);
 
     // retrieve approved bridge message
     let record = &mut inner.token_transfer_records[key];
     // ensure this is a token bridge message
-    assert!(
-        &record.message.message_type() == message_types::token(),
-        EUnexpectedMessageType,
-    );
+    assert!(&record.message.message_type() == message_types::token(), EUnexpectedMessageType);
     // Ensure it's signed
     assert!(record.verified_signatures.is_some(), EUnauthorisedClaim);
 
@@ -616,9 +585,7 @@ fun claim_token_internal<T>(
     let token_payload = record.message.extract_token_bridge_payload();
     let mut bypass_limiter = false;
     if (record.message.message_version() == 2) {
-        let timestamp = record
-            .message
-            .extract_token_bridge_payload_v2_timestamp();
+        let timestamp = record.message.extract_token_bridge_payload_v2_timestamp();
         // if token_payload.timestamp is within the last 48 hours, bypass the limiter
         if (clock.timestamp_ms() < timestamp + 48 * 3600000) {
             bypass_limiter = true;
@@ -691,10 +658,7 @@ fun execute_emergency_op(inner: &mut BridgeInner, payload: EmergencyOp) {
     };
 }
 
-fun execute_update_bridge_limit(
-    inner: &mut BridgeInner,
-    payload: UpdateBridgeLimit,
-) {
+fun execute_update_bridge_limit(inner: &mut BridgeInner, payload: UpdateBridgeLimit) {
     let receiving_chain = payload.update_bridge_limit_payload_receiving_chain();
     assert!(receiving_chain == inner.chain_id, EUnexpectedChainID);
     let route = chain_ids::get_route(
@@ -710,10 +674,7 @@ fun execute_update_bridge_limit(
         )
 }
 
-fun execute_update_asset_price(
-    inner: &mut BridgeInner,
-    payload: UpdateAssetPrice,
-) {
+fun execute_update_asset_price(inner: &mut BridgeInner, payload: UpdateAssetPrice) {
     inner
         .treasury
         .update_asset_notional_price(
@@ -730,31 +691,20 @@ fun execute_add_tokens_on_sui(inner: &mut BridgeInner, payload: AddTokenOnSui) {
     let mut token_prices = payload.token_prices();
 
     // Make sure token data is consistent
-    assert!(
-        token_ids.length() == token_type_names.length(),
-        EMalformedMessageError,
-    );
-    assert!(
-        token_ids.length() == token_prices.length(),
-        EMalformedMessageError,
-    );
+    assert!(token_ids.length() == token_type_names.length(), EMalformedMessageError);
+    assert!(token_ids.length() == token_prices.length(), EMalformedMessageError);
 
     while (token_ids.length() > 0) {
         let token_id = token_ids.pop_back();
         let token_type_name = token_type_names.pop_back();
         let token_price = token_prices.pop_back();
-        inner
-            .treasury
-            .add_new_token(token_type_name, token_id, native_token, token_price)
+        inner.treasury.add_new_token(token_type_name, token_id, native_token, token_price)
     }
 }
 
 // Verify seq number matches the next expected seq number for the message type,
 // and increment it.
-fun get_current_seq_num_and_increment(
-    bridge: &mut BridgeInner,
-    msg_type: u8,
-): u64 {
+fun get_current_seq_num_and_increment(bridge: &mut BridgeInner, msg_type: u8): u64 {
     if (!bridge.sequence_nums.contains(&msg_type)) {
         bridge.sequence_nums.insert(msg_type, 1);
         return 0
@@ -793,11 +743,7 @@ fun get_parsed_token_transfer_message(
 //
 
 #[test_only]
-public fun create_bridge_for_testing(
-    id: UID,
-    chain_id: u8,
-    ctx: &mut TxContext,
-) {
+public fun create_bridge_for_testing(id: UID, chain_id: u8, ctx: &mut TxContext) {
     create(id, chain_id, ctx);
 }
 
@@ -904,9 +850,7 @@ public fun inner_treasury(bridge_inner: &BridgeInner): &BridgeTreasury {
 }
 
 #[test_only]
-public fun inner_treasury_mut(
-    bridge_inner: &mut BridgeInner,
-): &mut BridgeTreasury {
+public fun inner_treasury_mut(bridge_inner: &mut BridgeInner): &mut BridgeTreasury {
     &mut bridge_inner.treasury
 }
 
@@ -930,10 +874,7 @@ public fun inner_token_transfer_records_mut(
 }
 
 #[test_only]
-public fun test_execute_emergency_op(
-    bridge_inner: &mut BridgeInner,
-    payload: EmergencyOp,
-) {
+public fun test_execute_emergency_op(bridge_inner: &mut BridgeInner, payload: EmergencyOp) {
     bridge_inner.execute_emergency_op(payload)
 }
 
@@ -961,18 +902,12 @@ public fun test_get_current_seq_num_and_increment(
 }
 
 #[test_only]
-public fun test_execute_update_bridge_limit(
-    inner: &mut BridgeInner,
-    payload: UpdateBridgeLimit,
-) {
+public fun test_execute_update_bridge_limit(inner: &mut BridgeInner, payload: UpdateBridgeLimit) {
     execute_update_bridge_limit(inner, payload)
 }
 
 #[test_only]
-public fun test_execute_update_asset_price(
-    inner: &mut BridgeInner,
-    payload: UpdateAssetPrice,
-) {
+public fun test_execute_update_asset_price(inner: &mut BridgeInner, payload: UpdateAssetPrice) {
     execute_update_asset_price(inner, payload)
 }
 
@@ -997,10 +932,7 @@ public fun transfer_status_not_found(): u8 {
 }
 
 #[test_only]
-public fun test_execute_add_tokens_on_sui(
-    bridge: &mut Bridge,
-    payload: AddTokenOnSui,
-) {
+public fun test_execute_add_tokens_on_sui(bridge: &mut Bridge, payload: AddTokenOnSui) {
     let inner = load_inner_mut(bridge);
     inner.execute_add_tokens_on_sui(payload);
 }
@@ -1024,9 +956,7 @@ public fun get_seq_num_inc_for(bridge: &mut Bridge, message_type: u8): u64 {
 }
 
 #[test_only]
-public fun transfer_approve_key(
-    event: TokenTransferApproved,
-): BridgeMessageKey {
+public fun transfer_approve_key(event: TokenTransferApproved): BridgeMessageKey {
     event.message_key
 }
 
@@ -1036,23 +966,17 @@ public fun transfer_claimed_key(event: TokenTransferClaimed): BridgeMessageKey {
 }
 
 #[test_only]
-public fun transfer_already_approved_key(
-    event: TokenTransferAlreadyApproved,
-): BridgeMessageKey {
+public fun transfer_already_approved_key(event: TokenTransferAlreadyApproved): BridgeMessageKey {
     event.message_key
 }
 
 #[test_only]
-public fun transfer_already_claimed_key(
-    event: TokenTransferAlreadyClaimed,
-): BridgeMessageKey {
+public fun transfer_already_claimed_key(event: TokenTransferAlreadyClaimed): BridgeMessageKey {
     event.message_key
 }
 
 #[test_only]
-public fun transfer_limit_exceed_key(
-    event: TokenTransferLimitExceed,
-): BridgeMessageKey {
+public fun transfer_limit_exceed_key(event: TokenTransferLimitExceed): BridgeMessageKey {
     event.message_key
 }
 
