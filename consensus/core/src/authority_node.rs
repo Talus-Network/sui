@@ -8,11 +8,12 @@ use itertools::Itertools;
 use mysten_metrics::spawn_logged_monitored_task;
 use parking_lot::RwLock;
 use prometheus::Registry;
-use sui_protocol_config::{ConsensusNetwork, ProtocolConfig};
+use sui_protocol_config::ProtocolConfig;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::{
+    CommitConsumerArgs,
     authority_service::AuthorityService,
     block_manager::BlockManager,
     block_verifier::SignedBlockVerifier,
@@ -27,10 +28,7 @@ use crate::{
     leader_schedule::LeaderSchedule,
     leader_timeout::{LeaderTimeoutTask, LeaderTimeoutTaskHandle},
     metrics::initialise_metrics,
-    network::{
-        anemo_network::AnemoManager, tonic_network::TonicManager, NetworkClient as _,
-        NetworkManager,
-    },
+    network::{NetworkClient as _, NetworkManager, tonic_network::TonicManager},
     proposed_block_handler::ProposedBlockHandler,
     round_prober::{RoundProber, RoundProberHandle},
     round_tracker::PeerRoundTracker,
@@ -39,26 +37,24 @@ use crate::{
     synchronizer::{Synchronizer, SynchronizerHandle},
     transaction::{TransactionClient, TransactionConsumer, TransactionVerifier},
     transaction_certifier::TransactionCertifier,
-    CommitConsumerArgs,
 };
 
 /// ConsensusAuthority is used by Sui to manage the lifetime of AuthorityNode.
 /// It hides the details of the implementation from the caller, MysticetiManager.
 #[allow(private_interfaces)]
 pub enum ConsensusAuthority {
-    WithAnemo(AuthorityNode<AnemoManager>),
     WithTonic(AuthorityNode<TonicManager>),
 }
 
 impl ConsensusAuthority {
     pub async fn start(
-        network_type: ConsensusNetwork,
+        network_type: NetworkType,
         epoch_start_timestamp_ms: u64,
-        own_index: Option<AuthorityIndex>,
+        own_index: AuthorityIndex,
         committee: Committee,
         parameters: Parameters,
         protocol_config: ProtocolConfig,
-        protocol_keypair: Option<ProtocolKeyPair>,
+        protocol_keypair: ProtocolKeyPair,
         network_keypair: NetworkKeyPair,
         clock: Arc<Clock>,
         transaction_verifier: Arc<dyn TransactionVerifier>,
@@ -69,13 +65,9 @@ impl ConsensusAuthority {
         // make decisions on whether amnesia recovery should run or not. When `boot_counter` is 0, then `ConsensusAuthority`
         // will initiate the process of amnesia recovery if that's enabled in the parameters.
         boot_counter: u64,
-        // For observer nodes, specifies which validator to connect to. None means connect to first validator.
-        target_validator_index: Option<AuthorityIndex>,
-        // Optional randomness signature broadcast receiver for streaming signatures to observers
-        randomness_signature_receiver: Option<tokio::sync::broadcast::Receiver<(u64, Vec<u8>)>>,
     ) -> Self {
         match network_type {
-            ConsensusNetwork::Anemo => {
+            NetworkType::Tonic => {
                 let authority = AuthorityNode::start(
                     epoch_start_timestamp_ms,
                     own_index,
@@ -89,28 +81,6 @@ impl ConsensusAuthority {
                     commit_consumer,
                     registry,
                     boot_counter,
-                    target_validator_index,
-                    randomness_signature_receiver,
-                )
-                .await;
-                Self::WithAnemo(authority)
-            }
-            ConsensusNetwork::Tonic => {
-                let authority = AuthorityNode::start(
-                    epoch_start_timestamp_ms,
-                    own_index,
-                    committee,
-                    parameters,
-                    protocol_config,
-                    protocol_keypair,
-                    network_keypair,
-                    clock,
-                    transaction_verifier,
-                    commit_consumer,
-                    registry,
-                    boot_counter,
-                    target_validator_index,
-                    randomness_signature_receiver,
                 )
                 .await;
                 Self::WithTonic(authority)
@@ -120,14 +90,12 @@ impl ConsensusAuthority {
 
     pub async fn stop(self) {
         match self {
-            Self::WithAnemo(authority) => authority.stop().await,
             Self::WithTonic(authority) => authority.stop().await,
         }
     }
 
     pub fn transaction_client(&self) -> Arc<TransactionClient> {
         match self {
-            Self::WithAnemo(authority) => authority.transaction_client(),
             Self::WithTonic(authority) => authority.transaction_client(),
         }
     }
@@ -135,18 +103,14 @@ impl ConsensusAuthority {
     #[cfg(test)]
     fn context(&self) -> &Arc<Context> {
         match self {
-            Self::WithAnemo(authority) => &authority.context,
             Self::WithTonic(authority) => &authority.context,
         }
     }
+}
 
-    #[allow(unused)]
-    fn sync_last_known_own_block_enabled(&self) -> bool {
-        match self {
-            Self::WithAnemo(authority) => authority.sync_last_known_own_block,
-            Self::WithTonic(authority) => authority.sync_last_known_own_block,
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetworkType {
+    Tonic,
 }
 
 pub(crate) struct AuthorityNode<N>
@@ -159,16 +123,15 @@ where
     synchronizer: Arc<SynchronizerHandle>,
 
     commit_syncer_handle: CommitSyncerHandle,
-    round_prober_handle: Option<RoundProberHandle>,
-    proposed_block_handler: Option<JoinHandle<()>>,
-    leader_timeout_handle: Option<LeaderTimeoutTaskHandle>,
+    round_prober_handle: RoundProberHandle,
+    proposed_block_handler: JoinHandle<()>,
+    leader_timeout_handle: LeaderTimeoutTaskHandle,
     core_thread_handle: CoreThreadHandle,
     // Only one of broadcaster and subscriber gets created, depending on
     // if streaming is supported.
     broadcaster: Option<Broadcaster>,
     subscriber: Option<Subscriber<N::Client, AuthorityService<ChannelCoreThreadDispatcher>>>,
     network_manager: N,
-    sync_last_known_own_block: bool,
 }
 
 impl<N> AuthorityNode<N>
@@ -177,76 +140,36 @@ where
 {
     pub(crate) async fn start(
         epoch_start_timestamp_ms: u64,
-        own_index: Option<AuthorityIndex>,
+        own_index: AuthorityIndex,
         committee: Committee,
         parameters: Parameters,
         protocol_config: ProtocolConfig,
         // To avoid accidentally leaking the private key, the protocol key pair should only be
-        // kept in Core. None for observer nodes.
-        protocol_keypair: Option<ProtocolKeyPair>,
+        // kept in Core.
+        protocol_keypair: ProtocolKeyPair,
         network_keypair: NetworkKeyPair,
         clock: Arc<Clock>,
         transaction_verifier: Arc<dyn TransactionVerifier>,
         commit_consumer: CommitConsumerArgs,
         registry: Registry,
         boot_counter: u64,
-        // For observer nodes, specifies which validator to connect to. None means connect to first validator.
-        target_validator_index: Option<AuthorityIndex>,
-        // Optional randomness signature broadcast receiver for streaming signatures to observers
-        randomness_signature_receiver: Option<tokio::sync::broadcast::Receiver<(u64, Vec<u8>)>>,
     ) -> Self {
-        // For observers, use a sentinel value (AuthorityIndex::MAX) since Context requires own_index
-        let own_index = own_index.unwrap_or(AuthorityIndex::MAX);
-
-        let context = Arc::new(Context::new(
-            epoch_start_timestamp_ms,
+        assert!(
+            committee.is_valid_index(own_index),
+            "Invalid own index {}",
+            own_index
+        );
+        let own_hostname = committee.authority(own_index).hostname.clone();
+        info!(
+            "Starting consensus authority {} {}, {:?}, epoch start timestamp {}, boot counter {}, replaying after commit index {}, consumer last processed commit index {}",
             own_index,
-            committee.clone(),
-            parameters.clone(),
-            protocol_config.clone(),
-            initialise_metrics(registry),
-            clock.clone(),
-        ));
-
-        if !context.is_observer {
-            assert!(
-                committee.is_valid_index(own_index),
-                "Invalid own index {}",
-                own_index
-            );
-        }
-
-        let own_hostname = if context.is_observer {
-            // Use first 4 bytes of public key for a short identifier
-            let key_bytes = network_keypair.public().to_bytes();
-            format!(
-                "observer-{:02x}{:02x}{:02x}{:02x}",
-                key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3]
-            )
-        } else {
-            committee.authority(own_index).hostname.clone()
-        };
-        if context.is_observer {
-            info!(
-                "Starting consensus observer node, {:?}, epoch start timestamp {}, boot counter {}, replaying after commit index {}, consumer last processed commit index {}",
-                protocol_config.version,
-                epoch_start_timestamp_ms,
-                boot_counter,
-                commit_consumer.replay_after_commit_index,
-                commit_consumer.consumer_last_processed_commit_index
-            );
-        } else {
-            info!(
-                "Starting consensus authority {} {}, {:?}, epoch start timestamp {}, boot counter {}, replaying after commit index {}, consumer last processed commit index {}",
-                own_index,
-                own_hostname,
-                protocol_config.version,
-                epoch_start_timestamp_ms,
-                boot_counter,
-                commit_consumer.replay_after_commit_index,
-                commit_consumer.consumer_last_processed_commit_index
-            );
-        }
+            own_hostname,
+            protocol_config.version,
+            epoch_start_timestamp_ms,
+            boot_counter,
+            commit_consumer.replay_after_commit_index,
+            commit_consumer.consumer_last_processed_commit_index
+        );
         info!(
             "Consensus authorities: {}",
             committee
@@ -256,6 +179,15 @@ where
         );
         info!("Consensus parameters: {:?}", parameters);
         info!("Consensus committee: {:?}", committee);
+        let context = Arc::new(Context::new(
+            epoch_start_timestamp_ms,
+            own_index,
+            committee,
+            parameters,
+            protocol_config,
+            initialise_metrics(registry),
+            clock,
+        ));
         let start_time = Instant::now();
 
         context
@@ -301,33 +233,21 @@ where
 
         let transaction_certifier = TransactionCertifier::new(
             context.clone(),
+            block_verifier.clone(),
             dag_state.clone(),
             commit_consumer.block_sender.clone(),
         );
-        // TODO(fastpath): recover incrementally by chunk inside CommitObserver::new()
-        transaction_certifier.recover(
-            block_verifier.as_ref(),
-            commit_consumer.replay_after_commit_index,
+
+        let mut proposed_block_handler = ProposedBlockHandler::new(
+            context.clone(),
+            signals_receivers.block_broadcast_receiver(),
+            transaction_certifier.clone(),
         );
 
-        // Observer nodes don't propose blocks so they don't need the proposed_block_handler
-        let proposed_block_handler = if !context.is_observer {
-            let mut proposed_block_handler = ProposedBlockHandler::new(
-                context.clone(),
-                signals_receivers.block_broadcast_receiver(),
-                transaction_certifier.clone(),
-            );
-            Some(spawn_logged_monitored_task!(
-                proposed_block_handler.run(),
-                "proposed_block_handler"
-            ))
-        } else {
-            None
-        };
+        let proposed_block_handler =
+            spawn_logged_monitored_task!(proposed_block_handler.run(), "proposed_block_handler");
 
-        // Observer nodes don't need to sync their last known own block since they don't propose blocks
-        let sync_last_known_own_block = !context.is_observer
-            && boot_counter == 0
+        let sync_last_known_own_block = boot_counter == 0
             && dag_state.read().highest_accepted_round() == 0
             && !context
                 .parameters
@@ -360,10 +280,6 @@ where
             tx_consumer,
             transaction_certifier.clone(),
             block_manager,
-            // For streaming RPC, Core will be notified when consumer is available.
-            // For non-streaming RPC, there is no way to know so default to true.
-            // When there is only one (this) authority, assume subscriber exists.
-            !N::Client::SUPPORT_STREAMING || context.committee.size() == 1,
             commit_observer,
             core_signals,
             protocol_keypair,
@@ -375,17 +291,8 @@ where
         let (core_dispatcher, core_thread_handle) =
             ChannelCoreThreadDispatcher::start(context.clone(), &dag_state, core);
         let core_dispatcher = Arc::new(core_dispatcher);
-
-        // Observers don't propose blocks so they don't need leader timeout
-        let leader_timeout_handle = if !context.is_observer {
-            Some(LeaderTimeoutTask::start(
-                core_dispatcher.clone(),
-                &signals_receivers,
-                context.clone(),
-            ))
-        } else {
-            None
-        };
+        let leader_timeout_handle =
+            LeaderTimeoutTask::start(core_dispatcher.clone(), &signals_receivers, context.clone());
 
         let commit_vote_monitor = Arc::new(CommitVoteMonitor::new(context.clone()));
 
@@ -409,25 +316,17 @@ where
             transaction_certifier.clone(),
             network_client.clone(),
             dag_state.clone(),
-            target_validator_index,
         )
         .start();
 
-        let round_prober_handle =
-            if !context.is_observer && context.protocol_config.consensus_round_prober() {
-                Some(
-                    RoundProber::new(
-                        context.clone(),
-                        core_dispatcher.clone(),
-                        round_tracker.clone(),
-                        dag_state.clone(),
-                        network_client.clone(),
-                    )
-                    .start(),
-                )
-            } else {
-                None
-            };
+        let round_prober_handle = RoundProber::new(
+            context.clone(),
+            core_dispatcher.clone(),
+            round_tracker.clone(),
+            dag_state.clone(),
+            network_client.clone(),
+        )
+        .start();
 
         let network_service = Arc::new(AuthorityService::new(
             context.clone(),
@@ -437,11 +336,9 @@ where
             synchronizer.clone(),
             core_dispatcher,
             signals_receivers.block_broadcast_receiver(),
-            signals_receivers.accepted_blocks_broadcast_receiver(),
             transaction_certifier,
             dag_state.clone(),
             store,
-            randomness_signature_receiver,
         ));
 
         let subscriber = if N::Client::SUPPORT_STREAMING {
@@ -451,25 +348,9 @@ where
                 network_service.clone(),
                 dag_state,
             );
-            if context.is_observer {
-                // Observers connect to the specified target validator or the first authority
-                let peer = target_validator_index
-                    .or_else(|| context.committee.authorities().next().map(|(idx, _)| idx));
-                if let Some(peer) = peer {
-                    let hostname = &context.committee.authority(peer).hostname;
-                    info!("Observer subscribing to authority {peer} at {hostname}");
+            for (peer, _) in context.committee.authorities() {
+                if peer != context.own_index {
                     s.subscribe(peer);
-                } else {
-                    warn!("Observer could not find any authority to subscribe to");
-                }
-            } else {
-                // Validators subscribe to all other authorities except themselves
-                for (peer, _) in context.committee.authorities() {
-                    if peer != context.own_index {
-                        let hostname = &context.committee.authority(peer).hostname;
-                        info!("Validator subscribing to authority {peer} at {hostname}");
-                        s.subscribe(peer);
-                    }
                 }
             }
             Some(s)
@@ -497,7 +378,6 @@ where
             broadcaster,
             subscriber,
             network_manager,
-            sync_last_known_own_block,
         }
     }
 
@@ -518,15 +398,9 @@ where
             );
         };
         self.commit_syncer_handle.stop().await;
-        if let Some(round_prober_handle) = self.round_prober_handle.take() {
-            round_prober_handle.stop().await;
-        }
-        if let Some(handler) = self.proposed_block_handler.take() {
-            handler.abort();
-        }
-        if let Some(leader_timeout_handle) = self.leader_timeout_handle.take() {
-            leader_timeout_handle.stop().await;
-        }
+        self.round_prober_handle.stop().await;
+        self.proposed_block_handler.abort();
+        self.leader_timeout_handle.stop().await;
         // Shutdown Core to stop block productions and broadcast.
         // When using streaming, all subscribers to broadcasted blocks stop after this.
         self.core_thread_handle.stop().await;
@@ -561,11 +435,10 @@ mod tests {
         time::Duration,
     };
 
-    use consensus_config::{local_committee_and_keys, Parameters};
-    use mysten_metrics::monitored_mpsc::UnboundedReceiver;
+    use consensus_config::{Parameters, local_committee_and_keys};
     use mysten_metrics::RegistryService;
+    use mysten_metrics::monitored_mpsc::UnboundedReceiver;
     use prometheus::Registry;
-    use rand::{rngs::StdRng, SeedableRng};
     use rstest::rstest;
     use sui_protocol_config::ProtocolConfig;
     use tempfile::TempDir;
@@ -574,15 +447,15 @@ mod tests {
 
     use super::*;
     use crate::{
+        CommittedSubDag,
         block::{BlockAPI as _, CertifiedBlocksOutput, GENESIS_ROUND},
         transaction::NoopTransactionVerifier,
-        CommittedSubDag,
     };
 
     #[rstest]
     #[tokio::test]
     async fn test_authority_start_and_stop(
-        #[values(ConsensusNetwork::Anemo, ConsensusNetwork::Tonic)] network_type: ConsensusNetwork,
+        #[values(NetworkType::Tonic)] network_type: NetworkType,
     ) {
         let (committee, keypairs) = local_committee_and_keys(0, vec![1]);
         let registry = Registry::new();
@@ -603,19 +476,17 @@ mod tests {
         let authority = ConsensusAuthority::start(
             network_type,
             0,
-            Some(own_index),
+            own_index,
             committee,
             parameters,
             ProtocolConfig::get_for_max_version_UNSAFE(),
-            Some(protocol_keypair),
+            protocol_keypair,
             network_keypair,
             Arc::new(Clock::default()),
             Arc::new(txn_verifier),
             commit_consumer,
             registry,
             0,
-            None,
-            None,
         )
         .await;
 
@@ -630,7 +501,7 @@ mod tests {
     #[rstest]
     #[tokio::test(flavor = "current_thread")]
     async fn test_authority_committee(
-        #[values(ConsensusNetwork::Anemo, ConsensusNetwork::Tonic)] network_type: ConsensusNetwork,
+        #[values(NetworkType::Tonic)] network_type: NetworkType,
         #[values(5, 10)] gc_depth: u32,
     ) {
         telemetry_subscribers::init_for_testing();
@@ -734,109 +605,8 @@ mod tests {
 
     #[rstest]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_authority_committee_with_observer(
-        #[values(ConsensusNetwork::Tonic)] network_type: ConsensusNetwork,
-        #[values(5)] gc_depth: u32,
-    ) {
-        telemetry_subscribers::init_for_testing();
-        let db_registry = Registry::new();
-        DBMetrics::init(RegistryService::new(db_registry));
-
-        const NUM_OF_AUTHORITIES: usize = 4;
-        const NUM_OF_OBSERVERS: usize = 1;
-        let (committee, keypairs) = local_committee_and_keys(0, [1; NUM_OF_AUTHORITIES].to_vec());
-        let mut protocol_config = ProtocolConfig::get_for_max_version_UNSAFE();
-        protocol_config.set_consensus_gc_depth_for_testing(gc_depth);
-
-        let temp_dirs = (0..NUM_OF_AUTHORITIES + NUM_OF_OBSERVERS)
-            .map(|_| TempDir::new().unwrap())
-            .collect::<Vec<_>>();
-
-        let mut commit_receivers = Vec::with_capacity(NUM_OF_AUTHORITIES + NUM_OF_OBSERVERS);
-        let mut block_receivers = Vec::with_capacity(NUM_OF_AUTHORITIES + NUM_OF_OBSERVERS);
-        let mut authorities = Vec::with_capacity(committee.size());
-        let mut boot_counters = [0; NUM_OF_AUTHORITIES + NUM_OF_OBSERVERS];
-
-        for (index, _authority_info) in committee.authorities() {
-            let (authority, commit_receiver, block_receiver) = make_authority(
-                index,
-                &temp_dirs[index.value()],
-                committee.clone(),
-                keypairs.clone(),
-                network_type,
-                boot_counters[index],
-                protocol_config.clone(),
-            )
-            .await;
-            boot_counters[index] += 1;
-            commit_receivers.push(commit_receiver);
-            block_receivers.push(block_receiver);
-            authorities.push(authority);
-        }
-
-        // Now boot the Observer node
-        let (authority, commit_receiver, block_receiver) = make_authority(
-            AuthorityIndex::MAX,
-            &temp_dirs[NUM_OF_AUTHORITIES],
-            committee.clone(),
-            keypairs.clone(),
-            network_type,
-            boot_counters[NUM_OF_AUTHORITIES],
-            protocol_config.clone(),
-        )
-        .await;
-        boot_counters[NUM_OF_AUTHORITIES] += 1;
-        commit_receivers.push(commit_receiver);
-        block_receivers.push(block_receiver);
-        authorities.push(authority);
-
-        const NUM_TRANSACTIONS: u8 = 15;
-        let mut submitted_transactions = BTreeSet::<Vec<u8>>::new();
-        for i in 0..NUM_TRANSACTIONS {
-            let txn = vec![i; 16];
-            submitted_transactions.insert(txn.clone());
-            authorities[i as usize % (authorities.len() - 1)]
-                .transaction_client()
-                .submit(vec![txn])
-                .await
-                .unwrap();
-        }
-
-        // Only check validators (not observer at the end)
-        for receiver in commit_receivers.iter_mut().take(NUM_OF_AUTHORITIES) {
-            let mut expected_transactions = submitted_transactions.clone();
-            loop {
-                let committed_subdag =
-                    tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                for b in committed_subdag.blocks {
-                    for txn in b.transactions().iter().map(|t| t.data().to_vec()) {
-                        assert!(
-                            expected_transactions.remove(&txn),
-                            "Transaction not submitted or already seen: {:?}",
-                            txn
-                        );
-                    }
-                }
-                assert_eq!(committed_subdag.reputation_scores_desc, vec![]);
-                if expected_transactions.is_empty() {
-                    break;
-                }
-            }
-        }
-
-        // Stop all authorities and exit.
-        for authority in authorities {
-            authority.stop().await;
-        }
-    }
-
-    #[rstest]
-    #[tokio::test(flavor = "current_thread")]
     async fn test_small_committee(
-        #[values(ConsensusNetwork::Anemo, ConsensusNetwork::Tonic)] network_type: ConsensusNetwork,
+        #[values(NetworkType::Tonic)] network_type: NetworkType,
         #[values(1, 2, 3)] num_authorities: usize,
     ) {
         telemetry_subscribers::init_for_testing();
@@ -958,12 +728,11 @@ mod tests {
                 &dir,
                 committee.clone(),
                 keypairs.clone(),
-                ConsensusNetwork::Tonic,
+                NetworkType::Tonic,
                 boot_counters[index],
                 protocol_config.clone(),
             )
             .await;
-            assert!(authority.sync_last_known_own_block_enabled(), "Expected syncing of last known own block to be enabled as all authorities are of empty db and boot for first time.");
             boot_counters[index] += 1;
             commit_receivers.push(commit_receiver);
             block_receivers.push(block_receiver);
@@ -1008,15 +777,11 @@ mod tests {
             &dir,
             committee.clone(),
             keypairs.clone(),
-            ConsensusNetwork::Tonic,
+            NetworkType::Tonic,
             boot_counters[index_1],
             protocol_config.clone(),
         )
         .await;
-        assert!(
-            authority.sync_last_known_own_block_enabled(),
-            "Authority should have the sync of last own block enabled"
-        );
         boot_counters[index_1] += 1;
         authorities.insert(index_1, authority);
         temp_dirs.insert(index_1, dir);
@@ -1029,15 +794,11 @@ mod tests {
             &temp_dirs[&index_2],
             committee.clone(),
             keypairs,
-            ConsensusNetwork::Tonic,
+            NetworkType::Tonic,
             boot_counters[index_2],
             protocol_config.clone(),
         )
         .await;
-        assert!(
-            !authority.sync_last_known_own_block_enabled(),
-            "Authority should not have attempted to sync the last own block"
-        );
         boot_counters[index_2] += 1;
         authorities.insert(index_2, authority);
         sleep(Duration::from_secs(5)).await;
@@ -1063,7 +824,7 @@ mod tests {
         db_dir: &TempDir,
         committee: Committee,
         keypairs: Vec<(NetworkKeyPair, ProtocolKeyPair)>,
-        network_type: ConsensusNetwork,
+        network_type: NetworkType,
         boot_counter: u64,
         protocol_config: ProtocolConfig,
     ) -> (
@@ -1084,24 +845,15 @@ mod tests {
         };
         let txn_verifier = NoopTransactionVerifier {};
 
-        let (protocol_keypair, network_keypair) = if index == AuthorityIndex::MAX {
-            // Create a network keypair for the observer
-            let mut rng = StdRng::from_seed([0; 32]);
-            let network_keypair = NetworkKeyPair::generate(&mut rng);
-
-            (None, network_keypair)
-        } else {
-            let protocol_keypair = keypairs[index].1.clone();
-            let network_keypair = keypairs[index].0.clone();
-            (Some(protocol_keypair), network_keypair)
-        };
+        let protocol_keypair = keypairs[index].1.clone();
+        let network_keypair = keypairs[index].0.clone();
 
         let (commit_consumer, commit_receiver, block_receiver) = CommitConsumerArgs::new(0, 0);
 
         let authority = ConsensusAuthority::start(
             network_type,
             0,
-            Some(index),
+            index,
             committee,
             parameters,
             protocol_config,
@@ -1112,8 +864,6 @@ mod tests {
             commit_consumer,
             registry,
             boot_counter,
-            None,
-            None,
         )
         .await;
 

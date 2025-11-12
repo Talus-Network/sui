@@ -13,56 +13,39 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use consensus_config::{AuthorityIndex, NetworkKeyPair, NetworkPublicKey};
 use consensus_types::block::{BlockRef, Round};
-use futures::{stream, Stream, StreamExt as _, TryStreamExt as _};
+use futures::{Stream, StreamExt as _, stream};
 use mysten_network::{
+    Multiaddr,
     callback::{CallbackLayer, MakeCallbackHandler, ResponseHandler},
     multiaddr::Protocol,
-    Multiaddr,
 };
 use parking_lot::RwLock;
 use sui_http::ServerHandle;
 use sui_tls::AllowPublicKeys;
-use tokio_stream::{iter, Iter};
-use tonic::{codec::CompressionEncoding, Request, Response, Streaming};
+use tokio_stream::{Iter, iter};
+use tonic::{Request, Response, Streaming, codec::CompressionEncoding};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer};
 use tracing::{debug, error, info, trace, warn};
 
 use super::{
+    BlockStream, ExtendedSerializedBlock, NetworkClient, NetworkManager, NetworkService,
     metrics_layer::{MetricsCallbackMaker, MetricsResponseCallback, SizedRequest, SizedResponse},
     tonic_gen::{
         consensus_service_client::ConsensusServiceClient,
         consensus_service_server::ConsensusService,
-        observer_consensus_service_client::ObserverConsensusServiceClient,
-        observer_consensus_service_server::ObserverConsensusService,
     },
-    BlockStream, ExtendedSerializedBlock, NetworkClient, NetworkManager, NetworkService, NodeId,
 };
 use crate::{
+    CommitIndex,
     block::VerifiedBlock,
     commit::CommitRange,
     context::Context,
     error::{ConsensusError, ConsensusResult},
     network::{
-        tonic_gen::{
-            consensus_service_server::ConsensusServiceServer,
-            observer_consensus_service_server::ObserverConsensusServiceServer,
-        },
+        tonic_gen::consensus_service_server::ConsensusServiceServer,
         tonic_tls::certificate_server_name,
     },
-    CommitIndex,
 };
-
-/// Calculates throttle duration based on configuration.
-/// Returns None if throttling is disabled.
-fn calculate_throttle_duration(
-    min_round_delay: Duration,
-    throttle_divisor: Option<f64>,
-) -> Option<Duration> {
-    throttle_divisor.map(|divisor| {
-        let millis = (min_round_delay.as_millis() as f64 / divisor) as u64;
-        Duration::from_millis(millis)
-    })
-}
 
 // Maximum bytes size in a single fetch_blocks()response.
 // TODO: put max RPC response size in protocol config.
@@ -99,15 +82,11 @@ impl TonicClient {
             .channel_pool
             .get_channel(self.network_keypair.clone(), peer, timeout)
             .await?;
-        let mut client = ConsensusServiceClient::new(channel)
+        let client = ConsensusServiceClient::new(channel)
             .max_encoding_message_size(config.message_size_limit)
-            .max_decoding_message_size(config.message_size_limit);
-
-        if self.context.protocol_config.consensus_zstd_compression() {
-            client = client
-                .send_compressed(CompressionEncoding::Zstd)
-                .accept_compressed(CompressionEncoding::Zstd);
-        }
+            .max_decoding_message_size(config.message_size_limit)
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd);
         Ok(client)
     }
 }
@@ -126,7 +105,6 @@ impl NetworkClient for TonicClient {
         let mut client = self.get_client(peer, timeout).await?;
         let mut request = Request::new(SendBlockRequest {
             block: block.serialized().clone(),
-            randomness_signatures: vec![],
         });
         request.set_timeout(timeout);
         client
@@ -160,9 +138,6 @@ impl NetworkClient for TonicClient {
                     Ok(response) => Some(ExtendedSerializedBlock {
                         block: response.block,
                         excluded_ancestors: response.excluded_ancestors,
-                        randomness_signatures: response.randomness_signatures.into_iter()
-                            .map(|e| (e.round, e.signature.into()))
-                            .collect(),
                     }),
                     Err(e) => {
                         debug!("Network error received from {}: {e:?}", peer);
@@ -170,21 +145,10 @@ impl NetworkClient for TonicClient {
                     }
                 }
             });
-
-        // Apply throttling based on configuration for validator-to-validator streams
-        let final_stream: BlockStream = if let Some(throttle_duration) = calculate_throttle_duration(
-            self.context.parameters.min_round_delay,
-            self.context
-                .parameters
-                .tonic
-                .validator_stream_throttle_divisor,
-        ) {
-            tokio_stream::StreamExt::throttle(stream, throttle_duration).boxed()
-        } else {
-            stream.boxed()
-        };
-
-        Ok(final_stream)
+        let rate_limited_stream =
+            tokio_stream::StreamExt::throttle(stream, self.context.parameters.min_round_delay / 2)
+                .boxed();
+        Ok(rate_limited_stream)
     }
 
     async fn fetch_blocks(
@@ -363,263 +327,6 @@ impl NetworkClient for TonicClient {
     }
 }
 
-/// Tonic RPC client for Observer nodes to stream blocks from validators.
-/// This is a specialized client that only supports block streaming, not the full NetworkClient interface.
-pub(crate) struct ObserverClient {
-    context: Arc<Context>,
-    network_keypair: NetworkKeyPair,
-    observer_channel_pool: Arc<ObserverChannelPool>,
-}
-
-impl ObserverClient {
-    pub(crate) fn new(context: Arc<Context>, network_keypair: NetworkKeyPair) -> Self {
-        Self {
-            context: context.clone(),
-            network_keypair,
-            observer_channel_pool: Arc::new(ObserverChannelPool::new(context)),
-        }
-    }
-
-    async fn get_client(
-        &self,
-        peer: AuthorityIndex,
-        timeout: Duration,
-    ) -> ConsensusResult<ObserverConsensusServiceClient<Channel>> {
-        let config = &self.context.parameters.tonic;
-        let channel = self
-            .observer_channel_pool
-            .get_channel(self.network_keypair.clone(), peer, timeout)
-            .await?;
-        let mut client = ObserverConsensusServiceClient::new(channel)
-            .max_encoding_message_size(config.message_size_limit)
-            .max_decoding_message_size(config.message_size_limit);
-
-        if self.context.protocol_config.consensus_zstd_compression() {
-            client = client
-                .send_compressed(CompressionEncoding::Zstd)
-                .accept_compressed(CompressionEncoding::Zstd);
-        }
-        Ok(client)
-    }
-
-    /// Subscribes to blocks from a validator's observer port.
-    /// Returns a stream of blocks starting from the specified round.
-    pub(crate) async fn subscribe_blocks(
-        &self,
-        peer: AuthorityIndex,
-        last_received: Round,
-        timeout: Duration,
-    ) -> ConsensusResult<BlockStream> {
-        let mut client = self.get_client(peer, timeout).await?;
-        let request = Request::new(stream::once(async move {
-            SubscribeBlocksRequest {
-                last_received_round: last_received,
-            }
-        }));
-        let response = client.subscribe_blocks(request).await.map_err(|e| {
-            ConsensusError::NetworkRequest(format!("observer subscribe_blocks failed: {e:?}"))
-        })?;
-        let stream = response
-            .into_inner()
-            .take_while(|b| futures::future::ready(b.is_ok()))
-            .filter_map(move |b| async move {
-                match b {
-                    Ok(response) => Some(ExtendedSerializedBlock {
-                        block: response.block,
-                        excluded_ancestors: response.excluded_ancestors,
-                        randomness_signatures: response.randomness_signatures.into_iter()
-                            .map(|e| (e.round, e.signature.into()))
-                            .collect(),
-                    }),
-                    Err(e) => {
-                        debug!("Network error from validator {}: {e:?}", peer);
-                        None
-                    }
-                }
-            });
-
-        // Apply throttling based on configuration for validator-to-observer streams
-        let final_stream: BlockStream = if let Some(throttle_duration) = calculate_throttle_duration(
-            self.context.parameters.min_round_delay,
-            self.context
-                .parameters
-                .tonic
-                .observer_stream_throttle_divisor,
-        ) {
-            tokio_stream::StreamExt::throttle(stream, throttle_duration).boxed()
-        } else {
-            stream.boxed()
-        };
-
-        Ok(final_stream)
-    }
-
-    /// Fetches blocks from a validator's observer port.
-    pub(crate) async fn fetch_blocks(
-        &self,
-        peer: AuthorityIndex,
-        block_refs: Vec<BlockRef>,
-        highest_accepted_rounds: Vec<Round>,
-        breadth_first: bool,
-        timeout: Duration,
-    ) -> ConsensusResult<Vec<Bytes>> {
-        let mut client = self.get_client(peer, timeout).await?;
-        let request = Request::new(FetchBlocksRequest {
-            block_refs: block_refs
-                .iter()
-                .map(|r| bcs::to_bytes(r).unwrap())
-                .collect(),
-            highest_accepted_rounds,
-            breadth_first,
-        });
-        let response = client.fetch_blocks(request).await.map_err(|e| {
-            ConsensusError::NetworkRequest(format!("observer fetch_blocks failed: {e:?}"))
-        })?;
-        let blocks: Vec<Bytes> = response
-            .into_inner()
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| {
-                ConsensusError::NetworkRequest(format!(
-                    "observer fetch_blocks stream failed: {e:?}"
-                ))
-            })?
-            .into_iter()
-            .flat_map(|r| r.blocks)
-            .collect();
-        Ok(blocks)
-    }
-
-    /// Fetches commits from a validator's observer port.
-    pub(crate) async fn fetch_commits(
-        &self,
-        peer: AuthorityIndex,
-        commit_range: CommitRange,
-        timeout: Duration,
-    ) -> ConsensusResult<(Vec<Bytes>, Vec<Bytes>)> {
-        let mut client = self.get_client(peer, timeout).await?;
-        let request = Request::new(FetchCommitsRequest {
-            start: commit_range.start(),
-            end: commit_range.end(),
-        });
-        let response = client.fetch_commits(request).await.map_err(|e| {
-            ConsensusError::NetworkRequest(format!("observer fetch_commits failed: {e:?}"))
-        })?;
-        let inner = response.into_inner();
-        Ok((inner.commits, inner.certifier_blocks))
-    }
-}
-
-/// Unified client that can be either a validator client or observer client
-pub(crate) enum ConsensusNetworkClient {
-    Validator(TonicClient),
-    Observer(ObserverClient),
-}
-
-#[async_trait]
-impl NetworkClient for ConsensusNetworkClient {
-    const SUPPORT_STREAMING: bool = true;
-
-    async fn send_block(
-        &self,
-        peer: AuthorityIndex,
-        block: &VerifiedBlock,
-        timeout: Duration,
-    ) -> ConsensusResult<()> {
-        match self {
-            Self::Validator(client) => client.send_block(peer, block, timeout).await,
-            Self::Observer(_) => Err(ConsensusError::NetworkRequest(
-                "Observers cannot send blocks".to_string(),
-            )),
-        }
-    }
-
-    async fn subscribe_blocks(
-        &self,
-        peer: AuthorityIndex,
-        last_received: Round,
-        timeout: Duration,
-    ) -> ConsensusResult<BlockStream> {
-        match self {
-            Self::Validator(client) => client.subscribe_blocks(peer, last_received, timeout).await,
-            Self::Observer(client) => client.subscribe_blocks(peer, last_received, timeout).await,
-        }
-    }
-
-    async fn fetch_blocks(
-        &self,
-        peer: AuthorityIndex,
-        block_refs: Vec<BlockRef>,
-        highest_accepted_rounds: Vec<Round>,
-        breadth_first: bool,
-        timeout: Duration,
-    ) -> ConsensusResult<Vec<Bytes>> {
-        match self {
-            Self::Validator(client) => {
-                client
-                    .fetch_blocks(
-                        peer,
-                        block_refs,
-                        highest_accepted_rounds,
-                        breadth_first,
-                        timeout,
-                    )
-                    .await
-            }
-            Self::Observer(client) => {
-                client
-                    .fetch_blocks(
-                        peer,
-                        block_refs,
-                        highest_accepted_rounds,
-                        breadth_first,
-                        timeout,
-                    )
-                    .await
-            }
-        }
-    }
-
-    async fn fetch_commits(
-        &self,
-        peer: AuthorityIndex,
-        commit_range: CommitRange,
-        timeout: Duration,
-    ) -> ConsensusResult<(Vec<Bytes>, Vec<Bytes>)> {
-        match self {
-            Self::Validator(client) => client.fetch_commits(peer, commit_range, timeout).await,
-            Self::Observer(client) => client.fetch_commits(peer, commit_range, timeout).await,
-        }
-    }
-
-    async fn fetch_latest_blocks(
-        &self,
-        peer: AuthorityIndex,
-        authorities: Vec<AuthorityIndex>,
-        timeout: Duration,
-    ) -> ConsensusResult<Vec<Bytes>> {
-        match self {
-            Self::Validator(client) => client.fetch_latest_blocks(peer, authorities, timeout).await,
-            Self::Observer(_) => Err(ConsensusError::NetworkRequest(
-                "Observers cannot fetch latest blocks".to_string(),
-            )),
-        }
-    }
-
-    async fn get_latest_rounds(
-        &self,
-        peer: AuthorityIndex,
-        timeout: Duration,
-    ) -> ConsensusResult<(Vec<Round>, Vec<Round>)> {
-        match self {
-            Self::Validator(client) => client.get_latest_rounds(peer, timeout).await,
-            Self::Observer(_) => Err(ConsensusError::NetworkRequest(
-                "Observers cannot get latest rounds".to_string(),
-            )),
-        }
-    }
-}
-
 // Tonic channel wrapped with layers.
 type Channel = mysten_network::callback::Callback<
     tower_http::trace::Trace<
@@ -726,114 +433,6 @@ impl ChannelPool {
     }
 }
 
-/// Manages a pool of connections to validator observer ports for observer nodes.
-struct ObserverChannelPool {
-    context: Arc<Context>,
-    channels: RwLock<BTreeMap<AuthorityIndex, Channel>>,
-}
-
-impl ObserverChannelPool {
-    fn new(context: Arc<Context>) -> Self {
-        Self {
-            context,
-            channels: RwLock::new(BTreeMap::new()),
-        }
-    }
-
-    async fn get_channel(
-        &self,
-        network_keypair: NetworkKeyPair,
-        peer: AuthorityIndex,
-        timeout: Duration,
-    ) -> ConsensusResult<Channel> {
-        {
-            let channels = self.channels.read();
-            if let Some(channel) = channels.get(&peer) {
-                return Ok(channel.clone());
-            }
-        }
-
-        let authority = self.context.committee.authority(peer);
-        let address = to_host_port_str(&authority.address).map_err(|e| {
-            ConsensusError::NetworkConfig(format!("Cannot convert address to host:port: {e:?}"))
-        })?;
-
-        // Use the configured observer port
-        let config = &self.context.parameters.tonic;
-        let observer_port = config.observer_port.ok_or_else(|| {
-            ConsensusError::NetworkConfig("Observer port not configured".to_string())
-        })?;
-
-        // Extract host and replace port with observer port
-        let address = if let Some((host, _port_str)) = address.rsplit_once(':') {
-            format!("{}:{}", host, observer_port)
-        } else {
-            return Err(ConsensusError::NetworkConfig(format!(
-                "Cannot parse host:port from address: {}",
-                address
-            )));
-        };
-
-        let address = format!("https://{address}");
-        let buffer_size = config.connection_buffer_size;
-
-        // Observer client connects to validator's observer port
-        // TLS config validates the validator's certificate
-        let client_tls_config = sui_tls::create_rustls_client_config(
-            authority.network_key.clone().into_inner(),
-            certificate_server_name(&self.context),
-            Some(network_keypair.private_key().into_inner()),
-        );
-
-        let endpoint = tonic_rustls::Channel::from_shared(address.clone())
-            .unwrap()
-            .connect_timeout(timeout)
-            .initial_connection_window_size(Some(buffer_size as u32))
-            .initial_stream_window_size(Some(buffer_size as u32 / 2))
-            .keep_alive_while_idle(true)
-            .keep_alive_timeout(config.keepalive_interval)
-            .http2_keep_alive_interval(config.keepalive_interval)
-            .user_agent("mysticeti-observer")
-            .unwrap()
-            .tls_config(client_tls_config)
-            .unwrap();
-
-        let deadline = tokio::time::Instant::now() + timeout;
-        let channel = loop {
-            trace!("Observer connecting to endpoint at {address}");
-            match endpoint.connect().await {
-                Ok(channel) => break channel,
-                Err(e) => {
-                    debug!("Observer failed to connect to endpoint at {address}: {e:?}");
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(ConsensusError::NetworkClientConnection(format!(
-                            "Observer timed out connecting to endpoint at {address}: {e:?}"
-                        )));
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        };
-        trace!("Observer connected to {address}");
-
-        let channel = tower::ServiceBuilder::new()
-            .layer(CallbackLayer::new(MetricsCallbackMaker::new(
-                self.context.metrics.network_metrics.outbound.clone(),
-                self.context.parameters.tonic.excessive_message_size,
-            )))
-            .layer(
-                TraceLayer::new_for_grpc()
-                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::TRACE))
-                    .on_failure(DefaultOnFailure::new().level(tracing::Level::DEBUG)),
-            )
-            .service(channel);
-
-        let mut channels = self.channels.write();
-        let channel = channels.entry(peer).or_insert(channel);
-        Ok(channel.clone())
-    }
-}
-
 /// Proxies Tonic requests to NetworkService with actual handler implementation.
 struct TonicServiceProxy<S: NetworkService> {
     context: Arc<Context>,
@@ -863,7 +462,6 @@ impl<S: NetworkService> ConsensusService for TonicServiceProxy<S> {
         let block = ExtendedSerializedBlock {
             block,
             excluded_ancestors: vec![],
-            randomness_signatures: vec![],
         };
         self.service
             .handle_send_block(peer_index, block)
@@ -902,40 +500,19 @@ impl<S: NetworkService> ConsensusService for TonicServiceProxy<S> {
         };
         let stream = self
             .service
-            .handle_subscribe_blocks(
-                NodeId::Authority(peer_index),
-                first_request.last_received_round,
-            )
+            .handle_subscribe_blocks(peer_index, first_request.last_received_round)
             .await
             .map_err(|e| tonic::Status::internal(format!("{e:?}")))?
             .map(|block| {
                 Ok(SubscribeBlocksResponse {
                     block: block.block,
                     excluded_ancestors: block.excluded_ancestors,
-                    randomness_signatures: block.randomness_signatures
-                        .into_iter()
-                        .map(|(round, signature)| RandomnessSignatureEntry {
-                            round,
-                            signature: signature.into(),
-                        })
-                        .collect(),
                 })
             });
-
-        // Apply throttling based on configuration for validator-to-validator streams
-        let final_stream = if let Some(throttle_duration) = calculate_throttle_duration(
-            self.context.parameters.min_round_delay,
-            self.context
-                .parameters
-                .tonic
-                .validator_stream_throttle_divisor,
-        ) {
-            tokio_stream::StreamExt::throttle(stream, throttle_duration).boxed()
-        } else {
-            stream.boxed()
-        };
-
-        Ok(Response::new(final_stream))
+        let rate_limited_stream =
+            tokio_stream::StreamExt::throttle(stream, self.context.parameters.min_round_delay / 2)
+                .boxed();
+        Ok(Response::new(rate_limited_stream))
     }
 
     type FetchBlocksStream = Iter<std::vec::IntoIter<Result<FetchBlocksResponse, tonic::Status>>>;
@@ -1085,177 +662,6 @@ impl<S: NetworkService> ConsensusService for TonicServiceProxy<S> {
     }
 }
 
-/// Proxies observer requests to NetworkService for block streaming only.
-struct ObserverServiceProxy<S: NetworkService> {
-    context: Arc<Context>,
-    service: Arc<S>,
-}
-
-impl<S: NetworkService> ObserverServiceProxy<S> {
-    fn new(context: Arc<Context>, service: Arc<S>) -> Self {
-        Self { context, service }
-    }
-}
-
-#[async_trait]
-impl<S: NetworkService> ObserverConsensusService for ObserverServiceProxy<S> {
-    type SubscribeBlocksStream =
-        Pin<Box<dyn Stream<Item = Result<SubscribeBlocksResponse, tonic::Status>> + Send>>;
-
-    async fn subscribe_blocks(
-        &self,
-        request: Request<Streaming<SubscribeBlocksRequest>>,
-    ) -> Result<Response<Self::SubscribeBlocksStream>, tonic::Status> {
-        let Some(peer_public_key) = request
-            .extensions()
-            .get::<ObserverPeerInfo>()
-            .map(|p| p.public_key.clone())
-        else {
-            return Err(tonic::Status::internal("ObserverPeerInfo not found"));
-        };
-
-        debug!("Observer {:?} subscribing to blocks", peer_public_key);
-
-        let mut request_stream = request.into_inner();
-        let first_request = match request_stream.next().await {
-            Some(Ok(r)) => r,
-            Some(Err(e)) => {
-                debug!(
-                    "subscribe_blocks() request from observer {:?} failed: {e:?}",
-                    peer_public_key
-                );
-                return Err(tonic::Status::invalid_argument("Request error"));
-            }
-            None => {
-                return Err(tonic::Status::invalid_argument("Missing request"));
-            }
-        };
-
-        let stream = self
-            .service
-            .handle_subscribe_blocks(
-                NodeId::Observer(peer_public_key),
-                first_request.last_received_round,
-            )
-            .await
-            .map_err(|e| tonic::Status::internal(format!("{e:?}")))?
-            .map(|block| {
-                Ok(SubscribeBlocksResponse {
-                    block: block.block,
-                    excluded_ancestors: block.excluded_ancestors,
-                    randomness_signatures: block.randomness_signatures
-                        .into_iter()
-                        .map(|(round, signature)| RandomnessSignatureEntry {
-                            round,
-                            signature: signature.into(),
-                        })
-                        .collect(),
-                })
-            });
-
-        // Apply throttling based on configuration for validator-to-observer streams
-        let final_stream = if let Some(throttle_duration) = calculate_throttle_duration(
-            self.context.parameters.min_round_delay,
-            self.context
-                .parameters
-                .tonic
-                .observer_stream_throttle_divisor,
-        ) {
-            tokio_stream::StreamExt::throttle(stream, throttle_duration).boxed()
-        } else {
-            stream.boxed()
-        };
-
-        Ok(Response::new(final_stream))
-    }
-
-    type FetchBlocksStream =
-        Pin<Box<dyn Stream<Item = Result<FetchBlocksResponse, tonic::Status>> + Send>>;
-
-    async fn fetch_blocks(
-        &self,
-        request: Request<FetchBlocksRequest>,
-    ) -> Result<Response<Self::FetchBlocksStream>, tonic::Status> {
-        let Some(_peer_public_key) = request
-            .extensions()
-            .get::<ObserverPeerInfo>()
-            .map(|p| p.public_key.clone())
-        else {
-            return Err(tonic::Status::internal("ObserverPeerInfo not found"));
-        };
-
-        let inner = request.into_inner();
-        let block_refs = inner
-            .block_refs
-            .into_iter()
-            .map(|r| bcs::from_bytes(&r))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                tonic::Status::internal(format!("Failed to deserialize block_refs: {e:?}"))
-            })?;
-
-        let blocks = self
-            .service
-            .handle_fetch_blocks(
-                AuthorityIndex::new_for_test(0), // Placeholder, not used for observer requests
-                block_refs,
-                inner.highest_accepted_rounds,
-                inner.breadth_first,
-            )
-            .await
-            .map_err(|e| tonic::Status::internal(format!("{e:?}")))?;
-
-        let stream = stream::iter(vec![Ok(FetchBlocksResponse { blocks })]);
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn fetch_commits(
-        &self,
-        request: Request<FetchCommitsRequest>,
-    ) -> Result<Response<FetchCommitsResponse>, tonic::Status> {
-        let Some(_peer_public_key) = request
-            .extensions()
-            .get::<ObserverPeerInfo>()
-            .map(|p| p.public_key.clone())
-        else {
-            return Err(tonic::Status::internal("ObserverPeerInfo not found"));
-        };
-
-        let inner = request.into_inner();
-        let commit_range = CommitRange::new(inner.start..=inner.end);
-
-        let (trusted_commits, verified_blocks) = self
-            .service
-            .handle_fetch_commits(
-                AuthorityIndex::new_for_test(0), // Placeholder, not used for observer requests
-                commit_range,
-            )
-            .await
-            .map_err(|e| tonic::Status::internal(format!("{e:?}")))?;
-
-        // Serialize commits and blocks to bytes
-        let commits = trusted_commits
-            .into_iter()
-            .map(|c| c.serialized().clone())
-            .collect();
-        let certifier_blocks = verified_blocks
-            .into_iter()
-            .map(|b| b.serialized().clone())
-            .collect();
-
-        Ok(Response::new(FetchCommitsResponse {
-            commits,
-            certifier_blocks,
-        }))
-    }
-}
-
-/// Information about the observer peer, set per connection.
-#[derive(Clone, Debug)]
-struct ObserverPeerInfo {
-    public_key: NetworkPublicKey,
-}
-
 /// Manages the lifecycle of Tonic network client and service. Typical usage during initialization:
 /// 1. Create a new `TonicManager`.
 /// 2. Take `TonicClient` from `TonicManager::client()`.
@@ -1265,37 +671,23 @@ struct ObserverPeerInfo {
 pub(crate) struct TonicManager {
     context: Arc<Context>,
     network_keypair: NetworkKeyPair,
-    client: Arc<ConsensusNetworkClient>,
-    validator_server: Option<ServerHandle>,
-    observer_server: Option<ServerHandle>,
+    client: Arc<TonicClient>,
+    server: Option<ServerHandle>,
 }
 
 impl TonicManager {
     pub(crate) fn new(context: Arc<Context>, network_keypair: NetworkKeyPair) -> Self {
-        let client = if context.is_observer {
-            Arc::new(ConsensusNetworkClient::Observer(ObserverClient::new(
-                context.clone(),
-                network_keypair.clone(),
-            )))
-        } else {
-            Arc::new(ConsensusNetworkClient::Validator(TonicClient::new(
-                context.clone(),
-                network_keypair.clone(),
-            )))
-        };
-
         Self {
-            context,
-            network_keypair,
-            client,
-            validator_server: None,
-            observer_server: None,
+            context: context.clone(),
+            network_keypair: network_keypair.clone(),
+            client: Arc::new(TonicClient::new(context, network_keypair)),
+            server: None,
         }
     }
 }
 
 impl<S: NetworkService> NetworkManager<S> for TonicManager {
-    type Client = ConsensusNetworkClient;
+    type Client = TonicClient;
 
     fn new(context: Arc<Context>, network_keypair: NetworkKeyPair) -> Self {
         TonicManager::new(context, network_keypair)
@@ -1313,12 +705,6 @@ impl<S: NetworkService> NetworkManager<S> for TonicManager {
             .with_label_values(&["tonic"])
             .set(1);
 
-        // Observers don't run validator servers, only observer servers
-        if self.context.is_observer {
-            info!("Observer node - skipping validator server setup");
-            return;
-        }
-
         info!("Starting tonic service");
 
         let authority = self.context.committee.authority(self.context.own_index);
@@ -1330,7 +716,7 @@ impl<S: NetworkService> NetworkManager<S> for TonicManager {
             authority.address.with_zero_ip()
         };
         let own_address = to_socket_addr(&own_address).unwrap();
-        let validator_service = TonicServiceProxy::new(self.context.clone(), service.clone());
+        let service = TonicServiceProxy::new(self.context.clone(), service);
         let config = &self.context.parameters.tonic;
 
         let connections_info = Arc::new(ConnectionsInfo::new(self.context.clone()));
@@ -1339,12 +725,10 @@ impl<S: NetworkService> NetworkManager<S> for TonicManager {
             .map_request(move |mut request: http::Request<_>| {
                 if let Some(peer_certificates) =
                     request.extensions().get::<sui_http::PeerCertificates>()
-                {
-                    if let Some(peer_info) =
+                    && let Some(peer_info) =
                         peer_info_from_certs(&connections_info, peer_certificates)
-                    {
-                        request.extensions_mut().insert(peer_info);
-                    }
+                {
+                    request.extensions_mut().insert(peer_info);
                 }
                 request
             })
@@ -1366,15 +750,11 @@ impl<S: NetworkService> NetworkManager<S> for TonicManager {
                 )
             });
 
-        let mut consensus_service_server = ConsensusServiceServer::new(validator_service)
+        let consensus_service_server = ConsensusServiceServer::new(service)
             .max_encoding_message_size(config.message_size_limit)
-            .max_decoding_message_size(config.message_size_limit);
-
-        if self.context.protocol_config.consensus_zstd_compression() {
-            consensus_service_server = consensus_service_server
-                .send_compressed(CompressionEncoding::Zstd)
-                .accept_compressed(CompressionEncoding::Zstd);
-        }
+            .max_decoding_message_size(config.message_size_limit)
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd);
 
         let consensus_service = tonic::service::Routes::new(consensus_service_server)
             .into_axum_router()
@@ -1459,107 +839,12 @@ impl<S: NetworkService> NetworkManager<S> for TonicManager {
             }
         };
 
-        info!("Validator server started at: {own_address}");
-        self.validator_server = Some(server);
-
-        // Start observer server if configured
-        if let Some(observer_port) = config.observer_port {
-            let observer_address = match own_address {
-                SocketAddr::V4(addr) => {
-                    SocketAddr::V4(SocketAddrV4::new(*addr.ip(), observer_port))
-                }
-                SocketAddr::V6(addr) => {
-                    SocketAddr::V6(SocketAddrV6::new(*addr.ip(), observer_port, 0, 0))
-                }
-            };
-
-            info!("Starting observer service at {observer_address}");
-
-            let observer_service_proxy =
-                ObserverServiceProxy::new(self.context.clone(), service.clone());
-
-            let observer_layers = tower::ServiceBuilder::new()
-                .map_request(move |mut request: http::Request<_>| {
-                    if let Some(peer_certificates) =
-                        request.extensions().get::<sui_http::PeerCertificates>()
-                    {
-                        if let Some(observer_peer_info) =
-                            observer_peer_info_from_certs(peer_certificates)
-                        {
-                            debug!("Inserting observer peer info: {:?}", observer_peer_info);
-                            request.extensions_mut().insert(observer_peer_info);
-                        }
-                    } else {
-                        debug!("No peer certificates found for observer");
-                    }
-                    request
-                })
-                .layer(CallbackLayer::new(MetricsCallbackMaker::new(
-                    self.context.metrics.network_metrics.inbound.clone(),
-                    self.context.parameters.tonic.excessive_message_size,
-                )))
-                .layer(
-                    TraceLayer::new_for_grpc()
-                        .make_span_with(DefaultMakeSpan::new().level(tracing::Level::TRACE))
-                        .on_failure(DefaultOnFailure::new().level(tracing::Level::DEBUG)),
-                )
-                .layer_fn(|service| {
-                    mysten_network::grpc_timeout::GrpcTimeout::new(
-                        service,
-                        DEFAULT_GRPC_SERVER_TIMEOUT,
-                    )
-                });
-
-            let mut observer_service_server =
-                ObserverConsensusServiceServer::new(observer_service_proxy)
-                    .max_encoding_message_size(config.message_size_limit)
-                    .max_decoding_message_size(config.message_size_limit);
-
-            if self.context.protocol_config.consensus_zstd_compression() {
-                observer_service_server = observer_service_server
-                    .send_compressed(CompressionEncoding::Zstd)
-                    .accept_compressed(CompressionEncoding::Zstd);
-            }
-
-            let observer_consensus_service = tonic::service::Routes::new(observer_service_server)
-                .into_axum_router()
-                .route_layer(observer_layers);
-
-            // Observer server requires mTLS but accepts any valid certificate (not just committee members)
-            let observer_tls_config = sui_tls::create_rustls_server_config_with_client_verifier(
-                self.network_keypair.clone().private_key().into_inner(),
-                certificate_server_name(&self.context),
-                sui_tls::AllowAll,
-            );
-
-            let deadline = Instant::now() + Duration::from_secs(20);
-            let observer_server = loop {
-                match sui_http::Builder::new()
-                    .config(http_config.clone())
-                    .tls_config(observer_tls_config.clone())
-                    .serve(observer_address, observer_consensus_service.clone())
-                {
-                    Ok(server) => break server,
-                    Err(err) => {
-                        warn!("Error starting observer server: {err:?}");
-                        if Instant::now() > deadline {
-                            panic!("Failed to start observer server within required deadline");
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            };
-
-            info!("Observer server started at: {observer_address}");
-            self.observer_server = Some(observer_server);
-        }
+        info!("Server started at: {own_address}");
+        self.server = Some(server);
     }
 
     async fn stop(&mut self) {
-        if let Some(server) = self.validator_server.take() {
-            server.shutdown().await;
-        }
-        if let Some(server) = self.observer_server.take() {
+        if let Some(server) = self.server.take() {
             server.shutdown().await;
         }
 
@@ -1576,10 +861,7 @@ impl<S: NetworkService> NetworkManager<S> for TonicManager {
 // dropped.
 impl Drop for TonicManager {
     fn drop(&mut self) {
-        if let Some(server) = self.validator_server.as_ref() {
-            server.trigger_shutdown();
-        }
-        if let Some(server) = self.observer_server.as_ref() {
+        if let Some(server) = self.server.as_ref() {
             server.trigger_shutdown();
         }
     }
@@ -1613,31 +895,6 @@ fn peer_info_from_certs(
         return None;
     };
     Some(PeerInfo { authority_index })
-}
-
-fn observer_peer_info_from_certs(
-    peer_certificates: &sui_http::PeerCertificates,
-) -> Option<ObserverPeerInfo> {
-    let certs = peer_certificates.peer_certs();
-
-    if certs.len() != 1 {
-        trace!(
-            "Unexpected number of certificates from TLS stream: {}",
-            certs.len()
-        );
-        return None;
-    }
-    trace!("Received {} certificates from observer", certs.len());
-    let public_key = sui_tls::public_key_from_certificate(&certs[0])
-        .map_err(|e| {
-            trace!("Failed to extract public key from certificate: {e:?}");
-            e
-        })
-        .ok()?;
-    let client_public_key = NetworkPublicKey::new(public_key);
-    Some(ObserverPeerInfo {
-        public_key: client_public_key,
-    })
 }
 
 /// Attempts to convert a multiaddr of the form `/[ip4,ip6,dns]/{}/udp/{port}` into
@@ -1786,19 +1043,6 @@ pub(crate) struct SendBlockRequest {
     // Serialized SignedBlock.
     #[prost(bytes = "bytes", tag = "1")]
     block: Bytes,
-    // Optional randomness signatures completed recently.
-    // Vec of (RandomnessRound, BCS-serialized RandomnessSignature).
-    // This allows observers to learn about completed randomness rounds.
-    #[prost(message, repeated, tag = "2")]
-    randomness_signatures: Vec<RandomnessSignatureEntry>,
-}
-
-#[derive(Clone, prost::Message)]
-pub(crate) struct RandomnessSignatureEntry {
-    #[prost(uint64, tag = "1")]
-    round: u64,
-    #[prost(bytes = "bytes", tag = "2")]
-    signature: Bytes,
 }
 
 #[derive(Clone, prost::Message)]
@@ -1817,10 +1061,6 @@ pub(crate) struct SubscribeBlocksResponse {
     // Serialized BlockRefs that are excluded from the blocks ancestors.
     #[prost(bytes = "vec", repeated, tag = "2")]
     excluded_ancestors: Vec<Vec<u8>>,
-    // Optional randomness signatures completed recently.
-    // This allows observers to learn about completed randomness rounds.
-    #[prost(message, repeated, tag = "3")]
-    randomness_signatures: Vec<RandomnessSignatureEntry>,
 }
 
 #[derive(Clone, prost::Message)]

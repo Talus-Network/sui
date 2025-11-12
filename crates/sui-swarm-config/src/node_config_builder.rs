@@ -8,18 +8,18 @@ use std::time::Duration;
 use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::traits::KeyPair;
 use sui_config::node::{
-    default_enable_index_processing, default_end_of_epoch_broadcast_channel_capacity,
     AuthorityKeyPairWithPath, AuthorityOverloadConfig, AuthorityStorePruningConfig,
-    CheckpointExecutorConfig, DBCheckpointConfig, ExecutionCacheConfig,
-    ExecutionTimeObserverConfig, ExpensiveSafetyCheckConfig, Genesis, KeyPairWithPath,
-    StateSnapshotConfig, DEFAULT_GRPC_CONCURRENCY_LIMIT,
+    CheckpointExecutorConfig, DBCheckpointConfig, DEFAULT_GRPC_CONCURRENCY_LIMIT,
+    ExecutionCacheConfig, ExecutionTimeObserverConfig, ExpensiveSafetyCheckConfig, Genesis,
+    KeyPairWithPath, StateSnapshotConfig, default_enable_index_processing,
+    default_end_of_epoch_broadcast_channel_capacity,
 };
-use sui_config::node::{default_zklogin_oauth_providers, RunWithRange};
+use sui_config::node::{RunWithRange, TransactionDriverConfig, default_zklogin_oauth_providers};
 use sui_config::p2p::{P2pConfig, SeedPeer, StateSyncConfig};
 use sui_config::verifier_signing_config::VerifierSigningConfig;
 use sui_config::{
-    local_ip_utils, ConsensusConfig, NodeConfig, AUTHORITIES_DB_NAME, CONSENSUS_DB_NAME,
-    FULL_NODE_DB_PATH,
+    AUTHORITIES_DB_NAME, CONSENSUS_DB_NAME, ConsensusConfig, FULL_NODE_DB_PATH, NodeConfig,
+    local_ip_utils,
 };
 use sui_protocol_config::Chain;
 use sui_types::crypto::{AuthorityKeyPair, AuthorityPublicKeyBytes, NetworkKeyPair, SuiKeyPair};
@@ -163,8 +163,6 @@ impl ValidatorConfigBuilder {
             max_pending_transactions: None,
             max_submit_position: self.max_submit_position,
             submit_delay_step_override_millis: self.submit_delay_step_override_millis,
-            is_observer: false,
-            observer_target_validator: None,
             parameters: Default::default(),
         };
 
@@ -257,7 +255,7 @@ impl ValidatorConfigBuilder {
             chain_override_for_testing: self.chain_override,
             validator_client_monitor_config: None,
             fork_recovery: None,
-            mfp_allowed_list: vec![],
+            transaction_driver_config: Some(TransactionDriverConfig::default()),
         }
     }
 
@@ -295,7 +293,8 @@ pub struct FullnodeConfigBuilder {
     data_ingestion_dir: Option<PathBuf>,
     disable_pruning: bool,
     chain_override: Option<Chain>,
-    mfp_allowed_list: Vec<String>,
+    transaction_driver_config: Option<TransactionDriverConfig>,
+    rpc_config: Option<sui_config::RpcConfig>,
 }
 
 impl FullnodeConfigBuilder {
@@ -323,6 +322,11 @@ impl FullnodeConfigBuilder {
     pub fn with_rpc_addr(mut self, addr: SocketAddr) -> Self {
         assert!(self.rpc_addr.is_none() && self.rpc_port.is_none());
         self.rpc_addr = Some(addr);
+        self
+    }
+
+    pub fn with_rpc_config(mut self, rpc_config: sui_config::RpcConfig) -> Self {
+        self.rpc_config = Some(rpc_config);
         self
     }
 
@@ -419,8 +423,11 @@ impl FullnodeConfigBuilder {
         self
     }
 
-    pub fn with_mfp_allowed_list(mut self, list: Vec<String>) -> Self {
-        self.mfp_allowed_list = list;
+    pub fn with_transaction_driver_config(
+        mut self,
+        config: Option<TransactionDriverConfig>,
+    ) -> Self {
+        self.transaction_driver_config = config;
         self
     }
 
@@ -443,19 +450,6 @@ impl FullnodeConfigBuilder {
         let config_directory = self
             .config_directory
             .unwrap_or_else(|| mysten_common::tempdir().unwrap().keep());
-
-        let consensus_db_path = config_directory.join(CONSENSUS_DB_NAME).join(&key_path);
-        let consensus_config = ConsensusConfig {
-            db_path: consensus_db_path,
-            is_observer: true,
-            db_retention_epochs: None,
-            db_pruner_period_secs: None,
-            max_pending_transactions: None,
-            max_submit_position: None,
-            submit_delay_step_override_millis: None,
-            observer_target_validator: None,
-            parameters: Default::default(),
-        }; 
 
         let p2p_config = {
             let seed_peers = network_config
@@ -533,7 +527,7 @@ impl FullnodeConfigBuilder {
                 .admin_interface_port
                 .unwrap_or(local_ip_utils::get_available_port(&localhost)),
             json_rpc_address: self.json_rpc_address.unwrap_or(json_rpc_address),
-            consensus_config: Some(consensus_config),
+            consensus_config: None,
             remove_deprecated_tables: false,
             enable_index_processing: default_enable_index_processing(),
             genesis: self.genesis.unwrap_or(sui_config::node::Genesis::new(
@@ -563,9 +557,11 @@ impl FullnodeConfigBuilder {
             indexer_max_subscriptions: Default::default(),
             transaction_kv_store_read_config: Default::default(),
             transaction_kv_store_write_config: Default::default(),
-            rpc: Some(sui_rpc_api::Config {
-                enable_indexing: Some(true),
-                ..Default::default()
+            rpc: self.rpc_config.or_else(|| {
+                Some(sui_rpc_api::Config {
+                    enable_indexing: Some(true),
+                    ..Default::default()
+                })
             }),
             // note: not used by fullnodes.
             jwk_fetch_interval_seconds: 3600,
@@ -586,7 +582,9 @@ impl FullnodeConfigBuilder {
             chain_override_for_testing: self.chain_override,
             validator_client_monitor_config: None,
             fork_recovery: None,
-            mfp_allowed_list: self.mfp_allowed_list,
+            transaction_driver_config: self
+                .transaction_driver_config
+                .or(Some(TransactionDriverConfig::default())),
         }
     }
 }

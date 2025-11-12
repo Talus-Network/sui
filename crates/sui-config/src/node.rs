@@ -1,5 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+use crate::Config;
 use crate::certificate_deny_config::CertificateDenyConfig;
 use crate::genesis;
 use crate::object_storage_config::ObjectStoreConfig;
@@ -7,7 +8,6 @@ use crate::p2p::P2pConfig;
 use crate::transaction_deny_config::TransactionDenyConfig;
 use crate::validator_client_monitor_config::ValidatorClientMonitorConfig;
 use crate::verifier_signing_config::VerifierSigningConfig;
-use crate::Config;
 use anyhow::Result;
 use consensus_config::Parameters as ConsensusParameters;
 use mysten_common::fatal;
@@ -33,7 +33,7 @@ use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::supported_protocol_versions::{Chain, SupportedProtocolVersions};
 use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig};
 
-use sui_types::crypto::{get_key_pair_from_rng, AccountKeyPair, AuthorityKeyPair};
+use sui_types::crypto::{AccountKeyPair, AuthorityKeyPair, get_key_pair_from_rng};
 use sui_types::multiaddr::Multiaddr;
 use tracing::info;
 
@@ -222,10 +222,34 @@ pub struct NodeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_recovery: Option<ForkRecoveryConfig>,
 
+    /// Configuration for the transaction driver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_driver_config: Option<TransactionDriverConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TransactionDriverConfig {
     /// The list of validators that are allowed to submit MFP transactions to (via the transaction driver).
     /// Each entry is a validator display name.
-    #[serde(default)]
-    pub mfp_allowed_list: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_submission_validators: Vec<String>,
+
+    /// Enable early transaction validation before submission to consensus.
+    /// This checks for non-retriable errors (like old object versions) and rejects
+    /// transactions early to provide fast feedback to clients.
+    /// Note: Currently used in TransactionOrchestrator, but may be moved to TransactionDriver in future.
+    #[serde(default = "bool_true")]
+    pub enable_early_validation: bool,
+}
+
+impl Default for TransactionDriverConfig {
+    fn default() -> Self {
+        Self {
+            allowed_submission_validators: vec![],
+            enable_early_validation: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -690,6 +714,7 @@ pub fn default_zklogin_oauth_providers() -> BTreeMap<Chain, BTreeSet<String>> {
         "AwsTenant-region:us-east-1-tenant_id:us-east-1_qPsZxYqd8".to_string(), // Ambrus, external partner
         "Arden".to_string(),                                                    // Arden partner
         "AwsTenant-region:eu-west-3-tenant_id:eu-west-3_gGVCx53Es".to_string(), // Trace, external partner
+        "EveFrontier".to_string(),
     ]);
 
     // providers that are available for mainnet and testnet.
@@ -853,31 +878,6 @@ impl NodeConfig {
     pub fn rpc(&self) -> Option<&crate::RpcConfig> {
         self.rpc.as_ref()
     }
-
-    /// Determines the type of node based on the configuration
-    pub fn node_type(&self) -> NodeType {
-        match &self.consensus_config {
-            None => NodeType::FullNode,
-            Some(config) => {
-                if config.is_observer {
-                    NodeType::Observer
-                } else {
-                    NodeType::Validator
-                }
-            }
-        }
-    }
-}
-
-/// Represents the type of node in the Sui network
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeType {
-    /// A validator that participates in consensus and produces blocks
-    Validator,
-    /// An observer (full node) that follows consensus without participating
-    Observer,
-    /// A regular full node that does not run consensus
-    FullNode,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -915,17 +915,6 @@ pub struct ConsensusConfig {
     /// override the current back off logic otherwise the default backoff logic will be applied based
     /// on consensus latency estimates.
     pub submit_delay_step_override_millis: Option<u64>,
-
-    /// When true, this node runs consensus as an observer (full node) rather than a validator.
-    /// Observer nodes follow consensus without participating in block production.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub is_observer: bool,
-
-    /// For observer nodes, specifies the hostname of the validator to stream blocks from.
-    /// If not specified, observer will connect to all validators.
-    /// Example: "validator-1.example.com"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observer_target_validator: Option<String>,
 
     pub parameters: Option<ConsensusParameters>,
 }
@@ -1434,6 +1423,7 @@ impl Genesis {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 enum GenesisLocation {
     InPlace {
         genesis: genesis::Genesis,
@@ -1603,15 +1593,31 @@ where
     let mut processed_options = Vec::new();
 
     for (key, value) in raw_options {
-        match read_credential_from_path_or_literal(&value) {
-            Ok(processed_value) => processed_options.push((key, processed_value)),
-            Err(e) => {
-                return Err(D::Error::custom(format!(
-                    "Failed to read credential for key '{}': {}",
-                    key, e
-                )))
+        // GCS service_account keys expect a file path, not the file content
+        // All other keys (AWS credentials, service_account_key) should read file content
+        let is_service_account_path = matches!(
+            key.as_str(),
+            "google_service_account"
+                | "service_account"
+                | "google_service_account_path"
+                | "service_account_path"
+        );
+
+        let processed_value = if is_service_account_path {
+            value
+        } else {
+            match read_credential_from_path_or_literal(&value) {
+                Ok(processed) => processed,
+                Err(e) => {
+                    return Err(D::Error::custom(format!(
+                        "Failed to read credential for key '{}': {}",
+                        key, e
+                    )));
+                }
             }
-        }
+        };
+
+        processed_options.push((key, processed_value));
     }
 
     Ok(processed_options)
@@ -1622,9 +1628,9 @@ mod tests {
     use std::path::PathBuf;
 
     use fastcrypto::traits::KeyPair;
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{SeedableRng, rngs::StdRng};
     use sui_keys::keypair_file::{write_authority_keypair_to_file, write_keypair_to_file};
-    use sui_types::crypto::{get_key_pair_from_rng, AuthorityKeyPair, NetworkKeyPair, SuiKeyPair};
+    use sui_types::crypto::{AuthorityKeyPair, NetworkKeyPair, SuiKeyPair, get_key_pair_from_rng};
 
     use super::{Genesis, StateArchiveConfig};
     use crate::NodeConfig;
@@ -1762,6 +1768,66 @@ remote-store-options:
         assert_eq!(config.remote_store_options.len(), 2);
         assert_eq!(config.remote_store_options[0].1, "literal_access_key");
         assert_eq!(config.remote_store_options[1].1, "literal_secret_key");
+    }
+
+    #[test]
+    fn test_remote_store_options_gcs_service_account_path_preserved() {
+        let temp_dir = std::env::temp_dir();
+        let service_account_file = temp_dir.join("test_service_account.json");
+        let aws_key_file = temp_dir.join("test_aws_key");
+
+        std::fs::write(&service_account_file, r#"{"type": "service_account"}"#).unwrap();
+        std::fs::write(&aws_key_file, "aws_key_value").unwrap();
+
+        let yaml_config = format!(
+            r#"
+object-store-config: null
+concurrency: 5
+ingestion-url: "gs://my-bucket"
+remote-store-options:
+  - ["service_account", "{}"]
+  - ["google_service_account_path", "{}"]
+  - ["aws_access_key_id", "{}"]
+"#,
+            service_account_file.to_string_lossy(),
+            service_account_file.to_string_lossy(),
+            aws_key_file.to_string_lossy()
+        );
+
+        let config: StateArchiveConfig = serde_yaml::from_str(&yaml_config).unwrap();
+
+        assert_eq!(config.remote_store_options.len(), 3);
+
+        // service_account should preserve the file path, not read the content
+        let service_account_option = config
+            .remote_store_options
+            .iter()
+            .find(|(key, _)| key == "service_account")
+            .unwrap();
+        assert_eq!(
+            service_account_option.1,
+            service_account_file.to_string_lossy()
+        );
+
+        // google_service_account_path should also preserve the file path
+        let gcs_path_option = config
+            .remote_store_options
+            .iter()
+            .find(|(key, _)| key == "google_service_account_path")
+            .unwrap();
+        assert_eq!(gcs_path_option.1, service_account_file.to_string_lossy());
+
+        // AWS key should read the file content
+        let aws_option = config
+            .remote_store_options
+            .iter()
+            .find(|(key, _)| key == "aws_access_key_id")
+            .unwrap();
+        assert_eq!(aws_option.1, "aws_key_value");
+
+        // Clean up
+        std::fs::remove_file(&service_account_file).ok();
+        std::fs::remove_file(&aws_key_file).ok();
     }
 }
 
