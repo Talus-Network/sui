@@ -330,7 +330,7 @@ public fun send_token_v2<T>(
         target_address,
         token_type: token_id,
         amount: token_amount,
-        timestamp: clock.timestamp_ms(),
+        timestamp_ms: clock.timestamp_ms(),
     });
 }
 
@@ -582,14 +582,17 @@ fun claim_token_internal<T>(
     assert!(record.verified_signatures.is_some(), EUnauthorisedClaim);
 
     // extract token message
-    let token_payload = record.message.extract_token_bridge_payload();
     let mut bypass_limiter = false;
-    if (record.message.message_version() == 2) {
-        let timestamp = record.message.extract_token_bridge_payload_v2_timestamp();
+    let mut token_payload;
+    if (record.message.message_version() == 1) {
+        token_payload = record.message.extract_token_bridge_payload();
+    } else if (record.message.message_version() == 2) {
+        let token_payload_v2 = record.message.extract_token_bridge_payload_v2();
+
+        let timestamp = token_payload_v2.timestamp_ms();
         // if token_payload.timestamp is within the last 48 hours, bypass the limiter
-        if (clock.timestamp_ms() < timestamp + 48 * 3600000) {
-            bypass_limiter = true;
-        };
+        bypass_limiter = clock.timestamp_ms() < timestamp + 48 * 3600000;
+        token_payload = token_payload_v2.to_token_payload_v1();
     };
 
     // get owner address
