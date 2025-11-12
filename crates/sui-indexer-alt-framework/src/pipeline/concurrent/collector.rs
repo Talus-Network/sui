@@ -27,58 +27,6 @@ struct PendingCheckpoint<H: Handler> {
     watermark: WatermarkPart,
 }
 
-/// Helper enum for filtering checkpoints based on the main pipeline's reader watermark. The
-/// `Disabled` variant is a regular pipeline that will batch all checkpoint data without filtering.
-/// The `Enabled` variant tracks the main pipeline reader watermark and enables dropping checkpoints
-/// below that value.
-enum MainReaderFilter {
-    Enabled(watch::Receiver<Option<u64>>),
-    Disabled,
-}
-
-impl MainReaderFilter {
-    /// Wait until the watch channel is initialized, returning `None` if there is a watch channel,
-    /// but the sender is closed.
-    async fn init(rx_opt: Option<watch::Receiver<Option<u64>>>) -> Option<Self> {
-        match rx_opt {
-            None => return Some(Self::Disabled),
-            Some(mut rx) => {
-                if rx.wait_for(|v| v.is_some()).await.is_err() {
-                    return None;
-                }
-                Some(MainReaderFilter::Enabled(rx))
-            }
-        }
-    }
-
-    /// If the given checkpoint is less than the main reader lo, return true to indicate it should
-    /// be skipped.
-    fn should_skip(&self, checkpoint: u64) -> bool {
-        match self {
-            MainReaderFilter::Disabled => false,
-            MainReaderFilter::Enabled(rx) => {
-                // SAFETY: We ensured during initialization that this value is `Some`.
-                checkpoint
-                    < rx.borrow()
-                        .expect("main_reader_lo should not revert to None after initialization")
-            }
-        }
-    }
-
-    /// Wait for the main reader watermark to change. The `Disabled` variant never resolves. The
-    /// `Enabled` variant blocks until the channel receives a new value, and then updates its cached
-    /// value.
-    async fn wait_for_change(&mut self) -> Result<(), ()> {
-        match self {
-            MainReaderFilter::Disabled => std::future::pending().await,
-            MainReaderFilter::Enabled(rx) => {
-                rx.changed().await.map_err(|_| ())?;
-                Ok(())
-            }
-        }
-    }
-}
-
 impl<H: Handler> PendingCheckpoint<H> {
     /// Whether there are values left to commit from this indexed checkpoint.
     fn is_empty(&self) -> bool {
@@ -121,24 +69,11 @@ pub(super) fn collector<H: Handler + 'static>(
     config: CommitterConfig,
     mut rx: mpsc::Receiver<IndexedCheckpoint<H>>,
     tx: mpsc::Sender<BatchedRows<H>>,
-    main_reader_lo_rx: Option<watch::Receiver<Option<u64>>>,
+    mut main_reader_lo_rx: watch::Receiver<Option<u64>>,
     metrics: Arc<IndexerMetrics>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // If the channel exists, the collector needs to block until the main reader lo value is
-        // initialized.
-        let mut main_reader_filter = match MainReaderFilter::init(main_reader_lo_rx).await {
-            Some(filter) => filter,
-            None => {
-                info!(
-                    pipeline = H::NAME,
-                    "Shutdown received before main reader lo initialized"
-                );
-                return;
-            }
-        };
-
         // The `poll` interval controls the maximum time to wait between collecting batches,
         // regardless of number of rows pending.
         let mut poll = interval(config.collect_interval());
@@ -163,16 +98,13 @@ pub(super) fn collector<H: Handler + 'static>(
                     break;
                 }
 
-                // Check that the main_reader_lo channel is still open.
-                changed_result = main_reader_filter.wait_for_change() => {
-                    if changed_result.is_err() {
-                        info!(
-                            pipeline = H::NAME,
-                            "Shutting down collector as main reader lo watch closed",
-                        );
+                result = main_reader_lo_rx.changed() => {
+                    if result.is_err() {
+                        info!(pipeline = H::NAME, "Main reader lo channel closed, stopping collector");
                         break;
                     }
                 }
+
 
                 // Time to create another batch and push it to the committer.
                 _ = poll.tick() => {
@@ -258,9 +190,20 @@ pub(super) fn collector<H: Handler + 'static>(
 
                 // docs::#collector (see docs/content/guides/developer/advanced/custom-indexer.mdx)
                 Some(mut indexed) = rx.recv(), if pending_rows < H::MAX_PENDING_ROWS => {
+                    // Block until the main `reader_lo` is not `None` - writer needs to populate the
+                    // channel so the collector knows which checkpoints to keep or filter out.
+                    let main_reader_lo = match main_reader_lo_rx.wait_for(|v| v.is_some()).await {
+                        Err(_) => {
+                            info!(pipeline = H::NAME, "Main reader lo channel closed before initialization, stopping collector");
+                            break;
+                        }
+                        // SAFETY: We just waited for the value to be `Some`.
+                        Ok(value) => value.unwrap(),
+                    };
+
                     // Clear the values of outdated checkpoints, so that we don't commit data to the
                     // store, but can still advance watermarks.
-                    if main_reader_filter.should_skip(indexed.checkpoint()) {
+                    if indexed.checkpoint() < main_reader_lo {
                         indexed.values.clear();
                         metrics.total_collector_skipped_checkpoints
                             .with_label_values(&[H::NAME])
@@ -388,6 +331,7 @@ mod tests {
         let (processor_tx, processor_rx) = mpsc::channel(10);
         let (collector_tx, mut collector_rx) = mpsc::channel(10);
         let cancel = CancellationToken::new();
+        let (_main_reader_lo_tx, main_reader_lo_rx) = watch::channel(Some(0u64));
 
         let handler = Arc::new(TestHandler);
         let _collector = collector::<TestHandler>(
@@ -395,7 +339,7 @@ mod tests {
             CommitterConfig::default(),
             processor_rx,
             collector_tx,
-            None,
+            main_reader_lo_rx,
             test_metrics(),
             cancel.clone(),
         );
@@ -431,6 +375,7 @@ mod tests {
         let (processor_tx, processor_rx) = mpsc::channel(10);
         let (collector_tx, mut collector_rx) = mpsc::channel(10);
         let cancel = CancellationToken::new();
+        let (_main_reader_lo_tx, main_reader_lo_rx) = watch::channel(Some(0u64));
 
         let handler = Arc::new(TestHandler);
         let collector = collector::<TestHandler>(
@@ -438,7 +383,7 @@ mod tests {
             CommitterConfig::default(),
             processor_rx,
             collector_tx,
-            None,
+            main_reader_lo_rx,
             test_metrics(),
             cancel.clone(),
         );
@@ -470,6 +415,7 @@ mod tests {
         let collector_channel_size = 2; // unit is batch, aka rows / MAX_CHUNK_ROWS
         let (processor_tx, processor_rx) = mpsc::channel(processor_channel_size);
         let (collector_tx, _collector_rx) = mpsc::channel(collector_channel_size);
+        let (_main_reader_lo_tx, main_reader_lo_rx) = watch::channel(Some(0u64));
 
         let metrics = test_metrics();
         let cancel = CancellationToken::new();
@@ -480,7 +426,7 @@ mod tests {
             CommitterConfig::default(),
             processor_rx,
             collector_tx,
-            None,
+            main_reader_lo_rx,
             metrics.clone(),
             cancel.clone(),
         );
@@ -524,6 +470,8 @@ mod tests {
     async fn test_collector_accumulates_across_checkpoints_until_eager_threshold() {
         let (processor_tx, processor_rx) = mpsc::channel(10);
         let (collector_tx, mut collector_rx) = mpsc::channel(10);
+        let (_main_reader_lo_tx, main_reader_lo_rx) = watch::channel(Some(0u64));
+
         let cancel = CancellationToken::new();
 
         // Set a very long collect interval (60 seconds) to ensure timing doesn't trigger batching
@@ -537,7 +485,7 @@ mod tests {
             config,
             processor_rx,
             collector_tx,
-            None,
+            main_reader_lo_rx,
             test_metrics(),
             cancel.clone(),
         );
@@ -581,6 +529,8 @@ mod tests {
     async fn test_immediate_batch_on_min_eager_rows() {
         let (processor_tx, processor_rx) = mpsc::channel(10);
         let (collector_tx, mut collector_rx) = mpsc::channel(10);
+        let (_main_reader_lo_tx, main_reader_lo_rx) = watch::channel(Some(0u64));
+
         let cancel = CancellationToken::new();
 
         // Set a very long collect interval (60 seconds) to ensure timing doesn't trigger batching
@@ -594,7 +544,7 @@ mod tests {
             config,
             processor_rx,
             collector_tx,
-            None,
+            main_reader_lo_rx,
             test_metrics(),
             cancel.clone(),
         );
@@ -627,6 +577,8 @@ mod tests {
     async fn test_collector_waits_for_timer_when_below_eager_threshold() {
         let (processor_tx, processor_rx) = mpsc::channel(10);
         let (collector_tx, mut collector_rx) = mpsc::channel(10);
+        let (_main_reader_lo_tx, main_reader_lo_rx) = watch::channel(Some(0u64));
+
         let cancel = CancellationToken::new();
 
         // Set a reasonable collect interval for this test (3 seconds).
@@ -640,7 +592,7 @@ mod tests {
             config,
             processor_rx,
             collector_tx,
-            None,
+            main_reader_lo_rx,
             test_metrics(),
             cancel.clone(),
         );
@@ -673,28 +625,25 @@ mod tests {
         let cancel = CancellationToken::new();
         let (main_reader_lo_tx, main_reader_lo_rx) = watch::channel(None);
 
-        let _collector = collector::<MainReaderLoTestHandler>(
+        let handler = Arc::new(TestHandler);
+        let collector = collector(
+            handler,
             CommitterConfig {
-                // Collect interval logger than time to advance to ensure timing doesn't trigger
+                // Collect interval longer than time to advance to ensure timing doesn't trigger
                 // batching.
                 collect_interval_ms: 200_000,
                 ..CommitterConfig::default()
             },
             processor_rx,
             collector_tx,
-            Some(main_reader_lo_rx),
+            main_reader_lo_rx,
             test_metrics(),
             cancel.clone(),
         );
 
         // Send enough data to trigger batching.
-        let test_data = IndexedCheckpoint::new(
-            0,
-            1,
-            10,
-            1000,
-            vec![SequenceNumber(1); MainReaderLoTestHandler::MIN_EAGER_ROWS + 1],
-        );
+        let test_data =
+            IndexedCheckpoint::new(0, 1, 10, 1000, vec![Entry; TestHandler::MIN_EAGER_ROWS + 1]);
         processor_tx.send(test_data).await.unwrap();
 
         // Advance time significantly - collector should still be blocked waiting for
@@ -710,9 +659,10 @@ mod tests {
 
         let batch = recv_with_timeout(&mut collector_rx, Duration::from_secs(2)).await;
 
-        assert_eq!(batch.len(), MainReaderLoTestHandler::MIN_EAGER_ROWS + 1);
+        assert_eq!(batch.batch_len, TestHandler::MIN_EAGER_ROWS + 1);
 
         cancel.cancel();
+        collector.await.unwrap();
     }
 
     /// During initialization, if the `main_reader_lo_rx` channel closes before sending a value, the
@@ -724,28 +674,24 @@ mod tests {
         let cancel = CancellationToken::new();
         let (main_reader_lo_tx, main_reader_lo_rx) = watch::channel(None);
 
-        let collector = collector::<MainReaderLoTestHandler>(
+        let collector = collector(
+            Arc::new(TestHandler),
             CommitterConfig {
-                // Collect interval logger than time to advance to ensure timing doesn't trigger
+                // Collect interval longer than time to advance to ensure timing doesn't trigger
                 // batching.
                 collect_interval_ms: 200_000,
                 ..CommitterConfig::default()
             },
             processor_rx,
             collector_tx,
-            Some(main_reader_lo_rx),
+            main_reader_lo_rx,
             test_metrics(),
             cancel.clone(),
         );
 
         // Send enough data to trigger batching.
-        let test_data = IndexedCheckpoint::new(
-            0,
-            1,
-            10,
-            1000,
-            vec![SequenceNumber(1); MainReaderLoTestHandler::MIN_EAGER_ROWS + 1],
-        );
+        let test_data =
+            IndexedCheckpoint::new(0, 1, 10, 1000, vec![Entry; TestHandler::MIN_EAGER_ROWS + 1]);
         processor_tx.send(test_data).await.unwrap();
 
         assert!(collector_rx.try_recv().is_err());
@@ -769,43 +715,34 @@ mod tests {
         let cancel = CancellationToken::new();
         let (main_reader_lo_tx, main_reader_lo_rx) = watch::channel(None);
 
-        let collector = collector::<MainReaderLoTestHandler>(
+        let collector = collector(
+            Arc::new(TestHandler),
             CommitterConfig {
-                // Collect interval logger than time to advance to ensure timing doesn't trigger
+                // Collect interval longer than time to advance to ensure timing doesn't trigger
                 // batching.
                 collect_interval_ms: 200_000,
                 ..CommitterConfig::default()
             },
             processor_rx,
             collector_tx,
-            Some(main_reader_lo_rx),
+            main_reader_lo_rx,
             test_metrics(),
             cancel.clone(),
         );
 
         // Send enough data to trigger batching, and validate that we are able to get the first batch.
-        let test_data = IndexedCheckpoint::new(
-            0,
-            1,
-            10,
-            1000,
-            vec![SequenceNumber(1); MainReaderLoTestHandler::MIN_EAGER_ROWS + 1],
-        );
+        let test_data =
+            IndexedCheckpoint::new(0, 1, 10, 1000, vec![Entry; TestHandler::MIN_EAGER_ROWS + 1]);
         processor_tx.send(test_data).await.unwrap();
         main_reader_lo_tx.send(Some(0)).unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
         let batch = recv_with_timeout(&mut collector_rx, Duration::from_secs(2)).await;
 
-        assert_eq!(batch.len(), MainReaderLoTestHandler::MIN_EAGER_ROWS + 1);
+        assert_eq!(batch.batch_len, TestHandler::MIN_EAGER_ROWS + 1);
 
         // On the next batch, test that we eventually shut down when the channel closes.
-        let test_data = IndexedCheckpoint::new(
-            0,
-            2,
-            20,
-            2000,
-            vec![SequenceNumber(2); MainReaderLoTestHandler::MIN_EAGER_ROWS + 1],
-        );
+        let test_data =
+            IndexedCheckpoint::new(0, 2, 20, 2000, vec![Entry; TestHandler::MIN_EAGER_ROWS + 1]);
         processor_tx.send(test_data).await.unwrap();
         main_reader_lo_tx.send(Some(1)).unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -827,33 +764,26 @@ mod tests {
         let (_main_reader_lo_tx, main_reader_lo_rx) = watch::channel(Some(5u64));
         let metrics = test_metrics();
 
-        let _collector = collector::<MainReaderLoTestHandler>(
+        let _collector = collector(
+            Arc::new(TestHandler),
             CommitterConfig {
-                // Collect interval logger than time to advance to ensure timing doesn't trigger
+                // Collect interval longer than time to advance to ensure timing doesn't trigger
                 // batching.
                 collect_interval_ms: 200_000,
                 ..CommitterConfig::default()
             },
             processor_rx,
             collector_tx,
-            Some(main_reader_lo_rx),
+            main_reader_lo_rx,
             metrics.clone(),
             cancel.clone(),
         );
 
-        let eager_rows_plus_one = MainReaderLoTestHandler::MIN_EAGER_ROWS + 1;
+        let eager_rows_plus_one = TestHandler::MIN_EAGER_ROWS + 1;
 
         let test_data: Vec<_> = [1, 5, 2, 6, 4]
             .into_iter()
-            .map(|cp| {
-                IndexedCheckpoint::new(
-                    0,
-                    cp,
-                    10,
-                    1000,
-                    vec![SequenceNumber(cp); eager_rows_plus_one],
-                )
-            })
+            .map(|cp| IndexedCheckpoint::new(0, cp, 10, 1000, vec![Entry; eager_rows_plus_one]))
             .collect();
         for data in test_data {
             processor_tx.send(data).await.unwrap();
@@ -866,7 +796,7 @@ mod tests {
         assert_eq!(
             metrics
                 .total_collector_checkpoints_received
-                .with_label_values(&[MainReaderLoTestHandler::NAME])
+                .with_label_values(&[TestHandler::NAME])
                 .get(),
             5
         );
@@ -874,12 +804,12 @@ mod tests {
         assert_eq!(
             metrics
                 .total_collector_skipped_checkpoints
-                .with_label_values(&[MainReaderLoTestHandler::NAME])
+                .with_label_values(&[TestHandler::NAME])
                 .get(),
             3
         );
         // And that we only have values from two checkpoints (5, 6)
-        assert_eq!(batch.len(), eager_rows_plus_one * 2);
+        assert_eq!(batch.batch_len, eager_rows_plus_one * 2);
 
         cancel.cancel();
     }
@@ -897,30 +827,26 @@ mod tests {
         let (main_reader_lo_tx, main_reader_lo_rx) = watch::channel(Some(0u64));
         let metrics = test_metrics();
 
-        let _collector = collector::<MainReaderLoTestHandler>(
+        let _collector = collector(
+            Arc::new(TestHandler),
             CommitterConfig::default(),
             processor_rx,
             collector_tx,
-            Some(main_reader_lo_rx),
+            main_reader_lo_rx,
             metrics.clone(),
             cancel.clone(),
         );
 
-        let more_than_max_chunk_rows = max_chunk_rows::<MainReaderLoTestHandler>() + 10;
+        let more_than_max_chunk_rows = TEST_MAX_CHUNK_ROWS + 10;
 
-        let test_data = IndexedCheckpoint::new(
-            0,
-            1,
-            10,
-            1000,
-            vec![SequenceNumber(1); more_than_max_chunk_rows],
-        );
+        let test_data =
+            IndexedCheckpoint::new(0, 1, 10, 1000, vec![Entry; more_than_max_chunk_rows]);
         processor_tx.send(test_data).await.unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
         let batch = recv_with_timeout(&mut collector_rx, Duration::from_secs(2)).await;
 
         // There are still 10 rows left to be sent in the next batch.
-        assert_eq!(batch.len(), max_chunk_rows::<MainReaderLoTestHandler>());
+        assert_eq!(batch.batch_len, TEST_MAX_CHUNK_ROWS);
 
         // Send indexed checkpoints 2 through 5 inclusive, but also bump the main reader lo to 4.
         let test_data: Vec<_> = (2..=5)
@@ -930,7 +856,7 @@ mod tests {
                     cp,
                     10,
                     1000,
-                    vec![SequenceNumber(cp); MainReaderLoTestHandler::MIN_EAGER_ROWS + 1],
+                    vec![Entry; TestHandler::MIN_EAGER_ROWS + 1],
                 )
             })
             .collect();
@@ -943,7 +869,7 @@ mod tests {
         let batch = recv_with_timeout(&mut collector_rx, Duration::from_secs(2)).await;
 
         // The next batch should still be the remaining 10 rows from checkpoint 1.
-        assert_eq!(batch.len(), 10);
+        assert_eq!(batch.batch_len, 10);
         assert_eq!(batch.watermark[0].watermark.checkpoint_hi_inclusive, 1);
 
         recv_with_timeout(&mut collector_rx, Duration::from_secs(2)).await;
@@ -951,14 +877,14 @@ mod tests {
         assert_eq!(
             metrics
                 .total_collector_skipped_checkpoints
-                .with_label_values(&[MainReaderLoTestHandler::NAME])
+                .with_label_values(&[TestHandler::NAME])
                 .get(),
             2
         );
         assert_eq!(
             metrics
                 .total_collector_checkpoints_received
-                .with_label_values(&[MainReaderLoTestHandler::NAME])
+                .with_label_values(&[TestHandler::NAME])
                 .get(),
             5
         );

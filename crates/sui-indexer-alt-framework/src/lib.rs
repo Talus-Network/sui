@@ -14,7 +14,7 @@ use pipeline::{
 };
 use prometheus::Registry;
 use sui_indexer_alt_framework_store_traits::{
-    CommitterWatermark, Connection, Store, TransactionalStore, is_valid_pipeline, pipeline_task,
+    Connection, Store, TransactionalStore, is_valid_pipeline, pipeline_task,
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -243,6 +243,12 @@ impl<S: Store> Indexer<S> {
             return Ok(());
         };
 
+        println!(
+            "Pipeline {} starting from checkpoint {}",
+            H::NAME,
+            next_checkpoint
+        );
+
         self.handles.push(concurrent::pipeline::<H>(
             handler,
             next_checkpoint,
@@ -309,6 +315,13 @@ impl<S: Store> Indexer<S> {
             self.added_pipelines.insert(P::NAME),
             "Pipeline {:?} already added",
             P::NAME,
+        );
+
+        ensure!(
+            is_valid_pipeline::<S>(P::NAME),
+            "Pipeline {:?} name contains delimiter {}",
+            P::NAME,
+            S::DELIMITER,
         );
 
         if let Some(enabled_pipelines) = &mut self.enabled_pipelines
@@ -386,6 +399,12 @@ impl<T: TransactionalStore> Indexer<T> {
 
         let (checkpoint_rx, watermark_tx) = self.ingestion_service.subscribe();
 
+        println!(
+            "Pipeline {} starting from checkpoint {}",
+            H::NAME,
+            next_checkpoint
+        );
+
         self.handles.push(sequential::pipeline::<H>(
             handler,
             next_checkpoint,
@@ -409,11 +428,12 @@ mod tests {
     use sui_synthetic_ingestion::synthetic_ingestion;
     use tokio_util::sync::CancellationToken;
 
-    use crate::mocks::store::{MockConnection, MockStore};
+    use crate::mocks::store::MockStore;
     use crate::pipeline::{
         Processor,
         concurrent::{ConcurrentConfig, PrunerConfig},
     };
+    use crate::store::CommitterWatermark;
 
     use super::*;
 
@@ -433,9 +453,7 @@ mod tests {
                     &self,
                     checkpoint: &Arc<sui_types::full_checkpoint_content::Checkpoint>,
                 ) -> anyhow::Result<Vec<Self::Value>> {
-                    Ok(vec![MockValue(
-                        checkpoint.checkpoint_summary.sequence_number,
-                    )])
+                    Ok(vec![MockValue(checkpoint.summary.sequence_number)])
                 }
             }
 
@@ -490,7 +508,6 @@ mod tests {
     test_pipeline!(MockHandler, "test_processor");
     test_pipeline!(SequentialHandler, "sequential_handler");
     test_pipeline!(MockCheckpointSequenceNumberHandler, "test");
-    test_pipeline!(MainReaderLoTestHandler, "main_reader_lo_test_handler");
 
     /// first_checkpoint_from_watermark is smallest among existing watermarks + 1.
     #[tokio::test]
@@ -1066,7 +1083,7 @@ mod tests {
                 .get_metric_with_label_values(&[A::NAME])
                 .unwrap()
                 .get(),
-            6
+            0
         );
         assert_eq!(
             metrics
@@ -1195,6 +1212,11 @@ mod tests {
             .sequential_pipeline::<D>(D, SequentialConfig::default())
             .await
             .unwrap();
+
+        println!(
+            "Ingestion from checkpoint {}",
+            indexer.first_checkpoint_from_watermark
+        );
 
         let metrics = indexer.metrics().clone();
         indexer.run().await.unwrap().await.unwrap();

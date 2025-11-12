@@ -238,15 +238,10 @@ pub(crate) fn pipeline<H: Handler + Send + Sync + 'static>(
     let pruner_cancel = cancel.child_token();
     let handler = Arc::new(handler);
 
-    // The watch channel is an Option<channel<Option<u64>>>. The outer Option indicates whether the
-    // pipeline is tasked or main. The inner is the safety mechanism - consumers must wait until the
-    // task has started and provided a fresh value.
-    let (main_reader_lo_tx, main_reader_lo_rx) = if task.is_some() {
-        let (tx, rx) = watch::channel(None);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    // The watch channel is an channel<Option<u64>> is populated with 0 if this is the main
+    // pipeline. Otherwise, the channel is set to None, so that the reader_lo task can correctly
+    // inform its consumers of the latest reader_lo.
+    let (main_reader_lo_tx, main_reader_lo_rx) = watch::channel(task.is_none().then_some(0));
 
     let main_reader_lo_task = main_reader_lo::<H>(
         main_reader_lo_tx,

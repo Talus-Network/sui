@@ -150,6 +150,12 @@ pub(super) fn commit_watermark<H: Handler + 'static>(
                     Ordering::Greater => {
                         // Track how many we see to make sure it doesn't grow without
                         // bound.
+                        println!(
+                            "Pipeline {} skipping out-of-order checkpoint watermark {}, expecting {}",
+                            H::NAME,
+                            pending.key(),
+                            next_checkpoint
+                        );
                         metrics
                             .total_watermarks_out_of_order
                             .with_label_values(&[H::NAME])

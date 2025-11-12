@@ -15,23 +15,30 @@ use super::{Handler, PrunerConfig};
 
 /// Starts a task for a tasked pipeline to track the main reader lo.
 pub(super) fn main_reader_lo<H: Handler + 'static>(
-    reader_lo_tx: Option<watch::Sender<Option<u64>>>,
+    reader_lo_tx: watch::Sender<Option<u64>>,
     config: Option<PrunerConfig>,
     cancel: CancellationToken,
     store: H::Store,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let Some(reader_lo_tx) = reader_lo_tx else {
+        // Only start the task if channel is not already initialized.
+        if reader_lo_tx.borrow().is_some() {
             info!(pipeline = H::NAME, "Skipping main reader lo task");
             return;
         };
 
+        // Keep the channel alive and set to 0, but stop the task as we don't need to track main
+        // `reader_lo`.
         let Some(config) = config else {
+            // Set channel to 0 to indicate no pruning.
+            reader_lo_tx.send(Some(0)).ok();
             info!(pipeline = H::NAME, "Skipping main reader lo task");
             return;
         };
 
+        // Set the interval to half the provided interval to ensure we refresh the watermark read frequently enough.
         let mut reader_interval = interval(config.interval() / 2);
+        // If we miss ticks, skip them to ensure we have the latest watermark.
         reader_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
