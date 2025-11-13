@@ -105,7 +105,6 @@ pub(super) fn collector<H: Handler + 'static>(
                     }
                 }
 
-
                 // Time to create another batch and push it to the committer.
                 _ = poll.tick() => {
                     let guard = metrics

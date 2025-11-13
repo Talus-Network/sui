@@ -18,7 +18,7 @@ use super::{CommitterConfig, PIPELINE_BUFFER, Processor, WatermarkPart, processo
 
 use self::{
     collector::collector, commit_watermark::commit_watermark, committer::committer,
-    main_reader_lo::main_reader_lo, pruner::pruner, reader_watermark::reader_watermark,
+    main_reader_lo::track_main_reader_lo, pruner::pruner, reader_watermark::reader_watermark,
 };
 
 mod collector;
@@ -243,9 +243,9 @@ pub(crate) fn pipeline<H: Handler + Send + Sync + 'static>(
     // inform its consumers of the latest reader_lo.
     let (main_reader_lo_tx, main_reader_lo_rx) = watch::channel(task.is_none().then_some(0));
 
-    let main_reader_lo_task = main_reader_lo::<H>(
+    let main_reader_lo_task = track_main_reader_lo::<H>(
         main_reader_lo_tx,
-        pruner_config.clone(),
+        pruner_config.as_ref().map(|c| c.interval_ms),
         cancel.clone(),
         store.clone(),
     );

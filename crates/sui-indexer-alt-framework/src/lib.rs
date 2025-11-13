@@ -243,12 +243,6 @@ impl<S: Store> Indexer<S> {
             return Ok(());
         };
 
-        println!(
-            "Pipeline {} starting from checkpoint {}",
-            H::NAME,
-            next_checkpoint
-        );
-
         self.handles.push(concurrent::pipeline::<H>(
             handler,
             next_checkpoint,
@@ -398,12 +392,6 @@ impl<T: TransactionalStore> Indexer<T> {
         );
 
         let (checkpoint_rx, watermark_tx) = self.ingestion_service.subscribe();
-
-        println!(
-            "Pipeline {} starting from checkpoint {}",
-            H::NAME,
-            next_checkpoint
-        );
 
         self.handles.push(sequential::pipeline::<H>(
             handler,
@@ -1212,11 +1200,6 @@ mod tests {
             .sequential_pipeline::<D>(D, SequentialConfig::default())
             .await
             .unwrap();
-
-        println!(
-            "Ingestion from checkpoint {}",
-            indexer.first_checkpoint_from_watermark
-        );
 
         let metrics = indexer.metrics().clone();
         indexer.run().await.unwrap().await.unwrap();

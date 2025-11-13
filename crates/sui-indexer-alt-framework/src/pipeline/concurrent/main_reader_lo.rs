@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::time::Duration;
+
 use tokio::{
     sync::watch,
     task::JoinHandle,
@@ -11,35 +13,33 @@ use tracing::{info, warn};
 
 use crate::store::{Connection, Store};
 
-use super::{Handler, PrunerConfig};
+use super::Handler;
 
-/// Starts a task for a tasked pipeline to track the main reader lo.
-pub(super) fn main_reader_lo<H: Handler + 'static>(
+/// Starts a task for a tasked pipeline to track the main reader lo. This task is responsible for
+/// managing the watch channel so consumers know when the sender has been dropped and break
+/// accordingly.
+pub(super) fn track_main_reader_lo<H: Handler + 'static>(
     reader_lo_tx: watch::Sender<Option<u64>>,
-    config: Option<PrunerConfig>,
+    reader_interval_ms: Option<u64>,
     cancel: CancellationToken,
     store: H::Store,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Only start the task if channel is not already initialized.
-        if reader_lo_tx.borrow().is_some() {
-            info!(pipeline = H::NAME, "Skipping main reader lo task");
-            return;
-        };
+        // Set the interval to half the provided interval to ensure we refresh the watermark read
+        // frequently enough.
+        let mut reader_interval = interval(
+            reader_interval_ms
+                .map(|ms| Duration::from_millis(ms / 2))
+                // Dummy value that won't be used
+                .unwrap_or(Duration::from_secs(5)),
+        );
 
-        // Keep the channel alive and set to 0, but stop the task as we don't need to track main
-        // `reader_lo`.
-        let Some(config) = config else {
-            // Set channel to 0 to indicate no pruning.
-            reader_lo_tx.send(Some(0)).ok();
-            info!(pipeline = H::NAME, "Skipping main reader lo task");
-            return;
-        };
-
-        // Set the interval to half the provided interval to ensure we refresh the watermark read frequently enough.
-        let mut reader_interval = interval(config.interval() / 2);
         // If we miss ticks, skip them to ensure we have the latest watermark.
         reader_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        if reader_interval_ms.is_none() {
+            reader_lo_tx.send(Some(0)).ok();
+        }
 
         loop {
             tokio::select! {
@@ -48,8 +48,14 @@ pub(super) fn main_reader_lo<H: Handler + 'static>(
                     break;
                 }
 
+
+                _ = reader_lo_tx.closed() => {
+                    info!(pipeline = H::NAME, "All main reader lo receivers dropped, shutting down task");
+                    break;
+                }
+
                 // Periodic refresh of the main reader watermark.
-                _ = reader_interval.tick() => {
+                _ = reader_interval.tick(), if reader_interval_ms.is_some() => {
                     match store.connect().await {
                         Ok(mut conn) => {
                             match conn.reader_watermark(H::NAME).await {
