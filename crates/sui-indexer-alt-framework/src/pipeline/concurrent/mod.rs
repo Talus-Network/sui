@@ -12,7 +12,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::{metrics::IndexerMetrics, store::Store, types::full_checkpoint_content::Checkpoint};
+use crate::{
+    Task, metrics::IndexerMetrics, store::Store, types::full_checkpoint_content::Checkpoint,
+};
 
 use super::{CommitterConfig, PIPELINE_BUFFER, Processor, WatermarkPart, processor::processor};
 
@@ -209,7 +211,7 @@ pub(crate) fn pipeline<H: Handler + Send + Sync + 'static>(
     next_checkpoint: u64,
     config: ConcurrentConfig,
     store: H::Store,
-    task: Option<String>,
+    task: Option<Task>,
     checkpoint_rx: mpsc::Receiver<Arc<Checkpoint>>,
     metrics: Arc<IndexerMetrics>,
     cancel: CancellationToken,
@@ -245,7 +247,7 @@ pub(crate) fn pipeline<H: Handler + Send + Sync + 'static>(
 
     let main_reader_lo_task = track_main_reader_lo::<H>(
         main_reader_lo_tx,
-        pruner_config.as_ref().map(|c| c.interval_ms),
+        task.as_ref().map(|t| t.reader_interval_ms),
         cancel.clone(),
         store.clone(),
     );
@@ -283,14 +285,10 @@ pub(crate) fn pipeline<H: Handler + Send + Sync + 'static>(
         committer_config,
         watermark_rx,
         store.clone(),
-        task.clone(),
+        task.as_ref().map(|t| t.task.clone()),
         metrics.clone(),
         cancel,
     );
-
-    // Tasked pipelines will skip reader_watermark and pruner. Setting the pruner config to None
-    // will result in the tasks returning early.
-    let pruner_config = if task.is_some() { None } else { pruner_config };
 
     let reader_watermark = reader_watermark::<H>(
         pruner_config.clone(),
