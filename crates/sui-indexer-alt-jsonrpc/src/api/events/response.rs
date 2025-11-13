@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use anyhow::Context as _;
 use move_core_types::annotated_value::{MoveDatatypeLayout, MoveTypeLayout};
-use sui_json_rpc_types::{EventPage, SuiEvent};
+use sui_json_rpc_types::{EventFilter, EventPage, SuiEvent};
 use sui_types::{
     digests::TransactionDigest,
     event::Event,
@@ -22,11 +22,42 @@ use super::error::Error;
 
 type Cursor = JsonCursor<(u64, u64)>; // (tx_sequence_number, event_seq)
 
+/// Check if an event matches the given filter criteria
+fn event_matches_filter(event: &Event, filter: &EventFilter) -> bool {
+    match filter {
+        EventFilter::MoveEventType(struct_tag) => {
+            // Check if event type matches the struct tag exactly
+            event.type_.address == struct_tag.address
+                && event.type_.module == struct_tag.module
+                && event.type_.name == struct_tag.name
+                && event.type_.type_params == struct_tag.type_params
+        }
+        EventFilter::Sender(sender) => {
+            // Check if event sender matches
+            &event.sender == sender
+        }
+        EventFilter::MoveEventModule { package, module } => {
+            // Check if event is from the specified package and module
+            // Convert ObjectID to AccountAddress for comparison
+            event.type_.address == (*package).into() && &event.type_.module == module
+        }
+        EventFilter::All(_) => {
+            // All events match
+            true
+        }
+        _ => {
+            // For unsupported filters, don't match (should have been caught earlier)
+            false
+        }
+    }
+}
+
 /// Build a page of events from transaction sequence numbers
 pub(super) async fn build_event_page(
     ctx: &Context,
     page: &Page<Cursor>,
     mut results: Vec<(i64, Vec<u8>)>,
+    filter: &EventFilter,
 ) -> Result<EventPage, RpcError<Error>> {
     let has_next_page = results.len() > page.limit as usize;
     if has_next_page {
@@ -87,8 +118,13 @@ pub(super) async fn build_event_page(
         // Extract all events from this transaction
         let tx_events: Vec<Event> = tx.events()?;
 
-        // Convert each event to SuiEvent
+        // Filter and convert events that match the filter criteria
         for (event_seq, event) in tx_events.into_iter().enumerate() {
+            // Check if this event matches the filter
+            if !event_matches_filter(&event, filter) {
+                continue;
+            }
+
             let layout = match ctx
                 .package_resolver()
                 .type_layout(event.type_.clone().into())

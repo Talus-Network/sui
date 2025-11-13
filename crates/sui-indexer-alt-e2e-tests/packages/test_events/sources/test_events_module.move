@@ -18,6 +18,17 @@ module test::events {
         result: u64,
     }
 
+    /// Generic event wrapper for testing type parameters
+    public struct EventWrapper<T: copy + drop> has copy, drop {
+        data: T,
+    }
+
+    /// Inner event data
+    public struct InnerData has copy, drop {
+        id: u64,
+        message: vector<u8>,
+    }
+
     /// Record a value and emit an event
     public entry fun record_value(value: u64, ctx: &mut TxContext) {
         event::emit(ValueRecorded {
@@ -32,6 +43,13 @@ module test::events {
             a,
             b,
             result: a + b,
+        });
+    }
+
+    /// Emit a generic event with type parameter
+    public entry fun emit_generic_event(id: u64, message: vector<u8>, _ctx: &mut TxContext) {
+        event::emit(EventWrapper<InnerData> {
+            data: InnerData { id, message },
         });
     }
 }

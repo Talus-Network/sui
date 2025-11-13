@@ -36,7 +36,7 @@ impl EventsTestCluster {
     async fn publish_test_module(&mut self) -> anyhow::Result<ObjectID> {
         // Build the Move package
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/test_package");
+        path.push("packages/test_events");
 
         // Create account and publish
         let (sender, keypair, gas) = self
@@ -417,6 +417,109 @@ async fn test_query_events_empty_result() {
     );
     assert!(!result.has_next_page, "Should not have next page");
     assert!(result.next_cursor.is_none(), "Should not have cursor");
+
+    test_cluster.stopped().await;
+}
+
+#[sim_test]
+async fn test_query_events_with_generic_type() {
+    telemetry_subscribers::init_for_testing();
+
+    let mut test_cluster = EventsTestCluster::new()
+        .await
+        .expect("Failed to create test cluster");
+
+    // Publish the test events module
+    let package_id = test_cluster
+        .publish_test_module()
+        .await
+        .expect("Failed to publish test module");
+
+    // Create checkpoint for the publish transaction
+    test_cluster.cluster.create_checkpoint().await;
+
+    // Create an account and fund it
+    let (sender, keypair, gas) = test_cluster
+        .cluster
+        .funded_account(10_000_000_000)
+        .expect("Failed to create funded account");
+
+    // Call the emit_generic_event function to emit a generic event
+    let message = b"test message".to_vec();
+    let tx = test_cluster
+        .cluster
+        .execute_transaction(
+            TestTransactionBuilder::new(
+                sender,
+                gas,
+                test_cluster.cluster.reference_gas_price(),
+            )
+            .move_call(
+                package_id,
+                "events",
+                "emit_generic_event",
+                vec![
+                    CallArg::Pure(bcs::to_bytes(&123u64).unwrap()),
+                    CallArg::Pure(bcs::to_bytes(&message).unwrap()),
+                ],
+            )
+            .build_and_sign(&keypair),
+        )
+        .expect("Failed to execute transaction");
+
+    assert!(tx.0.status().is_ok(), "Transaction failed: {:?}", tx.1);
+
+    // Create checkpoint and wait for indexer to catch up
+    let checkpoint = test_cluster.cluster.create_checkpoint().await;
+    test_cluster
+        .cluster
+        .wait_for_checkpoint(checkpoint.sequence_number, Duration::from_secs(10))
+        .await
+        .expect("Timed out waiting for checkpoint");
+
+    // Build the struct tag with type parameter: EventWrapper<InnerData>
+    use move_core_types::language_storage::{StructTag, TypeTag};
+    use move_core_types::account_address::AccountAddress;
+    use move_core_types::identifier::Identifier;
+
+    let inner_data_type = TypeTag::Struct(Box::new(StructTag {
+        address: AccountAddress::from(package_id),
+        module: Identifier::new("events").unwrap(),
+        name: Identifier::new("InnerData").unwrap(),
+        type_params: vec![],
+    }));
+
+    let event_wrapper_type = StructTag {
+        address: AccountAddress::from(package_id),
+        module: Identifier::new("events").unwrap(),
+        name: Identifier::new("EventWrapper").unwrap(),
+        type_params: vec![inner_data_type],
+    };
+
+    // Query events by MoveEventType with generic type parameter
+    let filter = EventFilter::MoveEventType(event_wrapper_type);
+    let result = test_cluster
+        .query_events(filter, None, Some(10), Some(false))
+        .await
+        .expect("Failed to query events with generic type");
+
+    // Verify we got the event
+    assert!(!result.data.is_empty(), "Expected to find generic event");
+    assert_eq!(result.data.len(), 1, "Should have exactly one event");
+
+    let event = &result.data[0];
+    assert_eq!(event.sender, sender, "Event sender should match");
+    assert_eq!(
+        event.package_id, package_id,
+        "Event package_id should match"
+    );
+
+    // Verify the event type includes the type parameter
+    assert_eq!(
+        event.type_.type_params.len(),
+        1,
+        "Event should have one type parameter"
+    );
 
     test_cluster.stopped().await;
 }

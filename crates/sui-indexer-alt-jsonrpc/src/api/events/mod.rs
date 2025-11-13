@@ -33,7 +33,7 @@ trait EventsApi {
     ) -> RpcResult<EventPage>;
 }
 
-pub(crate) struct Events(pub Context);
+pub struct Events(pub Context); // TEMPORARY: Made public for compare_with_rpc example
 
 #[async_trait::async_trait]
 impl EventsApiServer for Events {

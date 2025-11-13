@@ -146,7 +146,7 @@ async fn by_move_event_type(
         .await
         .context("Failed to fetch events")?;
 
-    response::build_event_page(ctx, page, results).await
+    response::build_event_page(ctx, page, results, &EventFilter::MoveEventType(struct_tag.clone())).await
 }
 
 /// Fetch events by sender address
@@ -196,7 +196,7 @@ async fn by_sender(
         .await
         .context("Failed to fetch events")?;
 
-    response::build_event_page(ctx, page, results).await
+    response::build_event_page(ctx, page, results, &EventFilter::Sender(sender)).await
 }
 
 /// Fetch events by MoveEventModule (package + module where event struct is defined)
@@ -249,7 +249,10 @@ async fn by_move_event_module(
         .await
         .context("Failed to fetch events")?;
 
-    response::build_event_page(ctx, page, results).await
+    response::build_event_page(ctx, page, results, &EventFilter::MoveEventModule {
+        package,
+        module: module.clone(),
+    }).await
 }
 
 /// Fetch all events without filtering
@@ -295,5 +298,5 @@ async fn all_events(
         .await
         .context("Failed to fetch events")?;
 
-    response::build_event_page(ctx, page, results).await
+    response::build_event_page(ctx, page, results, &EventFilter::All([])).await
 }
