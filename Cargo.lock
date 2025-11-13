@@ -13870,6 +13870,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bcs",
  "datatest-stable",
  "diesel",
  "diesel-async",
@@ -13891,6 +13892,7 @@ dependencies = [
  "sui-protocol-config",
  "sui-simulator",
  "sui-swarm-config",
+ "sui-test-transaction-builder",
  "sui-transactional-test-runner",
  "sui-types",
  "telemetry-subscribers",

@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use api::checkpoints::Checkpoints;
 use api::coin::Coins;
 use api::dynamic_fields::DynamicFields;
+use api::events::Events;
 use api::move_utils::MoveUtils;
 use api::name_service::NameService;
 use api::objects::{Objects, QueryObjects};
@@ -239,6 +240,7 @@ pub async fn start_rpc(
     rpc.add_module(Checkpoints(context.clone()))?;
     rpc.add_module(Coins(context.clone()))?;
     rpc.add_module(DynamicFields(context.clone()))?;
+    rpc.add_module(Events(context.clone()))?;
     rpc.add_module(Governance(context.clone()))?;
     rpc.add_module(MoveUtils(context.clone()))?;
     rpc.add_module(NameService(context.clone()))?;
