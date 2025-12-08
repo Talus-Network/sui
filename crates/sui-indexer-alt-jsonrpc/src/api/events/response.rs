@@ -11,9 +11,10 @@ use sui_types::{
     event::Event,
 };
 
+use sui_indexer_alt_reader::{kv_loader::TransactionContents, tx_digests::TxDigestKey};
+
 use crate::{
     context::Context,
-    data::{kv_loader::TransactionContents, tx_digests::TxDigestKey},
     error::{rpc_bail, RpcError},
     paginate::{JsonCursor, Page},
 };

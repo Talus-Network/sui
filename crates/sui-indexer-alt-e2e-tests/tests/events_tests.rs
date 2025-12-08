@@ -5,7 +5,7 @@ use anyhow::Context;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
-use sui_indexer_alt_e2e_tests::{find_immutable, FullCluster};
+use sui_indexer_alt_e2e_tests::{find, FullCluster};
 use sui_json_rpc_types::{EventFilter, EventPage};
 use sui_macros::sim_test;
 use sui_test_transaction_builder::TestTransactionBuilder;
@@ -51,7 +51,7 @@ impl EventsTestCluster {
         assert!(effects.status().is_ok(), "Publish failed");
 
         // Get the published package ID
-        let package_ref = find_immutable(&effects)?;
+        let package_ref = find::immutable(&effects)?;
         Ok(package_ref.0)
     }
 
@@ -65,7 +65,7 @@ impl EventsTestCluster {
 
         let response = self
             .client
-            .post(self.cluster.rpc_url())
+            .post(self.cluster.jsonrpc_url().to_string())
             .json(&query)
             .send()
             .await
@@ -163,7 +163,7 @@ async fn test_query_events_by_sender() {
     let checkpoint = test_cluster.cluster.create_checkpoint().await;
     test_cluster
         .cluster
-        .wait_for_checkpoint(checkpoint.sequence_number, Duration::from_secs(10))
+        .wait_for_indexer(checkpoint.sequence_number, Duration::from_secs(10))
         .await
         .expect("Timed out waiting for checkpoint");
 
@@ -236,7 +236,7 @@ async fn test_query_events_pagination() {
     let checkpoint = test_cluster.cluster.create_checkpoint().await;
     test_cluster
         .cluster
-        .wait_for_checkpoint(checkpoint.sequence_number, Duration::from_secs(10))
+        .wait_for_indexer(checkpoint.sequence_number, Duration::from_secs(10))
         .await
         .expect("Timed out waiting for checkpoint");
 
@@ -324,7 +324,7 @@ async fn test_query_events_descending_order() {
     let checkpoint = test_cluster.cluster.create_checkpoint().await;
     test_cluster
         .cluster
-        .wait_for_checkpoint(checkpoint.sequence_number, Duration::from_secs(10))
+        .wait_for_indexer(checkpoint.sequence_number, Duration::from_secs(10))
         .await
         .expect("Timed out waiting for checkpoint");
 
@@ -371,7 +371,7 @@ async fn test_query_all_events() {
     let checkpoint = test_cluster.cluster.create_checkpoint().await;
     test_cluster
         .cluster
-        .wait_for_checkpoint(checkpoint.sequence_number, Duration::from_secs(10))
+        .wait_for_indexer(checkpoint.sequence_number, Duration::from_secs(10))
         .await
         .expect("Timed out waiting for checkpoint");
 
@@ -473,7 +473,7 @@ async fn test_query_events_with_generic_type() {
     let checkpoint = test_cluster.cluster.create_checkpoint().await;
     test_cluster
         .cluster
-        .wait_for_checkpoint(checkpoint.sequence_number, Duration::from_secs(10))
+        .wait_for_indexer(checkpoint.sequence_number, Duration::from_secs(10))
         .await
         .expect("Timed out waiting for checkpoint");
 
