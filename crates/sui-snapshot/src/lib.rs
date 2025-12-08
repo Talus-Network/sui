@@ -19,9 +19,9 @@ use num_enum::TryFromPrimitive;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use sui_core::authority::authority_store_tables::AuthorityPerpetualTables;
 use sui_core::authority::authority_store_tables::LiveObject;
@@ -29,16 +29,16 @@ use sui_core::authority::epoch_start_configuration::EpochFlag;
 use sui_core::authority::epoch_start_configuration::EpochStartConfiguration;
 use sui_core::checkpoints::CheckpointStore;
 use sui_core::epoch::committee_store::CommitteeStore;
-use sui_core::state_accumulator::WrappedObject;
+use sui_core::global_state_hasher::WrappedObject;
 use sui_protocol_config::Chain;
 use sui_storage::object_store::util::path_to_filesystem;
-use sui_storage::{compute_sha3_checksum, FileCompression, SHA3_BYTES};
-use sui_types::accumulator::Accumulator;
+use sui_storage::{FileCompression, SHA3_BYTES, compute_sha3_checksum};
 use sui_types::base_types::ObjectID;
+use sui_types::global_state_hash::GlobalStateHash;
 use sui_types::messages_checkpoint::ECMHLiveObjectSetDigest;
+use sui_types::sui_system_state::SuiSystemStateTrait;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
 use sui_types::sui_system_state::get_sui_system_state;
-use sui_types::sui_system_state::SuiSystemStateTrait;
 use tokio::time::Instant;
 
 /// The following describes the format of an object file (*.obj) used for persisting live sui objects.
@@ -227,7 +227,7 @@ pub fn create_file_metadata(
 
 pub async fn setup_db_state(
     epoch: u64,
-    accumulator: Accumulator,
+    accumulator: GlobalStateHash,
     perpetual_db: Arc<AuthorityPerpetualTables>,
     checkpoint_store: Arc<CheckpointStore>,
     committee_store: Arc<CommitteeStore>,
@@ -291,7 +291,7 @@ pub async fn accumulate_live_object_iter(
     iter: Box<dyn Iterator<Item = LiveObject> + '_>,
     m: MultiProgress,
     num_live_objects: u64,
-) -> Accumulator {
+) -> GlobalStateHash {
     // Monitor progress of live object accumulation
     let accum_progress_bar = m.add(ProgressBar::new(num_live_objects).with_style(
         ProgressStyle::with_template("[{elapsed_precise}] {wide_bar} {pos}/{len} ({msg})").unwrap(),
@@ -321,7 +321,7 @@ pub async fn accumulate_live_object_iter(
     });
 
     // Accumulate live objects
-    let mut acc = Accumulator::default();
+    let mut acc = GlobalStateHash::default();
     for live_object in iter {
         match live_object {
             LiveObject::Normal(object) => {

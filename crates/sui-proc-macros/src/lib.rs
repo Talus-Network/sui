@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use proc_macro::TokenStream;
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{ToTokens, quote, quote_spanned};
 use syn::{
-    fold::{fold_expr, fold_item_macro, fold_stmt, Fold},
-    parse::Parser,
-    parse2, parse_macro_input,
-    punctuated::Punctuated,
-    spanned::Spanned,
     Attribute, BinOp, Data, DataEnum, DeriveInput, Expr, ExprBinary, ExprMacro, Item, ItemMacro,
     Stmt, StmtMacro, Token, UnOp,
+    fold::{Fold, fold_expr, fold_item_macro, fold_stmt},
+    parse::Parser,
+    parse_macro_input, parse2,
+    punctuated::Punctuated,
+    spanned::Spanned,
 };
 
 #[proc_macro_attribute]
@@ -38,7 +38,7 @@ pub fn init_static_initializers(_args: TokenStream, item: TokenStream) -> TokenS
             std::thread::spawn(|| {
                 use sui_protocol_config::ProtocolConfig;
                 ::sui_simulator::telemetry_subscribers::init_for_testing();
-                ::sui_simulator::sui_types::execution::get_denied_certificates();
+                ::sui_simulator::sui_types::execution_params::get_denied_certificates_for_sim_test();
                 ::sui_simulator::sui_framework::BuiltInFramework::all_package_ids();
                 ::sui_simulator::sui_types::gas::SuiGasStatus::new_unmetered();
 
@@ -60,7 +60,7 @@ pub fn init_static_initializers(_args: TokenStream, item: TokenStream) -> TokenS
                     let mut path = PathBuf::from(env!("SIMTEST_STATIC_INIT_MOVE"));
                     let mut build_config = BuildConfig::new_for_testing();
 
-                    build_config.config.install_dir = Some(TempDir::new().unwrap().into_path());
+                    build_config.config.install_dir = Some(TempDir::new().unwrap().keep());
                     let _all_module_bytes = build_config
                         .build(&path)
                         .unwrap()
@@ -317,7 +317,7 @@ impl CheckArithmetic {
         let Ok(exprs) = parser.parse(tokens.clone().into()) else {
             return Err(syn::Error::new_spanned(
                 tokens,
-                "could not process macro contents - use #[skip_checked_arithmetic] to skip this macro"
+                "could not process macro contents - use #[skip_checked_arithmetic] to skip this macro",
             ));
         };
 

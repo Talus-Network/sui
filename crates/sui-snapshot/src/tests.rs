@@ -1,9 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::FileCompression;
 use crate::reader::StateSnapshotReaderV1;
 use crate::writer::StateSnapshotWriterV1;
-use crate::FileCompression;
 use fastcrypto::hash::MultisetHash;
 use futures::future::AbortHandle;
 use indicatif::MultiProgress;
@@ -12,10 +12,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use sui_config::object_storage_config::{ObjectStoreConfig, ObjectStoreType};
 use sui_core::authority::authority_store_tables::AuthorityPerpetualTables;
-use sui_core::state_accumulator::StateAccumulator;
+use sui_core::global_state_hasher::GlobalStateHasher;
 use sui_protocol_config::ProtocolConfig;
-use sui_types::accumulator::Accumulator;
 use sui_types::base_types::ObjectID;
+use sui_types::global_state_hash::GlobalStateHash;
 use sui_types::messages_checkpoint::ECMHLiveObjectSetDigest;
 use sui_types::object::Object;
 use tempfile::tempdir;
@@ -23,7 +23,7 @@ use tempfile::tempdir;
 fn temp_dir() -> std::path::PathBuf {
     tempdir()
         .expect("Failed to open temporary directory")
-        .into_path()
+        .keep()
 }
 
 pub fn insert_keys(
@@ -58,12 +58,12 @@ fn compare_live_objects(
 fn accumulate_live_object_set(
     perpetual_db: &AuthorityPerpetualTables,
     include_wrapped_tombstone: bool,
-) -> Accumulator {
-    let mut acc = Accumulator::default();
+) -> GlobalStateHash {
+    let mut acc = GlobalStateHash::default();
     perpetual_db
         .iter_live_object_set(include_wrapped_tombstone)
         .for_each(|live_object| {
-            StateAccumulator::accumulate_live_object(&mut acc, &live_object);
+            GlobalStateHasher::accumulate_live_object(&mut acc, &live_object);
         });
     acc
 }
@@ -93,7 +93,7 @@ async fn test_snapshot_basic() -> Result<(), anyhow::Error> {
         NonZeroUsize::new(1).unwrap(),
     )
     .await?;
-    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(&db_path, None));
+    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(&db_path, None, None));
     insert_keys(&perpetual_db, 1000)?;
     let root_accumulator =
         ECMHLiveObjectSetDigest::from(accumulate_live_object_set(&perpetual_db, true).digest());
@@ -112,9 +112,10 @@ async fn test_snapshot_basic() -> Result<(), anyhow::Error> {
         NonZeroUsize::new(1).unwrap(),
         MultiProgress::new(),
         false, // skip_reset_local_store
+        3,     // max_retries
     )
     .await?;
-    let restored_perpetual_db = AuthorityPerpetualTables::open(&restored_db_path, None);
+    let restored_perpetual_db = AuthorityPerpetualTables::open(&restored_db_path, None, None);
     let (_abort_handle, abort_registration) = AbortHandle::new_pair();
     snapshot_reader
         .read(&restored_perpetual_db, abort_registration, None)
@@ -149,7 +150,7 @@ async fn test_snapshot_empty_db() -> Result<(), anyhow::Error> {
         NonZeroUsize::new(1).unwrap(),
     )
     .await?;
-    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(&db_path, None));
+    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(&db_path, None, None));
     let root_accumulator =
         ECMHLiveObjectSetDigest::from(accumulate_live_object_set(&perpetual_db, true).digest());
     snapshot_writer
@@ -167,9 +168,10 @@ async fn test_snapshot_empty_db() -> Result<(), anyhow::Error> {
         NonZeroUsize::new(1).unwrap(),
         MultiProgress::new(),
         false, // skip_reset_local_store
+        3,     // max_retries
     )
     .await?;
-    let restored_perpetual_db = AuthorityPerpetualTables::open(&restored_db_path, None);
+    let restored_perpetual_db = AuthorityPerpetualTables::open(&restored_db_path, None, None);
     let (_abort_handle, abort_registration) = AbortHandle::new_pair();
     snapshot_reader
         .read(&restored_perpetual_db, abort_registration, None)

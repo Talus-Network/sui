@@ -8,15 +8,15 @@ use crate::crypto::{PublicKey, SignatureScheme, ZkLoginPublicIdentifier};
 
 use crate::signature::VerifyParams;
 use crate::signature_verification::VerifiedDigestCache;
+use crate::utils::{SHORT_ADDRESS_SEED, load_test_vectors};
 use crate::utils::{get_zklogin_user_address, make_zklogin_tx, sign_zklogin_personal_msg};
-use crate::utils::{load_test_vectors, SHORT_ADDRESS_SEED};
 use crate::{
     base_types::SuiAddress, signature::GenericSignature, zk_login_util::DEFAULT_JWK_BYTES,
 };
 use fastcrypto::encoding::Base64;
 use fastcrypto::traits::ToFromBytes;
 
-use fastcrypto_zkp::bn254::zk_login::{parse_jwks, JwkId, OIDCProvider, ZkLoginInputs, JWK};
+use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId, OIDCProvider, ZkLoginInputs, parse_jwks};
 use fastcrypto_zkp::bn254::zk_login_api::ZkLoginEnv;
 use fastcrypto_zkp::zk_login_utils::Bn254FrElement;
 use im::hashmap::HashMap as ImHashMap;
@@ -94,14 +94,22 @@ fn zklogin_sign_personal_message() {
     };
     let (user_address, authenticator) = sign_zklogin_personal_msg(data.clone());
     let intent_msg = IntentMessage::new(Intent::personal_message(), data);
-    let parsed: ImHashMap<JwkId, JWK> = parse_jwks(DEFAULT_JWK_BYTES, &OIDCProvider::Twitch)
+    let parsed: ImHashMap<JwkId, JWK> = parse_jwks(DEFAULT_JWK_BYTES, &OIDCProvider::Twitch, true)
         .unwrap()
         .into_iter()
         .collect();
 
     // Construct the required info to verify a zk login authenticator, jwks, supported providers list and env (prod/test).
-    let aux_verify_data =
-        VerifyParams::new(parsed, vec![], ZkLoginEnv::Test, true, true, true, Some(30));
+    let aux_verify_data = VerifyParams::new(
+        parsed,
+        vec![],
+        ZkLoginEnv::Test,
+        true,
+        true,
+        true,
+        Some(30),
+        true,
+    );
     let res = authenticator.verify_authenticator(
         &intent_msg,
         user_address,

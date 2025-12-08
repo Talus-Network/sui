@@ -4,23 +4,31 @@
 //! Utility for generating programmable transactions, either by specifying a command or for
 //! migrating legacy transactions
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use indexmap::IndexMap;
 use move_core_types::{ident_str, identifier::Identifier, language_storage::TypeTag};
 use serde::Serialize;
 
 use crate::{
-    base_types::{ObjectID, ObjectRef, SuiAddress},
-    move_package::PACKAGE_MODULE_NAME,
-    transaction::{Argument, CallArg, Command, ObjectArg, ProgrammableTransaction},
     SUI_FRAMEWORK_PACKAGE_ID,
+    base_types::{FullObjectID, FullObjectRef, ObjectID, ObjectRef, SuiAddress},
+    move_package::PACKAGE_MODULE_NAME,
+    transaction::{
+        Argument, CallArg, Command, FundsWithdrawalArg, ObjectArg, ProgrammableTransaction,
+        SharedObjectMutability,
+    },
 };
+
+#[cfg(test)]
+#[path = "unit_tests/programmable_transaction_builder_tests.rs"]
+mod programmable_transaction_builder_tests;
 
 #[derive(PartialEq, Eq, Hash)]
 enum BuilderArg {
     Object(ObjectID),
     Pure(Vec<u8>),
     ForcedNonUniquePure(usize),
+    FundsWithdraw(usize),
 }
 
 #[derive(Default)]
@@ -71,18 +79,21 @@ impl ProgrammableTransactionBuilder {
             let old_obj_arg = match old_value {
                 CallArg::Pure(_) => anyhow::bail!("invariant violation! object has pure argument"),
                 CallArg::Object(arg) => arg,
+                CallArg::FundsWithdrawal(_) => {
+                    anyhow::bail!("invariant violation! object has balance withdraw argument")
+                }
             };
             match (old_obj_arg, obj_arg) {
                 (
                     ObjectArg::SharedObject {
                         id: id1,
                         initial_shared_version: v1,
-                        mutable: mut1,
+                        mutability: mut1,
                     },
                     ObjectArg::SharedObject {
                         id: id2,
                         initial_shared_version: v2,
-                        mutable: mut2,
+                        mutability: mut2,
                     },
                 ) if v1 == &v2 => {
                     anyhow::ensure!(
@@ -92,7 +103,13 @@ impl ProgrammableTransactionBuilder {
                     ObjectArg::SharedObject {
                         id,
                         initial_shared_version: v2,
-                        mutable: *mut1 || mut2,
+                        mutability: if mut1 == &SharedObjectMutability::Mutable
+                            || mut2 == SharedObjectMutability::Mutable
+                        {
+                            SharedObjectMutability::Mutable
+                        } else {
+                            mut2
+                        },
                     }
                 }
                 (old_obj_arg, obj_arg) => {
@@ -113,10 +130,19 @@ impl ProgrammableTransactionBuilder {
         Ok(Argument::Input(i as u16))
     }
 
+    pub fn funds_withdrawal(&mut self, arg: FundsWithdrawalArg) -> anyhow::Result<Argument> {
+        let (i, _) = self.inputs.insert_full(
+            BuilderArg::FundsWithdraw(self.inputs.len()),
+            CallArg::FundsWithdrawal(arg),
+        );
+        Ok(Argument::Input(i as u16))
+    }
+
     pub fn input(&mut self, call_arg: CallArg) -> anyhow::Result<Argument> {
         match call_arg {
             CallArg::Pure(bytes) => Ok(self.pure_bytes(bytes, /* force separate */ false)),
             CallArg::Object(obj) => self.obj(obj),
+            CallArg::FundsWithdrawal(arg) => self.funds_withdrawal(arg),
         }
     }
 
@@ -223,10 +249,19 @@ impl ProgrammableTransactionBuilder {
     pub fn transfer_object(
         &mut self,
         recipient: SuiAddress,
-        object_ref: ObjectRef,
+        full_object_ref: FullObjectRef,
     ) -> anyhow::Result<()> {
         let rec_arg = self.pure(recipient).unwrap();
-        let obj_arg = self.obj(ObjectArg::ImmOrOwnedObject(object_ref));
+        let obj_arg = self.obj(match full_object_ref.0 {
+            FullObjectID::Fastpath(_) => {
+                ObjectArg::ImmOrOwnedObject(full_object_ref.as_object_ref())
+            }
+            FullObjectID::Consensus((id, initial_shared_version)) => ObjectArg::SharedObject {
+                id,
+                initial_shared_version,
+                mutability: SharedObjectMutability::Mutable,
+            },
+        });
         self.commands
             .push(Command::TransferObjects(vec![obj_arg?], rec_arg));
         Ok(())
@@ -273,6 +308,32 @@ impl ProgrammableTransactionBuilder {
                 .collect(),
             recipient,
         ));
+    }
+
+    /// Merge `coins` into the `target` coin.
+    pub fn merge_coins(&mut self, target: ObjectRef, coins: Vec<ObjectRef>) -> anyhow::Result<()> {
+        let target_arg = self.obj(ObjectArg::ImmOrOwnedObject(target))?;
+        let coin_args = coins
+            .into_iter()
+            .map(|coin| self.obj(ObjectArg::ImmOrOwnedObject(coin)).unwrap())
+            .collect::<Vec<_>>();
+        self.command(Command::MergeCoins(target_arg, coin_args));
+        Ok(())
+    }
+
+    /// Merge all `coins` into the first coin in the vector.
+    /// Returns an `Argument` for the first coin.
+    pub fn smash_coins(&mut self, coins: Vec<ObjectRef>) -> anyhow::Result<Argument> {
+        let mut coins = coins.into_iter();
+        let Some(target) = coins.next() else {
+            bail!("coins vector is empty");
+        };
+        let target_arg = self.obj(ObjectArg::ImmOrOwnedObject(target))?;
+        let coin_args = coins
+            .map(|coin| self.obj(ObjectArg::ImmOrOwnedObject(coin)).unwrap())
+            .collect::<Vec<_>>();
+        self.command(Command::MergeCoins(target_arg, coin_args));
+        Ok(target_arg)
     }
 
     /// Will fail to generate if recipients and amounts do not have the same lengths.

@@ -5,7 +5,7 @@ use super::*;
 use crate::authority::authority_tests::init_state_with_ids_and_object_basics;
 use bcs;
 use sui_types::{
-    execution_status::ExecutionStatus,
+    base_types::FullObjectRef, execution_status::ExecutionStatus,
     programmable_transaction_builder::ProgrammableTransactionBuilder,
     utils::to_sender_signed_transaction,
 };
@@ -13,7 +13,7 @@ use sui_types::{
 use authority_tests::send_and_confirm_transaction;
 use move_core_types::{account_address::AccountAddress, ident_str};
 use sui_types::{
-    crypto::{get_key_pair, AccountKeyPair},
+    crypto::{AccountKeyPair, get_key_pair},
     object::Owner,
 };
 
@@ -36,11 +36,13 @@ async fn test_batch_transaction_ok() -> anyhow::Result<()> {
         builder
             .transfer_object(
                 recipient,
-                authority_state
-                    .get_object(obj_id)
-                    .await
-                    .unwrap()
-                    .compute_object_reference(),
+                FullObjectRef::from_fastpath_ref(
+                    authority_state
+                        .get_object(obj_id)
+                        .await
+                        .unwrap()
+                        .compute_object_reference(),
+                ),
             )
             .unwrap()
     }
@@ -60,11 +62,13 @@ async fn test_batch_transaction_ok() -> anyhow::Result<()> {
     }
     let data = TransactionData::new_programmable(
         sender,
-        vec![authority_state
-            .get_object(&all_ids[N])
-            .await
-            .unwrap()
-            .compute_object_reference()],
+        vec![
+            authority_state
+                .get_object(&all_ids[N])
+                .await
+                .unwrap()
+                .compute_object_reference(),
+        ],
         builder.finish(),
         rgp * TEST_ONLY_GAS_UNIT_FOR_OBJECT_BASICS * (N as u64),
         rgp,
@@ -78,10 +82,12 @@ async fn test_batch_transaction_ok() -> anyhow::Result<()> {
         (effects.created().len(), effects.mutated().len()),
         (N, N + 1),
     );
-    assert!(effects
-        .created()
-        .iter()
-        .all(|(_, owner)| owner == &Owner::AddressOwner(sender)));
+    assert!(
+        effects
+            .created()
+            .iter()
+            .all(|(_, owner)| owner == &Owner::AddressOwner(sender))
+    );
     // N of the objects should now be owned by recipient.
     assert_eq!(
         effects
@@ -114,11 +120,13 @@ async fn test_batch_transaction_last_one_fail() -> anyhow::Result<()> {
         builder
             .transfer_object(
                 recipient,
-                authority_state
-                    .get_object(obj_id)
-                    .await
-                    .unwrap()
-                    .compute_object_reference(),
+                FullObjectRef::from_fastpath_ref(
+                    authority_state
+                        .get_object(obj_id)
+                        .await
+                        .unwrap()
+                        .compute_object_reference(),
+                ),
             )
             .unwrap()
     }
@@ -133,11 +141,13 @@ async fn test_batch_transaction_last_one_fail() -> anyhow::Result<()> {
         .unwrap();
     let data = TransactionData::new_programmable(
         sender,
-        vec![authority_state
-            .get_object(&all_ids[N])
-            .await
-            .unwrap()
-            .compute_object_reference()],
+        vec![
+            authority_state
+                .get_object(&all_ids[N])
+                .await
+                .unwrap()
+                .compute_object_reference(),
+        ],
         builder.finish(),
         rgp * TEST_ONLY_GAS_UNIT_FOR_OBJECT_BASICS,
         rgp,

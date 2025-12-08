@@ -7,16 +7,16 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use super::{processor::processor, CommitterConfig, Processor, PIPELINE_BUFFER};
+use super::{CommitterConfig, PIPELINE_BUFFER, Processor, processor::processor};
 
 use crate::{
-    db::{self, Db},
     metrics::IndexerMetrics,
-    models::watermarks::CommitterWatermark,
+    store::{Store, TransactionalStore},
     types::full_checkpoint_content::CheckpointData,
 };
 
 use self::committer::committer;
+use async_trait::async_trait;
 
 mod committer;
 
@@ -37,8 +37,10 @@ mod committer;
 /// for, and in turn the ingestion service will only run ahead by its buffer size. This guarantees
 /// liveness and limits the amount of memory the pipeline can consume, by bounding the number of
 /// checkpoints that can be received before the next checkpoint.
-#[async_trait::async_trait]
+#[async_trait]
 pub trait Handler: Processor {
+    type Store: TransactionalStore;
+
     /// If at least this many rows are pending, the committer will commit them eagerly.
     const MIN_EAGER_ROWS: usize = 50;
 
@@ -58,7 +60,10 @@ pub trait Handler: Processor {
 
     /// Take a batch of values and commit them to the database, returning the number of rows
     /// affected.
-    async fn commit(batch: &Self::Batch, conn: &mut db::Connection<'_>) -> anyhow::Result<usize>;
+    async fn commit<'a>(
+        batch: &Self::Batch,
+        conn: &mut <Self::Store as Store>::Connection<'a>,
+    ) -> anyhow::Result<usize>;
 }
 
 /// Configuration for a sequential pipeline
@@ -98,9 +103,9 @@ pub struct SequentialConfig {
 /// channels close, or any of its independent tasks fail.
 pub(crate) fn pipeline<H: Handler + Send + Sync + 'static>(
     handler: H,
-    initial_watermark: Option<CommitterWatermark<'static>>,
+    next_checkpoint: u64,
     config: SequentialConfig,
-    db: Db,
+    db: H::Store,
     checkpoint_rx: mpsc::Receiver<Arc<CheckpointData>>,
     watermark_tx: mpsc::UnboundedSender<(&'static str, u64)>,
     metrics: Arc<IndexerMetrics>,
@@ -118,10 +123,10 @@ pub(crate) fn pipeline<H: Handler + Send + Sync + 'static>(
 
     let committer = committer::<H>(
         config,
-        initial_watermark,
+        next_checkpoint,
         committer_rx,
         watermark_tx,
-        db.clone(),
+        db,
         metrics.clone(),
         cancel.clone(),
     );

@@ -1,8 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::authority::authority_store_tables::LiveObject;
 use crate::authority::AuthorityStore;
+use crate::authority::authority_store_tables::LiveObject;
 use std::time::Instant;
 use sui_types::base_types::ObjectID;
 use sui_types::object::Object;
@@ -33,6 +33,7 @@ pub trait LiveObjectIndexer {
 /// operating on each set in parallel in a separate thread. User's will need to implement the
 /// `ParMakeLiveObjectIndexer` trait which will be used to make N `LiveObjectIndexer`s which will
 /// then process one of the disjoint parts of the live object set.
+#[tracing::instrument(skip_all)]
 pub fn par_index_live_object_set<T: ParMakeLiveObjectIndexer>(
     authority_store: &AuthorityStore,
     make_indexer: &T,
@@ -65,6 +66,7 @@ pub fn par_index_live_object_set<T: ParMakeLiveObjectIndexer>(
     Ok(())
 }
 
+#[tracing::instrument(skip(authority_store, object_indexer))]
 fn live_object_set_index_task<T: LiveObjectIndexer>(
     task_id: u8,
     bits: u8,
@@ -88,7 +90,7 @@ fn live_object_set_index_task<T: LiveObjectIndexer>(
         .filter_map(LiveObject::to_normal)
     {
         object_scanned += 1;
-        if object_scanned % 2_000_000 == 0 {
+        if object_scanned.is_multiple_of(2_000_000) {
             info!(
                 "[Index] Task {}: object scanned: {}",
                 task_id, object_scanned

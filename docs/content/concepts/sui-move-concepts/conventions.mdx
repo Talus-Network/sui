@@ -11,12 +11,12 @@ While these conventions are recommendations rather than strict rules, they repre
 
 ### Package
 
-A Sui package consists of: 
-- a `sources` directory containing the Move code to be uploaded to the blockchain
-- a `Move.toml` manifest file that declares dependencies and other information about the package
-- a `Move.lock` file that the Sui Move toolchain automatically generates to lock the versions of the dependencies and track the different published and upgraded versions of the package that exist on the different networks
+A Sui package consists of:
+- `sources` directory containing the Move code to be uploaded to the blockchain.
+- `Move.toml` manifest file that declares dependencies and other information about the package.
+- `Move.lock` file that the Sui Move toolchain automatically generates to lock the versions of the dependencies and track the different published and upgraded versions of the package that exist on the different networks.
 
-For this reason, the `Move.lock` file should always be part of the package (don't add it to the `.gitignore` file). Use the [automated address management](https://docs.sui.io/concepts/sui-move-concepts/packages/automated-address-management) instead of the old `published-at` field in the manifest file.
+For this reason, the `Move.lock` file should always be part of the package (don't add it to the `.gitignore` file). Use the [automated address management](/concepts/sui-move-concepts/packages/automated-address-management.mdx) instead of the old `published-at` field in the manifest file.
 
 Optionally, you can add a `tests` directory to contain the tests for the package and an `examples` directory to provide use cases for the package. Neither directory is uploaded on chain when you publish the package.
 
@@ -38,7 +38,7 @@ In your package manifest, the package name should be in PascalCase: `name = "MyP
 
 ### Modules
 
-Modules are the main building blocks of your Move code. They are used to organize and encapsulate related functionality. Design your modules around one object or data structure. A variant structure should have its own module to avoid complexity and bugs. 
+Modules are the main building blocks of your Move code. They are used to organize and encapsulate related functionality. Design your modules around one object or data structure. A variant structure should have its own module to avoid complexity and bugs.
 
 Module declarations don't need to use brackets anymore and the compiler provides default `use` statements for widely used modules, so you don't need to declare all of them.
 
@@ -46,14 +46,6 @@ Module declarations don't need to use brackets anymore and the compiler provides
 module conventions::wallet;
 
 public struct Wallet has key, store {
-    id: UID,
-    amount: u64
-}
-
-
-module conventions::claw_back_wallet;
-
-public struct Wallet has key {
     id: UID,
     amount: u64
 }
@@ -91,7 +83,7 @@ module conventions::comments;
 // === Test Functions ===
 ```
 
-Here, "public functions" are the functions modifying state, "view functions" are often on-chain getters or off-chain helpers. The latter are not necessary because you can query objects to read their data. The `init` function should be the first function in the module, if it exists.
+Here, public functions are the functions modifying state and view functions are often on-chain getters or off-chain helpers. The latter are not necessary because you can query objects to read their data. The `init` function should be the first function in the module, if it exists.
 
 Try to sort your functions by their purpose and according to the user flow to improve readability. You can also use explicit function names like `admin_set_fees` to make it clear what the function does.
 
@@ -132,7 +124,7 @@ const E_INVALID_NAME: u64 = 0;
 
 ### Structs
 
-Always declare struct abilities in this order: `key`, `copy`, `drop`, `store`. 
+Always declare struct abilities in this order: `key`, `copy`, `drop`, `store`.
 
 Do not use 'potato' in the name of structs. The lack of abilities define it as a potato pattern.
 
@@ -180,9 +172,9 @@ The following functions follow standard CRUD (Create, Read, Update, Delete) nami
 - `to_name`: Transforms a Type X to Type Y.
 - `from_name`: Transforms a Type Y to Type X.
 
-### Generics 
+### Generics
 
-Declare generics using single letter names or full names. By convention, developers use `T` and `U` for generic types, but you can use a more descriptive name if it is not confusing with other types. Always prioritize readability. 
+Declare generics using single letter names or full names. By convention, developers use `T` and `U` for generic types, but you can use a more descriptive name if it is not confusing with other types. Always prioritize readability.
 
 ```move
 module conventions::generics;
@@ -369,7 +361,7 @@ public fun new_shared(deposit: Coin<SUI>, ctx: &mut TxContext) {
 
 ### Admin capability
 
-In admin-gated functions, the first parameter should be the capability. It helps the autocomplete with user types.
+In admin-gated functions, the capability should be placed as the second parameter. This keeps the capability visible in method signatures and maintains method associativity.
 
 ```move
 module conventions::social_network;
@@ -385,14 +377,14 @@ public struct Admin has key {
     id: UID,
 }
 
-// right -> cap.update(&mut account, b"jose".to_string());
-public fun update(_: &Admin, account: &mut Account, new_name: String) {
+// right -> account.set(&cap, b"jose".to_string()); (normal method associativity)
+public fun set(account: &mut Account, _: &Admin, new_name: String) {
     // Implementation omitted.
     abort(0)
 }
 
-// wrong -> account.update(&cap, b"jose".to_string());
-public fun set(account: &mut Account, _: &Admin, new_name: String) {
+// wrong -> cap.update(&mut account, b"jose".to_string()); (reversed associativity)
+public fun update(_: &Admin, account: &mut Account, new_name: String) {
     // Implementation omitted.
     abort(0)
 }
@@ -439,7 +431,7 @@ public fun start_battle(
     _policy: &TransferPolicy<Hero>, // transfer policy for the game
     hero_id: ID, // hero to use
     battle_id: String // id of the battle to start
-) { 
+) {
     // Implementation omitted.
     abort(0)
 }

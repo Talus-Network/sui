@@ -1,14 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use camino::Utf8Path;
 use fastcrypto::hash::HashFunction;
 use fastcrypto::traits::KeyPair;
 use move_binary_format::CompiledModule;
 use move_core_types::ident_str;
 use shared_crypto::intent::{Intent, IntentMessage, IntentScope};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use sui_execution::{self, Executor};
 use sui_framework::{BuiltInFramework, SystemPackage};
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::base_types::{ExecutionDigests, ObjectID, SequenceNumber, TransactionDigest};
-use sui_types::bridge::{BridgeChainId, BRIDGE_CREATE_FUNCTION_NAME, BRIDGE_MODULE_NAME};
+use sui_types::bridge::{BRIDGE_CREATE_FUNCTION_NAME, BRIDGE_MODULE_NAME, BridgeChainId};
 use sui_types::committee::Committee;
 use sui_types::crypto::{
     AuthorityKeyPair, AuthorityPublicKeyBytes, AuthoritySignInfo, AuthoritySignInfoTrait,
@@ -30,6 +30,7 @@ use sui_types::deny_list_v1::{DENY_LIST_CREATE_FUNC, DENY_LIST_MODULE};
 use sui_types::digests::ChainIdentifier;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI, TransactionEvents};
 use sui_types::epoch_data::EpochData;
+use sui_types::execution_params::ExecutionOrEarlyError;
 use sui_types::gas::SuiGasStatus;
 use sui_types::gas_coin::GasCoin;
 use sui_types::governance::StakedSui;
@@ -45,7 +46,7 @@ use sui_types::messages_checkpoint::{
 use sui_types::metrics::LimitsMetrics;
 use sui_types::object::{Object, Owner};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
-use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState, SuiSystemStateTrait};
+use sui_types::sui_system_state::{SuiSystemState, SuiSystemStateTrait, get_sui_system_state};
 use sui_types::transaction::{
     CallArg, CheckedInputObjects, Command, InputObjectKind, ObjectReadResult, Transaction,
 };
@@ -349,9 +350,11 @@ impl Builder {
             let metadata = onchain_validator.verified_metadata();
 
             // Validators should not have duplicate addresses so the result of insertion should be None.
-            assert!(address_to_pool_id
-                .insert(metadata.sui_address, onchain_validator.staking_pool.id)
-                .is_none());
+            assert!(
+                address_to_pool_id
+                    .insert(metadata.sui_address, onchain_validator.staking_pool.id)
+                    .is_none()
+            );
             assert_eq!(validator.info.sui_address(), metadata.sui_address);
             assert_eq!(validator.info.protocol_key(), metadata.sui_pubkey_bytes());
             assert_eq!(validator.info.network_key, metadata.network_pubkey);
@@ -718,7 +721,9 @@ fn build_unsigned_genesis_data(
     objects: &[Object],
 ) -> UnsignedGenesis {
     if !parameters.allow_insertion_of_extra_objects && !objects.is_empty() {
-        panic!("insertion of extra objects at genesis time is prohibited due to 'allow_insertion_of_extra_objects' parameter");
+        panic!(
+            "insertion of extra objects at genesis time is prohibited due to 'allow_insertion_of_extra_objects' parameter"
+        );
     }
 
     let genesis_chain_parameters = parameters.to_genesis_chain_parameters();
@@ -908,11 +913,10 @@ fn create_genesis_transaction(
     let (effects, events, objects) = {
         let silent = true;
 
-        let executor = sui_execution::executor(protocol_config, silent, None)
+        let executor = sui_execution::executor(protocol_config, silent)
             .expect("Creating an executor should not fail here");
 
         let expensive_checks = false;
-        let certificate_deny_set = HashSet::new();
         let transaction_data = &genesis_transaction.data().intent_message().value;
         let (kind, signer, mut gas_data) = transaction_data.execution_parts();
         gas_data.payment = vec![];
@@ -923,7 +927,7 @@ fn create_genesis_transaction(
                 protocol_config,
                 metrics,
                 expensive_checks,
-                &certificate_deny_set,
+                ExecutionOrEarlyError::Ok(()),
                 &epoch_data.epoch_id(),
                 epoch_data.epoch_start_timestamp(),
                 input_objects,
@@ -969,7 +973,7 @@ fn create_genesis_objects(
     );
 
     let silent = true;
-    let executor = sui_execution::executor(&protocol_config, silent, None)
+    let executor = sui_execution::executor(&protocol_config, silent)
         .expect("Creating an executor should not fail here");
 
     for system_package in system_packages.into_iter() {
@@ -1025,7 +1029,7 @@ fn process_package(
     #[cfg(debug_assertions)]
     {
         use move_core_types::account_address::AccountAddress;
-        let to_be_published_addresses: HashSet<_> = modules
+        let to_be_published_addresses: std::collections::HashSet<_> = modules
             .iter()
             .map(|module| *module.self_id().address())
             .collect();
@@ -1134,6 +1138,28 @@ pub fn generate_genesis_system_object(
                 vec![],
             )?;
         }
+
+        if protocol_config.enable_accumulators() && protocol_config.create_root_accumulator_object()
+        {
+            builder.move_call(
+                SUI_FRAMEWORK_ADDRESS.into(),
+                ident_str!("accumulator").to_owned(),
+                ident_str!("create").to_owned(),
+                vec![],
+                vec![],
+            )?;
+        }
+
+        if protocol_config.enable_coin_registry() {
+            builder.move_call(
+                SUI_FRAMEWORK_ADDRESS.into(),
+                ident_str!("coin_registry").to_owned(),
+                ident_str!("create").to_owned(),
+                vec![],
+                vec![],
+            )?;
+        }
+
         if protocol_config.enable_coin_deny_list_v1() {
             builder.move_call(
                 SUI_FRAMEWORK_ADDRESS.into(),
@@ -1220,8 +1246,8 @@ pub fn generate_genesis_system_object(
 
 #[cfg(test)]
 mod test {
-    use crate::validator_info::ValidatorInfo;
     use crate::Builder;
+    use crate::validator_info::ValidatorInfo;
     use fastcrypto::traits::KeyPair;
     use sui_config::genesis::*;
     use sui_config::local_ip_utils;
@@ -1229,8 +1255,8 @@ mod test {
     use sui_config::node::DEFAULT_VALIDATOR_GAS_PRICE;
     use sui_types::base_types::SuiAddress;
     use sui_types::crypto::{
-        generate_proof_of_possession, get_key_pair_from_rng, AccountKeyPair, AuthorityKeyPair,
-        NetworkKeyPair,
+        AccountKeyPair, AuthorityKeyPair, NetworkKeyPair, generate_proof_of_possession,
+        get_key_pair_from_rng,
     };
 
     #[test]

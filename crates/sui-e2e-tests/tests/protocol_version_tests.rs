@@ -57,46 +57,51 @@ mod sim_only_tests {
 
     use super::*;
     use fastcrypto::encoding::Base64;
-    use move_binary_format::{file_format_common::VERSION_MAX, CompiledModule};
+    use move_binary_format::CompiledModule;
     use move_core_types::ident_str;
+    use mysten_common::register_debug_fatal_handler;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use sui_core::authority::framework_injection;
     use sui_framework::BuiltInFramework;
     use sui_json_rpc_api::WriteApiClient;
     use sui_json_rpc_types::{SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI};
     use sui_macros::*;
     use sui_move_build::{BuildConfig, CompiledPackage};
+    use sui_protocol_config::Chain;
     use sui_types::base_types::ConciseableName;
-    use sui_types::base_types::{ObjectID, ObjectRef};
+    use sui_types::base_types::{FullObjectID, FullObjectRef, ObjectID, ObjectRef};
     use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
     use sui_types::id::ID;
     use sui_types::object::Owner;
     use sui_types::sui_system_state::{
+        SUI_SYSTEM_STATE_SIM_TEST_DEEP_V2, SUI_SYSTEM_STATE_SIM_TEST_SHALLOW_V2,
+        SUI_SYSTEM_STATE_SIM_TEST_V1, SuiSystemState, SuiSystemStateTrait,
         epoch_start_sui_system_state::EpochStartSystemStateTrait, get_validator_from_table,
-        SuiSystemState, SuiSystemStateTrait, SUI_SYSTEM_STATE_SIM_TEST_DEEP_V2,
-        SUI_SYSTEM_STATE_SIM_TEST_SHALLOW_V2, SUI_SYSTEM_STATE_SIM_TEST_V1,
     };
     use sui_types::supported_protocol_versions::SupportedProtocolVersions;
     use sui_types::transaction::{
         CallArg, Command, ObjectArg, ProgrammableMoveCall, ProgrammableTransaction,
-        TransactionData, TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+        TEST_ONLY_GAS_UNIT_FOR_GENERIC, TransactionData,
     };
     use sui_types::{
+        MOVE_STDLIB_PACKAGE_ID, SUI_BRIDGE_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID,
+        SUI_SYSTEM_PACKAGE_ID,
         base_types::{SequenceNumber, SuiAddress},
         digests::TransactionDigest,
         object::Object,
         programmable_transaction_builder::ProgrammableTransactionBuilder,
         transaction::TransactionKind,
-        MOVE_STDLIB_PACKAGE_ID, SUI_BRIDGE_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID,
-        SUI_SYSTEM_PACKAGE_ID,
     };
     use sui_types::{
-        SUI_AUTHENTICATOR_STATE_OBJECT_ID, SUI_CLOCK_OBJECT_ID, SUI_RANDOMNESS_STATE_OBJECT_ID,
-        SUI_SYSTEM_STATE_OBJECT_ID,
+        SUI_ACCUMULATOR_ROOT_OBJECT_ID, SUI_AUTHENTICATOR_STATE_OBJECT_ID, SUI_CLOCK_OBJECT_ID,
+        SUI_RANDOMNESS_STATE_OBJECT_ID, SUI_SYSTEM_STATE_OBJECT_ID,
     };
     use test_cluster::TestCluster;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
     use tracing::info;
 
     const START: u64 = ProtocolVersion::MAX.as_u64();
@@ -356,9 +361,9 @@ mod sim_only_tests {
         assert!(has_public_transfer(&cluster, &to_transfer1.0).await);
         // Instances of the type that existed before and new instances are able to take advantage of
         // the newly introduced ability
-        wrap_obj(&cluster, to_wrap0).await;
+        wrap_obj(&cluster, to_wrap0.as_object_ref()).await;
         transfer_obj(&cluster, SuiAddress::ZERO, to_transfer0).await;
-        wrap_obj(&cluster, to_wrap1).await;
+        wrap_obj(&cluster, to_wrap1.as_object_ref()).await;
         transfer_obj(&cluster, SuiAddress::ZERO, to_transfer1).await;
     }
 
@@ -439,6 +444,7 @@ mod sim_only_tests {
                         SUI_AUTHENTICATOR_STATE_OBJECT_ID,
                         SUI_RANDOMNESS_STATE_OBJECT_ID,
                         SUI_BRIDGE_OBJECT_ID,
+                        SUI_ACCUMULATOR_ROOT_OBJECT_ID,
                     ]
                     .contains(&obj.0);
                     (!is_framework_obj).then_some(obj.0)
@@ -498,7 +504,7 @@ mod sim_only_tests {
         .await
     }
 
-    async fn create_obj(cluster: &TestCluster) -> ObjectRef {
+    async fn create_obj(cluster: &TestCluster) -> FullObjectRef {
         execute_creating(cluster, {
             let mut builder = ProgrammableTransactionBuilder::new();
             builder
@@ -518,7 +524,7 @@ mod sim_only_tests {
         .clone()
     }
 
-    async fn wrap_obj(cluster: &TestCluster, obj: ObjectRef) -> ObjectRef {
+    async fn wrap_obj(cluster: &TestCluster, obj: ObjectRef) -> FullObjectRef {
         execute_creating(cluster, {
             let mut builder = ProgrammableTransactionBuilder::new();
             builder
@@ -541,7 +547,7 @@ mod sim_only_tests {
     async fn transfer_obj(
         cluster: &TestCluster,
         recipient: SuiAddress,
-        obj: ObjectRef,
+        obj: FullObjectRef,
     ) -> ObjectRef {
         execute(cluster, {
             let mut builder = ProgrammableTransactionBuilder::new();
@@ -551,7 +557,7 @@ mod sim_only_tests {
         .await
         .mutated()
         .iter()
-        .find(|oref| oref.reference.object_id == obj.0)
+        .find(|oref| oref.reference.object_id == obj.0.id())
         .unwrap()
         .reference
         .to_object_ref()
@@ -588,12 +594,17 @@ mod sim_only_tests {
     async fn execute_creating(
         cluster: &TestCluster,
         ptb: ProgrammableTransaction,
-    ) -> Vec<ObjectRef> {
+    ) -> Vec<FullObjectRef> {
         execute(cluster, ptb)
             .await
             .created()
             .iter()
-            .map(|oref| oref.reference.to_object_ref())
+            .map(|oref| {
+                FullObjectRef::from_object_ref_and_owner(
+                    oref.reference.to_object_ref(),
+                    &oref.owner,
+                )
+            })
             .collect()
     }
 
@@ -605,13 +616,15 @@ mod sim_only_tests {
         let (sender, gas_object) = context.get_one_gas_object().await.unwrap().unwrap();
 
         let rgp = context.get_reference_gas_price().await.unwrap();
-        let txn = context.sign_transaction(&TransactionData::new_programmable(
-            sender,
-            vec![gas_object],
-            ptb,
-            rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
-            rgp,
-        ));
+        let txn = context
+            .sign_transaction(&TransactionData::new_programmable(
+                sender,
+                vec![gas_object],
+                ptb,
+                rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+                rgp,
+            ))
+            .await;
 
         context
             .execute_transaction_must_succeed(txn)
@@ -677,8 +690,8 @@ mod sim_only_tests {
             .await
     }
 
-    async fn has_public_transfer(cluster: &TestCluster, object_id: &ObjectID) -> bool {
-        get_object(&cluster, object_id)
+    async fn has_public_transfer(cluster: &TestCluster, object_id: &FullObjectID) -> bool {
+        get_object(&cluster, &object_id.id())
             .await
             .data
             .try_as_move()
@@ -720,6 +733,14 @@ mod sim_only_tests {
             .build()
             .await;
 
+        let framework_mismatch_counter = Arc::new(AtomicUsize::new(0));
+        register_debug_fatal_handler!("Framework mismatch -- ", {
+            let counter = framework_mismatch_counter.clone();
+            move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
         // We must stop the validators before overriding the system modules, otherwise the validators
         // may start running before the override and hence send capabilities indicating that they
         // only support the genesis system modules.
@@ -752,6 +773,9 @@ mod sim_only_tests {
             );
             assert_eq!(committee.epoch, 2);
         });
+
+        // The debug_fatal was hit
+        assert_eq!(framework_mismatch_counter.load(Ordering::Relaxed), 1);
     }
 
     // Test that protocol version upgrade does not complete when there is no quorum on the
@@ -1025,8 +1049,7 @@ mod sim_only_tests {
         Object::new_package(
             &sui_system_modules(fixture),
             TransactionDigest::genesis_marker(),
-            u64::MAX,
-            VERSION_MAX,
+            &ProtocolConfig::get_for_version(FINISH.into(), Chain::Unknown),
             &[
                 BuiltInFramework::get_package_by_id(&MOVE_STDLIB_PACKAGE_ID).genesis_move_package(),
                 BuiltInFramework::get_package_by_id(&SUI_FRAMEWORK_PACKAGE_ID)

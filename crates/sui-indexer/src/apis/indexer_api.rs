@@ -8,7 +8,7 @@ use jsonrpsee::{PendingSubscriptionSink, RpcModule};
 use tap::TapFallible;
 
 use sui_json_rpc::SuiRpcModule;
-use sui_json_rpc_api::{cap_page_limit, IndexerApiServer};
+use sui_json_rpc_api::{IndexerApiServer, cap_page_limit};
 use sui_json_rpc_types::{
     DynamicFieldPage, EventFilter, EventPage, ObjectsPage, Page, SuiObjectResponse,
     SuiObjectResponseQuery, SuiTransactionBlockResponseQuery, TransactionBlocksPage,
@@ -16,16 +16,16 @@ use sui_json_rpc_types::{
 };
 use sui_name_service::{Domain, NameRecord, NameServiceConfig, NameServiceError};
 use sui_open_rpc::Module;
+use sui_types::TypeTag;
 use sui_types::base_types::{ObjectID, SuiAddress};
 use sui_types::digests::TransactionDigest;
 use sui_types::dynamic_field::{DynamicFieldName, Field};
 use sui_types::error::SuiObjectResponseError;
 use sui_types::event::EventID;
 use sui_types::object::ObjectRead;
-use sui_types::TypeTag;
 
-use crate::indexer_reader::IndexerReader;
 use crate::IndexerError;
+use crate::indexer_reader::IndexerReader;
 
 pub(crate) struct IndexerApi {
     inner: IndexerReader,
@@ -77,7 +77,6 @@ impl IndexerApi {
         let next_cursor = objects.last().map(|o_read| o_read.object_id());
         let mut parallel_tasks = vec![];
         for o in objects {
-            let inner_clone = self.inner.clone();
             let options = options.clone();
             parallel_tasks.push(tokio::task::spawn(async move {
                 match o {
@@ -86,18 +85,10 @@ impl IndexerApi {
                     )),
                     ObjectRead::Exists(object_ref, o, layout) => {
                         if options.show_display {
-                            match inner_clone.get_display_fields(&o, &layout).await {
-                                Ok(rendered_fields) => Ok(SuiObjectResponse::new_with_data(
-                                    (object_ref, o, layout, options, Some(rendered_fields))
-                                        .try_into()?,
-                                )),
-                                Err(e) => Ok(SuiObjectResponse::new(
-                                    Some((object_ref, o, layout, options, None).try_into()?),
-                                    Some(SuiObjectResponseError::DisplayError {
-                                        error: e.to_string(),
-                                    }),
-                                )),
-                            }
+                            Err(IndexerError::NotSupportedError(
+                                "Display fields are not supported".to_owned(),
+                            )
+                            .into())
                         } else {
                             Ok(SuiObjectResponse::new_with_data(
                                 (object_ref, o, layout, options, None).try_into()?,

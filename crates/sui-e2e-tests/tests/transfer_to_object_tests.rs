@@ -10,7 +10,7 @@ use sui_test_transaction_builder::publish_package;
 use sui_types::base_types::{ObjectID, ObjectRef};
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
-use sui_types::error::{SuiError, UserInputError};
+use sui_types::error::{SuiErrorKind, UserInputError};
 use sui_types::object::Owner;
 use sui_types::transaction::{CallArg, ObjectArg, Transaction};
 use test_cluster::{TestCluster, TestClusterBuilder};
@@ -45,8 +45,8 @@ async fn receive_object_feature_deny() {
         .unwrap_err();
 
     assert!(matches!(
-        err,
-        SuiError::UserInputError {
+        err.as_inner(),
+        SuiErrorKind::UserInputError {
             error: UserInputError::Unsupported(..)
         }
     ));
@@ -179,7 +179,10 @@ impl TestEnvironment {
             .await
             .move_call(self.move_package, "tto", function, arguments)
             .build();
-        self.test_cluster.wallet.sign_transaction(&transaction)
+        self.test_cluster
+            .wallet
+            .sign_transaction(&transaction)
+            .await
     }
 
     async fn move_call(
@@ -216,11 +219,7 @@ impl TestEnvironment {
                 .iter()
                 .find_map(
                     |(oref, _)| {
-                        if oref.0 == child.0 {
-                            Some(*oref)
-                        } else {
-                            None
-                        }
+                        if oref.0 == child.0 { Some(*oref) } else { None }
                     },
                 )
                 .unwrap();

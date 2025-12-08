@@ -5,8 +5,8 @@ use crate::drivers::Interval;
 use crate::in_memory_wallet::InMemoryWallet;
 use crate::system_state_observer::SystemStateObserver;
 use crate::workloads::payload::Payload;
-use crate::workloads::workload::{ExpectedFailureType, Workload, STORAGE_COST_PER_COIN};
-use crate::workloads::workload::{WorkloadBuilder, ESTIMATED_COMPUTATION_COST};
+use crate::workloads::workload::{ESTIMATED_COMPUTATION_COST, WorkloadBuilder};
+use crate::workloads::workload::{ExpectedFailureType, STORAGE_COST_PER_COIN, Workload};
 use crate::workloads::{Gas, GasCoinConfig, WorkloadBuilderInfo, WorkloadParams};
 use crate::{ExecutionEffects, ValidatorProxy};
 use async_trait::async_trait;
@@ -273,5 +273,9 @@ impl Workload<dyn Payload> for BatchPaymentWorkload {
             .into_iter()
             .map(|b| Box::<dyn Payload>::from(b))
             .collect()
+    }
+
+    fn name(&self) -> &str {
+        "BatchPayment"
     }
 }

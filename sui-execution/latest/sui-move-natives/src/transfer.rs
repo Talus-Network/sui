@@ -3,8 +3,8 @@
 
 use super::object_runtime::{ObjectRuntime, TransferResult};
 use crate::{
-    get_receiver_object_id, get_tag_and_layouts, object_runtime::object_store::ObjectResult,
-    NativesCostTable,
+    NativesCostTable, get_extension, get_extension_mut, get_receiver_object_id,
+    get_tag_and_layouts, object_runtime::object_store::ObjectResult,
 };
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_core_types::{
@@ -28,6 +28,8 @@ const E_RECEIVING_OBJECT_TYPE_MISMATCH: u64 = 2;
 // Represents both the case where the object does not exist and the case where the object is not
 // able to be accessed through the parent that is passed-in.
 const E_UNABLE_TO_RECEIVE_OBJECT: u64 = 3;
+// Operation not yet supported
+const E_NOT_SUPPORTED: u64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct TransferReceiveObjectInternalCostParams {
@@ -46,9 +48,7 @@ pub fn receive_object_internal(
 ) -> PartialVMResult<NativeResult> {
     debug_assert!(ty_args.len() == 1);
     debug_assert!(args.len() == 3);
-    let transfer_receive_object_internal_cost_params = context
-        .extensions_mut()
-        .get::<NativesCostTable>()
+    let transfer_receive_object_internal_cost_params = get_extension!(context, NativesCostTable)?
         .transfer_receive_object_internal_cost_params
         .clone();
     native_charge_gas_early_exit!(
@@ -74,12 +74,11 @@ pub fn receive_object_internal(
         ));
     };
 
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
-    let child = match object_runtime.receive_object(
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
+    let (_cache_info, child) = match object_runtime.receive_object(
         parent,
         child_id,
         child_receiver_sequence_number,
-        &child_ty,
         &layout,
         &annotated_layout,
         MoveObjectType::from(tag),
@@ -89,14 +88,14 @@ pub fn receive_object_internal(
             return Ok(NativeResult::err(
                 context.gas_used(),
                 E_UNABLE_TO_RECEIVE_OBJECT,
-            ))
+            ));
         }
         Ok(Some(ObjectResult::Loaded(gv))) => gv,
         Ok(Some(ObjectResult::MismatchedType)) => {
             return Ok(NativeResult::err(
                 context.gas_used(),
                 E_RECEIVING_OBJECT_TYPE_MISMATCH,
-            ))
+            ));
         }
         Err(x) => return Err(x),
     };
@@ -121,9 +120,7 @@ pub fn transfer_internal(
     debug_assert!(ty_args.len() == 1);
     debug_assert!(args.len() == 2);
 
-    let transfer_transfer_internal_cost_params = context
-        .extensions_mut()
-        .get::<NativesCostTable>()
+    let transfer_transfer_internal_cost_params = get_extension!(context, NativesCostTable)?
         .transfer_transfer_internal_cost_params
         .clone();
 
@@ -137,6 +134,98 @@ pub fn transfer_internal(
     let obj = args.pop_back().unwrap();
 
     let owner = Owner::AddressOwner(recipient.into());
+    object_runtime_transfer(context, owner, ty, obj)?;
+    let cost = context.gas_used();
+    Ok(NativeResult::ok(cost, smallvec![]))
+}
+
+#[derive(Clone, Debug)]
+pub struct PartyTransferInternalCostParams {
+    pub transfer_party_transfer_internal_cost_base: Option<InternalGas>,
+}
+
+macro_rules! native_charge_gas_early_exit_option {
+    ($native_context:ident, $cost:expr) => {{
+        use move_binary_format::errors::PartialVMError;
+        use move_core_types::vm_status::StatusCode;
+        native_charge_gas_early_exit!(
+            $native_context,
+            $cost.ok_or_else(|| {
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("Gas cost for party is missing".to_string())
+            })?
+        );
+    }};
+}
+/***************************************************************************************************
+* native fun multi_partytransfer_impl
+* Implementation of the Move native function
+*   `party_transfer_impl<T: key>(obj: T, recipient: address)`
+*   gas cost: transfer_party_transfer_internal_cost_base                  |  covers various fixed costs in the oper
+**************************************************************************************************/
+pub fn party_transfer_internal(
+    context: &mut NativeContext,
+    mut ty_args: Vec<Type>,
+    mut args: VecDeque<Value>,
+) -> PartialVMResult<NativeResult> {
+    const NONE: u64 = 0;
+    const READ: u64 = 0b0001;
+    const WRITE: u64 = 0b0010;
+    const DELETE: u64 = 0b0100;
+    const TRANSFER: u64 = 0b1000;
+    const ALL: u64 = READ | WRITE | DELETE | TRANSFER;
+
+    debug_assert!(ty_args.len() == 1);
+    debug_assert!(args.len() == 4);
+
+    let is_supported = get_extension!(context, ObjectRuntime)?
+        .protocol_config
+        .enable_party_transfer();
+    if !is_supported {
+        let cost = context.gas_used();
+        return Ok(NativeResult::err(cost, E_NOT_SUPPORTED));
+    }
+
+    let transfer_party_transfer_internal_cost_params = get_extension!(context, NativesCostTable)?
+        .transfer_party_transfer_internal_cost_params
+        .clone();
+
+    native_charge_gas_early_exit_option!(
+        context,
+        transfer_party_transfer_internal_cost_params.transfer_party_transfer_internal_cost_base
+    );
+
+    let ty = ty_args.pop().unwrap();
+    let permissions = pop_arg!(args, Vec<u64>);
+    let addresses = pop_arg!(args, Vec<AccountAddress>);
+    let default_permissions = pop_arg!(args, u64);
+    let obj = args.pop_back().unwrap();
+    let Ok([permissions]): Result<[u64; 1], _> = permissions.try_into() else {
+        return Err(
+            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                .with_message("Party transfer only supports one party member".to_string()),
+        );
+    };
+    if permissions != ALL || default_permissions != NONE {
+        return Err(
+            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
+                "Party transfer only supports one party member with all permissions".to_string(),
+            ),
+        );
+    }
+    let Ok([address]): Result<[AccountAddress; 1], _> = addresses.try_into() else {
+        return Err(
+            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                .with_message("Party transfer only supports one party member".to_string()),
+        );
+    };
+
+    // Dummy version, to be filled with the correct initial version when the effects of the
+    // transaction are written to storage.
+    let owner = Owner::ConsensusAddressOwner {
+        start_version: SequenceNumber::new(),
+        owner: address.into(),
+    };
     object_runtime_transfer(context, owner, ty, obj)?;
     let cost = context.gas_used();
     Ok(NativeResult::ok(cost, smallvec![]))
@@ -159,9 +248,7 @@ pub fn freeze_object(
     debug_assert!(ty_args.len() == 1);
     debug_assert!(args.len() == 1);
 
-    let transfer_freeze_object_cost_params = context
-        .extensions_mut()
-        .get::<NativesCostTable>()
+    let transfer_freeze_object_cost_params = get_extension!(context, NativesCostTable)?
         .transfer_freeze_object_cost_params
         .clone();
 
@@ -195,9 +282,7 @@ pub fn share_object(
     debug_assert!(ty_args.len() == 1);
     debug_assert!(args.len() == 1);
 
-    let transfer_share_object_cost_params = context
-        .extensions_mut()
-        .get::<NativesCostTable>()
+    let transfer_share_object_cost_params = get_extension!(context, NativesCostTable)?
         .transfer_share_object_cost_params
         .clone();
 
@@ -233,13 +318,16 @@ fn object_runtime_transfer(
     ty: Type,
     obj: Value,
 ) -> PartialVMResult<TransferResult> {
-    if !matches!(context.type_to_type_tag(&ty)?, TypeTag::Struct(_)) {
-        return Err(
-            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                .with_message("Sui verifier guarantees this is a struct".to_string()),
-        );
-    }
+    let object_type = match context.type_to_type_tag(&ty)? {
+        TypeTag::Struct(s) => MoveObjectType::from(*s),
+        _ => {
+            return Err(
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("Sui verifier guarantees this is a struct".to_string()),
+            );
+        }
+    };
 
-    let obj_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
-    obj_runtime.transfer(owner, ty, obj)
+    let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
+    obj_runtime.transfer(owner, object_type, obj, /* end of transaction */ false)
 }

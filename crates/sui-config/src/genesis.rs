@@ -6,12 +6,12 @@ use fastcrypto::encoding::{Base64, Encoding};
 use fastcrypto::hash::HashFunction;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{fs, path::Path};
-use sui_types::authenticator_state::{get_authenticator_state, AuthenticatorStateInner};
+use sui_types::authenticator_state::{AuthenticatorStateInner, get_authenticator_state};
 use sui_types::base_types::{ObjectID, SuiAddress};
 use sui_types::clock::Clock;
 use sui_types::committee::CommitteeWithNetworkMetadata;
 use sui_types::crypto::DefaultHash;
-use sui_types::deny_list_v1::{get_coin_deny_list, PerTypeDenyList};
+use sui_types::deny_list_v1::{PerTypeDenyList, get_coin_deny_list};
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::gas_coin::TOTAL_SUPPLY_MIST;
 use sui_types::messages_checkpoint::{
@@ -19,16 +19,16 @@ use sui_types::messages_checkpoint::{
 };
 use sui_types::storage::ObjectStore;
 use sui_types::sui_system_state::{
-    get_sui_system_state, get_sui_system_state_wrapper, SuiSystemState, SuiSystemStateTrait,
-    SuiSystemStateWrapper, SuiValidatorGenesis,
+    SuiSystemState, SuiSystemStateTrait, SuiSystemStateWrapper, SuiValidatorGenesis,
+    get_sui_system_state, get_sui_system_state_wrapper,
 };
 use sui_types::transaction::Transaction;
+use sui_types::{SUI_BRIDGE_OBJECT_ID, SUI_RANDOMNESS_STATE_OBJECT_ID};
 use sui_types::{
     committee::{Committee, EpochId, ProtocolVersion},
     error::SuiResult,
     object::Object,
 };
-use sui_types::{SUI_BRIDGE_OBJECT_ID, SUI_RANDOMNESS_STATE_OBJECT_ID};
 use tracing::trace;
 
 #[derive(Clone, Debug)]
@@ -447,6 +447,8 @@ impl GenesisCeremonyParameters {
         1000
     }
 
+    #[allow(deprecated)]
+    // TODO: replace deprecated constants with proper values
     pub fn to_genesis_chain_parameters(&self) -> GenesisChainParameters {
         GenesisChainParameters {
             protocol_version: self.protocol_version.as_u64(),
@@ -491,7 +493,9 @@ impl TokenDistributionSchedule {
         }
 
         if total_mist != TOTAL_SUPPLY_MIST {
-            panic!("TokenDistributionSchedule adds up to {total_mist} and not expected {TOTAL_SUPPLY_MIST}");
+            panic!(
+                "TokenDistributionSchedule adds up to {total_mist} and not expected {TOTAL_SUPPLY_MIST}"
+            );
         }
     }
 
@@ -516,17 +520,9 @@ impl TokenDistributionSchedule {
                     allocation.amount_mist;
             }
         }
-
-        // Check that all validators have sufficient stake allocated to ensure they meet the
-        // minimum stake threshold
-        let minimum_required_stake = sui_types::governance::VALIDATOR_LOW_STAKE_THRESHOLD_MIST;
-        for (validator, stake) in validators {
-            if stake < minimum_required_stake {
-                panic!("validator {validator} has '{stake}' stake and does not meet the minimum required stake threshold of '{minimum_required_stake}'");
-            }
-        }
     }
 
+    #[allow(deprecated)]
     pub fn new_for_validators_with_default_allocation<I: IntoIterator<Item = SuiAddress>>(
         validators: I,
     ) -> Self {
@@ -634,6 +630,7 @@ impl TokenDistributionScheduleBuilder {
         }
     }
 
+    #[allow(deprecated)]
     pub fn default_allocation_for_validators<I: IntoIterator<Item = SuiAddress>>(
         &mut self,
         validators: I,

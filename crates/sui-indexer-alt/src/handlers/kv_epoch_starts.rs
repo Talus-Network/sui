@@ -4,29 +4,32 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use sui_indexer_alt_framework::{
-    db,
-    models::cp_sequence_numbers::epoch_interval,
-    pipeline::{concurrent::Handler, Processor},
+    pipeline::{Processor, concurrent::Handler},
+    postgres::{Connection, Db},
     types::{
         full_checkpoint_content::CheckpointData,
-        sui_system_state::{get_sui_system_state, SuiSystemStateTrait},
+        sui_system_state::{SuiSystemStateTrait, get_sui_system_state},
         transaction::{TransactionDataAPI, TransactionKind},
     },
 };
 use sui_indexer_alt_schema::{epochs::StoredEpochStart, schema::kv_epoch_starts};
 
+use crate::handlers::cp_sequence_numbers::epoch_interval;
+use async_trait::async_trait;
+
 pub(crate) struct KvEpochStarts;
 
+#[async_trait]
 impl Processor for KvEpochStarts {
     const NAME: &'static str = "kv_epoch_starts";
 
     type Value = StoredEpochStart;
 
-    fn process(&self, checkpoint: &Arc<CheckpointData>) -> Result<Vec<Self::Value>> {
+    async fn process(&self, checkpoint: &Arc<CheckpointData>) -> Result<Vec<Self::Value>> {
         let CheckpointData {
             checkpoint_summary,
             transactions,
@@ -66,11 +69,13 @@ impl Processor for KvEpochStarts {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Handler for KvEpochStarts {
+    type Store = Db;
+
     const MIN_EAGER_ROWS: usize = 1;
 
-    async fn commit(values: &[Self::Value], conn: &mut db::Connection<'_>) -> Result<usize> {
+    async fn commit<'a>(values: &[Self::Value], conn: &mut Connection<'a>) -> Result<usize> {
         Ok(diesel::insert_into(kv_epoch_starts::table)
             .values(values)
             .on_conflict_do_nothing()
@@ -78,11 +83,11 @@ impl Handler for KvEpochStarts {
             .await?)
     }
 
-    async fn prune(
+    async fn prune<'a>(
         &self,
         from: u64,
         to_exclusive: u64,
-        conn: &mut db::Connection<'_>,
+        conn: &mut Connection<'a>,
     ) -> Result<usize> {
         let Range {
             start: from_epoch,

@@ -1,0 +1,48 @@
+---
+source: external-crates/move/crates/move-transactional-test-runner/src/framework.rs
+---
+processed 6 tasks
+
+init:
+A: object(0,0)
+
+task 1, lines 8-29:
+//# publish
+created: object(1,0)
+mutated: object(0,1)
+gas summary: computation_cost: 1000000, storage_cost: 5137600,  storage_rebate: 0, non_refundable_storage_fee: 0
+
+task 2, lines 32-35:
+//# programmable
+// This should be allowed and should abort
+//> 0: test::m::pair_mut();
+//> test::m::increment(Result(0));
+Error: Transaction Effects Status: Invalid public Move function signature. Unsupported return type for return value 0
+Execution Error: ExecutionError: ExecutionError { inner: ExecutionErrorInner { kind: InvalidPublicFunctionReturnType { idx: 0 }, source: None, command: Some(0) } }
+
+task 3, lines 37-43:
+//# programmable
+// This should be allowed and should abort
+//> 0: test::m::box_mut();
+//> test::m::increment(NestedResult(0,0));
+//> test::m::increment(NestedResult(0,1));
+//> test::m::increment(NestedResult(0,0));
+//> test::m::swap_x(NestedResult(0,0), NestedResult(0,1));
+Error: Transaction Effects Status: Invalid public Move function signature. Unsupported return type for return value 0
+Execution Error: ExecutionError: ExecutionError { inner: ExecutionErrorInner { kind: InvalidPublicFunctionReturnType { idx: 0 }, source: None, command: Some(0) } }
+
+task 4, lines 45-48:
+//# programmable
+// This should be rejected by the borrow checker (in static PTBs)
+//> 0: test::m::pair_mut();
+//> test::m::swap_x(Result(0), Result(0));
+Error: Transaction Effects Status: Invalid public Move function signature. Unsupported return type for return value 0
+Execution Error: ExecutionError: ExecutionError { inner: ExecutionErrorInner { kind: InvalidPublicFunctionReturnType { idx: 0 }, source: None, command: Some(0) } }
+
+task 5, lines 50-53:
+//# programmable
+// This should be rejected by the borrow checker (in static PTBs)
+//> 0: test::m::box_mut();
+//> test::m::swap_x(NestedResult(0,0), NestedResult(0,0));
+Error: Transaction Effects Status: Invalid public Move function signature. Unsupported return type for return value 0
+Execution Error: ExecutionError: ExecutionError { inner: ExecutionErrorInner { kind: InvalidPublicFunctionReturnType { idx: 0 }, source: None, command: Some(0) } }

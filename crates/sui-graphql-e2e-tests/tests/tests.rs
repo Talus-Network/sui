@@ -7,13 +7,13 @@ use anyhow::bail;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::{path::Path, sync::Arc, time::Duration};
-use sui_graphql_rpc::test_infra::cluster::{serve_executor, ExecutorCluster};
+use sui_graphql_rpc::test_infra::cluster::{ExecutorCluster, serve_executor};
 use sui_transactional_test_runner::{
     args::SuiInitArgs,
     create_adapter,
     offchain_state::{OffchainStateReader, TestResponse},
     run_tasks_with_adapter,
-    test_adapter::{SuiTestAdapter, PRE_COMPILED},
+    test_adapter::{PRE_COMPILED, SuiTestAdapter},
 };
 
 pub struct OffchainReaderForAdapter {
@@ -95,7 +95,7 @@ async fn run_test(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             cluster: cluster_arc.clone(),
         }));
 
-        run_tasks_with_adapter(path, adapter, output).await?;
+        run_tasks_with_adapter(path, adapter, output, None).await?;
 
         match Arc::try_unwrap(cluster_arc) {
             Ok(cluster) => cluster.cleanup_resources().await,

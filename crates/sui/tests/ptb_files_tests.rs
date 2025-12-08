@@ -12,7 +12,8 @@ const TEST_DIR: &str = "tests";
 #[cfg(not(msim))]
 #[tokio::main]
 async fn test_ptb_files(path: &Path) -> datatest_stable::Result<()> {
-    use sui::client_ptb::ptb::{to_source_string, PTB};
+    use std::collections::BTreeMap;
+    use sui::client_ptb::ptb::{PTB, to_source_string};
     use sui::client_ptb::{error::build_error_reports, ptb::PTBPreview};
     use test_cluster::TestClusterBuilder;
 
@@ -63,7 +64,7 @@ async fn test_ptb_files(path: &Path) -> datatest_stable::Result<()> {
     let context = &test_cluster.wallet;
     let client = context.get_client().await?;
 
-    let (built_ptb, warnings) = PTB::build_ptb(program, context, client).await;
+    let (built_ptb, warnings) = PTB::build_ptb(program, BTreeMap::new(), client).await;
 
     if !warnings.is_empty() {
         let rendered = build_error_reports(&file_contents, warnings);
@@ -105,11 +106,12 @@ fn stable_call_arg_display(ca: &CallArg) -> String {
         CallArg::Pure(v) => format!("Pure({:?})", v),
         CallArg::Object(oa) => match oa {
             ObjectArg::ImmOrOwnedObject(_) => "ImmutableOrOwnedObject".to_string(),
-            ObjectArg::SharedObject { mutable, .. } => {
-                format!("SharedObject(mutable: {})", mutable)
+            ObjectArg::SharedObject { mutability, .. } => {
+                format!("SharedObject(mutability: {:?})", mutability)
             }
             ObjectArg::Receiving(_) => "Receiving".to_string(),
         },
+        CallArg::FundsWithdrawal(_) => "FundsWithdrawal".to_string(),
     }
 }
 

@@ -6,6 +6,10 @@ use std::str::FromStr;
 use anyhow::Context as _;
 use futures::future::OptionFuture;
 use move_core_types::annotated_value::{MoveDatatypeLayout, MoveTypeLayout};
+use sui_indexer_alt_reader::{
+    kv_loader::TransactionContents, objects::VersionedObjectKey,
+    tx_balance_changes::TxBalanceChangeKey,
+};
 use sui_indexer_alt_schema::transactions::{BalanceChange, StoredTxBalanceChange};
 use sui_json_rpc_types::{
     BalanceChange as SuiBalanceChange, ObjectChange as SuiObjectChange, SuiEvent,
@@ -13,6 +17,7 @@ use sui_json_rpc_types::{
     SuiTransactionBlockEvents, SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
 };
 use sui_types::{
+    TypeTag,
     base_types::{ObjectID, SequenceNumber},
     digests::{ObjectDigest, TransactionDigest},
     effects::{IDOperation, ObjectChange, TransactionEffects, TransactionEffectsAPI},
@@ -20,17 +25,12 @@ use sui_types::{
     object::Object,
     signature::GenericSignature,
     transaction::{TransactionData, TransactionDataAPI},
-    TypeTag,
 };
 use tokio::join;
 
 use crate::{
     context::Context,
-    data::{
-        kv_loader::TransactionContents, objects::VersionedObjectKey,
-        tx_balance_changes::TxBalanceChangeKey,
-    },
-    error::{invalid_params, rpc_bail, RpcError},
+    error::{RpcError, invalid_params, rpc_bail},
 };
 
 use super::error::Error;
@@ -60,7 +60,7 @@ pub(super) async fn transaction(
         .transpose()
         .context("Failed to fetch balance changes from store")?
     {
-        Some(None) => return Err(invalid_params(Error::PrunedBalanceChanges(digest))),
+        Some(None) => return Err(invalid_params(Error::BalanceChangesNotFound(digest))),
         Some(changes) => changes,
         None => None,
     };
@@ -68,6 +68,9 @@ pub(super) async fn transaction(
     let digest = tx.digest()?;
 
     let mut response = SuiTransactionBlockResponse::new(digest);
+
+    response.timestamp_ms = Some(tx.timestamp_ms());
+    response.checkpoint = tx.cp_sequence_number();
 
     if options.show_input {
         response.transaction = Some(input(ctx, &tx).await?);

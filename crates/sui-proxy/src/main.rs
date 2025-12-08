@@ -6,8 +6,8 @@ use std::env;
 use sui_proxy::config::ProxyConfig;
 use sui_proxy::{
     admin::{
-        app, create_server_cert_default_allow, create_server_cert_enforce_peer,
-        make_reqwest_client, server, Labels,
+        Labels, app, create_server_cert_default_allow, create_server_cert_enforce_peer,
+        make_reqwest_client, server,
     },
     config::load,
     histogram_relay, metrics,
@@ -84,6 +84,12 @@ async fn main() -> Result<()> {
             "unavailable",
         ))
         .unwrap();
+
+    let timeout_secs = match env::var("NODE_CLIENT_TIMEOUT") {
+        Ok(val) => val.parse::<u64>().ok(),
+        Err(_) => None,
+    };
+
     let app = app(
         Labels {
             network: config.network,
@@ -93,6 +99,7 @@ async fn main() -> Result<()> {
         client,
         histogram_relay,
         allower,
+        timeout_secs,
     );
 
     server(listener, app, Some(acceptor)).await.unwrap();

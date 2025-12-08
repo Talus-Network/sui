@@ -4,18 +4,18 @@
 use crate::drivers::Interval;
 use crate::system_state_observer::SystemStateObserver;
 use crate::util::publish_basics_package;
+use crate::workloads::GasCoinConfig;
 use crate::workloads::payload::Payload;
 use crate::workloads::workload::{
-    ExpectedFailureType, Workload, WorkloadBuilder, ESTIMATED_COMPUTATION_COST,
-    MAX_GAS_FOR_TESTING, STORAGE_COST_PER_COUNTER,
+    ESTIMATED_COMPUTATION_COST, ExpectedFailureType, MAX_GAS_FOR_TESTING, STORAGE_COST_PER_COUNTER,
+    Workload, WorkloadBuilder,
 };
-use crate::workloads::GasCoinConfig;
 use crate::workloads::{Gas, WorkloadBuilderInfo, WorkloadParams};
 use crate::{ExecutionEffects, ValidatorProxy};
 use async_trait::async_trait;
 use futures::future::join_all;
-use rand::seq::SliceRandom;
 use rand::Rng;
+use rand::seq::SliceRandom;
 use std::sync::Arc;
 use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::crypto::get_key_pair;
@@ -233,12 +233,8 @@ impl Workload<dyn Payload> for SharedCounterWorkload {
                 .build_and_sign(keypair.as_ref());
             let proxy_ref = proxy.clone();
             futures.push(async move {
-                proxy_ref
-                    .execute_transaction_block(transaction)
-                    .await
-                    .unwrap()
-                    .created()[0]
-                    .0
+                let (_, execution_result) = proxy_ref.execute_transaction_block(transaction).await;
+                execution_result.unwrap().created()[0].0
             });
         }
         self.counters = join_all(futures).await;
@@ -276,5 +272,9 @@ impl Workload<dyn Payload> for SharedCounterWorkload {
             .map(|b| Box::<dyn Payload>::from(b))
             .collect();
         payloads
+    }
+
+    fn name(&self) -> &str {
+        "SharedCounter"
     }
 }

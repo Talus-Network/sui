@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{consumer::ProtobufDecoder, peers::SuiNodeProvider};
 use axum::{
-    async_trait,
     body::Body,
     body::Bytes,
     extract::{Extension, FromRequest},
@@ -15,7 +14,7 @@ use axum_extra::typed_header::TypedHeader;
 use bytes::Buf;
 use hyper::header::CONTENT_ENCODING;
 use once_cell::sync::Lazy;
-use prometheus::{proto::MetricFamily, register_counter_vec, CounterVec};
+use prometheus::{CounterVec, proto::MetricFamily, register_counter_vec};
 use std::sync::Arc;
 use sui_tls::TlsConnectionInfo;
 use tracing::error;
@@ -29,22 +28,12 @@ static MIDDLEWARE_OPS: Lazy<CounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
-static MIDDLEWARE_HEADERS: Lazy<CounterVec> = Lazy::new(|| {
-    register_counter_vec!(
-        "middleware_headers",
-        "Operations counters and status for axum middleware.",
-        &["header", "value"]
-    )
-    .unwrap()
-});
-
 /// we expect sui-node to send us an http header content-length encoding.
 pub async fn expect_content_length(
-    TypedHeader(content_length): TypedHeader<ContentLength>,
+    TypedHeader(_content_length): TypedHeader<ContentLength>,
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, (StatusCode, &'static str)> {
-    MIDDLEWARE_HEADERS.with_label_values(&["content-length", &format!("{}", content_length.0)]);
     Ok(next.run(request).await)
 }
 
@@ -99,7 +88,6 @@ pub async fn expect_valid_public_key(
 #[derive(Debug)]
 pub struct LenDelimProtobuf(pub Vec<MetricFamily>);
 
-#[async_trait]
 impl<S> FromRequest<S> for LenDelimProtobuf
 where
     S: Send + Sync,

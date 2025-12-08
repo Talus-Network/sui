@@ -5,6 +5,7 @@ use p256::pkcs8::DecodePublicKey;
 use passkey_authenticator::{Authenticator, UserCheck, UserValidationMethod};
 use passkey_client::Client;
 use passkey_types::{
+    Bytes, Passkey,
     ctap2::{Aaguid, Ctap2Error},
     rand::random_vec,
     webauthn::{
@@ -13,7 +14,6 @@ use passkey_types::{
         PublicKeyCredentialRequestOptions, PublicKeyCredentialRpEntity, PublicKeyCredentialType,
         PublicKeyCredentialUserEntity, UserVerificationRequirement,
     },
-    Bytes, Passkey,
 };
 use shared_crypto::intent::{Intent, IntentMessage};
 use std::net::SocketAddr;
@@ -22,13 +22,13 @@ use sui_macros::sim_test;
 use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::crypto::Signature;
 use sui_types::error::UserInputError;
-use sui_types::error::{SuiError, SuiResult};
+use sui_types::error::{SuiErrorKind, SuiResult};
 use sui_types::signature::GenericSignature;
 use sui_types::transaction::Transaction;
 use sui_types::{
     base_types::SuiAddress,
     crypto::{PublicKey, SignatureScheme},
-    passkey_authenticator::{to_signing_message, PasskeyAuthenticator},
+    passkey_authenticator::{PasskeyAuthenticator, to_signing_message},
     transaction::TransactionData,
 };
 use test_cluster::TestCluster;
@@ -230,6 +230,9 @@ fn make_good_passkey_tx(response: PasskeyResponse<TransactionData>) -> Transacti
 #[sim_test]
 async fn test_passkey_feature_deny() {
     use sui_protocol_config::ProtocolConfig;
+    if sui_simulator::has_mainnet_protocol_config_override() {
+        return;
+    }
     let _guard = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
         config.set_passkey_auth_for_testing(false);
         config
@@ -239,8 +242,8 @@ async fn test_passkey_feature_deny() {
     let tx = make_good_passkey_tx(response);
     let err = execute_tx(tx, &test_cluster).await.unwrap_err();
     assert!(matches!(
-        err,
-        SuiError::UserInputError {
+        err.as_inner(),
+        SuiErrorKind::UserInputError {
             error: UserInputError::Unsupported(..)
         }
     ));
@@ -248,6 +251,9 @@ async fn test_passkey_feature_deny() {
 
 #[sim_test]
 async fn test_passkey_authenticator_verifies() {
+    if sui_simulator::has_mainnet_protocol_config_override() {
+        return;
+    }
     let test_cluster = TestClusterBuilder::new().build().await;
     let response = create_credential_and_sign_test_tx(&test_cluster, None, false, false).await;
     let tx = make_good_passkey_tx(response);
@@ -257,6 +263,9 @@ async fn test_passkey_authenticator_verifies() {
 
 #[sim_test]
 async fn test_passkey_fails_mismatched_challenge() {
+    if sui_simulator::has_mainnet_protocol_config_override() {
+        return;
+    }
     let test_cluster = TestClusterBuilder::new().build().await;
 
     // Tweak intent in challenge that is sent to passkey.
@@ -274,7 +283,7 @@ async fn test_passkey_fails_mismatched_challenge() {
     let err = res.unwrap_err();
     assert_eq!(
         err,
-        SuiError::InvalidSignature {
+        SuiErrorKind::InvalidSignature {
             error: "Invalid challenge".to_string()
         }
     );
@@ -294,7 +303,7 @@ async fn test_passkey_fails_mismatched_challenge() {
     let err = res.unwrap_err();
     assert_eq!(
         err,
-        SuiError::InvalidSignature {
+        SuiErrorKind::InvalidSignature {
             error: "Invalid challenge".to_string()
         }
     );
@@ -302,6 +311,9 @@ async fn test_passkey_fails_mismatched_challenge() {
 
 #[sim_test]
 async fn test_passkey_fails_to_verify_sig() {
+    if sui_simulator::has_mainnet_protocol_config_override() {
+        return;
+    }
     let test_cluster = TestClusterBuilder::new().build().await;
     let response = create_credential_and_sign_test_tx(&test_cluster, None, false, false).await;
     let mut modified_sig = response.user_sig_bytes.clone();
@@ -312,7 +324,32 @@ async fn test_passkey_fails_to_verify_sig() {
     }
     let sig = GenericSignature::PasskeyAuthenticator(
         PasskeyAuthenticator::new_for_testing(
-            response.authenticator_data,
+            response.authenticator_data.clone(),
+            response.client_data_json.clone(),
+            Signature::from_bytes(&modified_sig).unwrap(),
+        )
+        .unwrap(),
+    );
+    let tx = Transaction::from_generic_sig_data(response.intent_msg.value.clone(), vec![sig]);
+    let res = execute_tx(tx, &test_cluster).await;
+    let err = res.unwrap_err();
+    assert_eq!(
+        err,
+        SuiErrorKind::InvalidSignature {
+            error: "Fails to verify".to_string()
+        }
+    );
+
+    // mangles authenticator data fails to verify
+    let mut mangled_authenticator_data = response.authenticator_data.clone();
+    if mangled_authenticator_data[1] == 0x00 {
+        mangled_authenticator_data[1] = 0x01;
+    } else {
+        mangled_authenticator_data[1] = 0x00;
+    }
+    let sig = GenericSignature::PasskeyAuthenticator(
+        PasskeyAuthenticator::new_for_testing(
+            mangled_authenticator_data,
             response.client_data_json,
             Signature::from_bytes(&modified_sig).unwrap(),
         )
@@ -323,7 +360,7 @@ async fn test_passkey_fails_to_verify_sig() {
     let err = res.unwrap_err();
     assert_eq!(
         err,
-        SuiError::InvalidSignature {
+        SuiErrorKind::InvalidSignature {
             error: "Fails to verify".to_string()
         }
     );
@@ -331,6 +368,9 @@ async fn test_passkey_fails_to_verify_sig() {
 
 #[sim_test]
 async fn test_passkey_fails_wrong_author() {
+    if sui_simulator::has_mainnet_protocol_config_override() {
+        return;
+    }
     let test_cluster = TestClusterBuilder::new().build().await;
     // Modify sender that receives gas and construct test txn.
     let response =
@@ -347,5 +387,8 @@ async fn test_passkey_fails_wrong_author() {
     let tx = Transaction::from_generic_sig_data(response.intent_msg.value, vec![sig]);
     let res = execute_tx(tx, &test_cluster).await;
     let err = res.unwrap_err();
-    assert!(matches!(err, SuiError::SignerSignatureAbsent { .. }));
+    assert!(matches!(
+        err.as_inner(),
+        SuiErrorKind::SignerSignatureAbsent { .. }
+    ));
 }

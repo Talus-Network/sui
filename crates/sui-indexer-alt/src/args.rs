@@ -3,11 +3,11 @@
 
 use std::path::PathBuf;
 
+use crate::IndexerArgs;
 #[cfg(feature = "benchmark")]
 use crate::benchmark::BenchmarkArgs;
-use crate::IndexerArgs;
 use clap::Subcommand;
-use sui_indexer_alt_framework::{db::DbArgs, ingestion::ClientArgs};
+use sui_indexer_alt_framework::{ingestion::ClientArgs, postgres::DbArgs};
 use sui_indexer_alt_metrics::MetricsArgs;
 use url::Url;
 

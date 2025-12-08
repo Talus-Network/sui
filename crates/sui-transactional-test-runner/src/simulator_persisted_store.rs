@@ -9,15 +9,15 @@ use move_core_types::{language_storage::ModuleId, resolver::ModuleResolver};
 use simulacrum::Simulacrum;
 use std::num::NonZeroUsize;
 use sui_config::genesis;
-use sui_protocol_config::ProtocolVersion;
+use sui_protocol_config::{ProtocolConfig, ProtocolVersion};
 use sui_swarm_config::genesis_config::AccountConfig;
-use sui_swarm_config::network_config_builder::ConfigBuilder;
+use sui_swarm_config::network_config_builder::{ConfigBuilder, KeyPairWrapper};
+use sui_types::error::SuiErrorKind;
 use sui_types::storage::{ReadStore, RpcStateReader};
 use sui_types::{
     base_types::{ObjectID, SequenceNumber, SuiAddress, VersionNumber},
     committee::{Committee, EpochId},
-    crypto::AccountKeyPair,
-    digests::{ObjectDigest, TransactionDigest, TransactionEventsDigest},
+    digests::{ObjectDigest, TransactionDigest},
     effects::{TransactionEffects, TransactionEffectsAPI, TransactionEvents},
     error::{SuiError, UserInputError},
     messages_checkpoint::{
@@ -26,14 +26,12 @@ use sui_types::{
     },
     object::{Object, Owner},
     storage::{
-        load_package_object_from_object_store, BackingPackageStore, ChildObjectResolver,
-        ObjectStore, PackageObject, ParentSync,
+        BackingPackageStore, ChildObjectResolver, ObjectStore, PackageObject, ParentSync,
+        load_package_object_from_object_store,
     },
     transaction::VerifiedTransaction,
 };
 use tempfile::tempdir;
-use typed_store::traits::TableSummary;
-use typed_store::traits::TypedStoreDebug;
 use typed_store::DBMapUtils;
 use typed_store::Map;
 use typed_store::{
@@ -63,8 +61,7 @@ pub struct PersistedStoreInner {
     // Transaction data
     transactions: DBMap<TransactionDigest, sui_types::transaction::TrustedTransaction>,
     effects: DBMap<TransactionDigest, TransactionEffects>,
-    events: DBMap<TransactionEventsDigest, TransactionEvents>,
-    events_tx_digest_index: DBMap<TransactionDigest, TransactionEventsDigest>,
+    events: DBMap<TransactionDigest, TransactionEvents>,
 
     // Committee data
     epoch_to_committee: DBMap<(), Vec<Committee>>,
@@ -108,14 +105,16 @@ impl PersistedStore {
         chain_start_timestamp_ms: u64,
         protocol_version: ProtocolVersion,
         account_configs: Vec<AccountConfig>,
-        validator_keys: Option<Vec<AccountKeyPair>>,
+        key_pair_wrappers: Vec<KeyPairWrapper>,
         reference_gas_price: Option<u64>,
         path: Option<PathBuf>,
+        enable_accumulators: bool,
+        enable_authenticated_event_streams: bool,
     ) -> (Simulacrum<R, Self>, PersistedStoreInnerReadOnlyWrapper)
     where
         R: rand::RngCore + rand::CryptoRng,
     {
-        let path: PathBuf = path.unwrap_or(tempdir().unwrap().into_path());
+        let path: PathBuf = path.unwrap_or(tempdir().unwrap().keep());
 
         let mut builder = ConfigBuilder::new_with_temp_dir()
             .rng(&mut rng)
@@ -124,11 +123,28 @@ impl PersistedStore {
             .with_protocol_version(protocol_version)
             .with_accounts(account_configs);
 
-        if let Some(validator_keys) = validator_keys {
-            builder = builder.deterministic_committee_validators(validator_keys)
+        if !key_pair_wrappers.is_empty() {
+            builder = builder.deterministic_committee_validators(key_pair_wrappers)
         };
         if let Some(reference_gas_price) = reference_gas_price {
             builder = builder.with_reference_gas_price(reference_gas_price)
+        };
+
+        let _override_guard = if enable_accumulators || enable_authenticated_event_streams {
+            Some(ProtocolConfig::apply_overrides_for_testing(
+                move |_, cfg| {
+                    let mut c = cfg;
+                    if enable_accumulators {
+                        c.enable_accumulators_for_testing();
+                    }
+                    if enable_authenticated_event_streams {
+                        c.enable_authenticated_event_streams_for_testing();
+                    }
+                    c
+                },
+            ))
+        } else {
+            None
         };
 
         let config = builder.build();
@@ -149,6 +165,8 @@ impl PersistedStore {
         protocol_version: ProtocolVersion,
         account_configs: Vec<AccountConfig>,
         path: Option<PathBuf>,
+        enable_accumulators: bool,
+        enable_authenticated_event_streams: bool,
     ) -> Simulacrum<R, Self>
     where
         R: rand::RngCore + rand::CryptoRng,
@@ -158,9 +176,11 @@ impl PersistedStore {
             chain_start_timestamp_ms,
             protocol_version,
             account_configs,
-            None,
+            vec![],
             None,
             path,
+            enable_accumulators,
+            enable_authenticated_event_streams,
         )
         .0
     }
@@ -230,30 +250,11 @@ impl SimulatorStore for PersistedStore {
             .expect("Fatal: DB read failed")
     }
 
-    fn get_transaction_events(
-        &self,
-        digest: &TransactionEventsDigest,
-    ) -> Option<TransactionEvents> {
+    fn get_transaction_events(&self, digest: &TransactionDigest) -> Option<TransactionEvents> {
         self.read_write
             .events
             .get(digest)
             .expect("Fatal: DB read failed")
-    }
-
-    fn get_transaction_events_by_tx_digest(
-        &self,
-        tx_digest: &TransactionDigest,
-    ) -> Option<TransactionEvents> {
-        self.read_write
-            .events_tx_digest_index
-            .get(tx_digest)
-            .expect("Fatal: DB read failed")
-            .and_then(|x| {
-                self.read_write
-                    .events
-                    .get(&x)
-                    .expect("Fatal: DB read failed")
-            })
     }
 
     fn get_object(&self, id: &ObjectID) -> Option<Object> {
@@ -368,12 +369,8 @@ impl SimulatorStore for PersistedStore {
 
     fn insert_events(&mut self, tx_digest: &TransactionDigest, events: TransactionEvents) {
         self.read_write
-            .events_tx_digest_index
-            .insert(tx_digest, &events.digest())
-            .expect("Fatal: DB write failed");
-        self.read_write
             .events
-            .insert(&events.digest(), &events)
+            .insert(tx_digest, &events)
             .expect("Fatal: DB write failed");
     }
 
@@ -437,18 +434,20 @@ impl ChildObjectResolver for PersistedStore {
 
         let parent = *parent;
         if child_object.owner != Owner::ObjectOwner(parent.into()) {
-            return Err(SuiError::InvalidChildObjectAccess {
+            return Err(SuiErrorKind::InvalidChildObjectAccess {
                 object: *child,
                 given_parent: parent,
                 actual_owner: child_object.owner.clone(),
-            });
+            }
+            .into());
         }
 
         if child_object.version() > child_version_upper_bound {
-            return Err(SuiError::UnsupportedFeatureError {
+            return Err(SuiErrorKind::UnsupportedFeatureError {
                 error: "TODO InMemoryStorage::read_child_object does not yet support bounded reads"
                     .to_owned(),
-            });
+            }
+            .into());
         }
 
         Ok(Some(child_object))
@@ -460,8 +459,6 @@ impl ChildObjectResolver for PersistedStore {
         receiving_object_id: &ObjectID,
         receive_object_at_version: SequenceNumber,
         _epoch_id: EpochId,
-        // TODO: Delete this parameter once table migration is complete.
-        _use_object_per_epoch_marker_table_v2: bool,
     ) -> sui_types::error::SuiResult<Option<Object>> {
         let recv_object = match SimulatorStore::get_object(self, receiving_object_id) {
             None => return Ok(None),
@@ -563,7 +560,7 @@ impl ReadStore for PersistedStoreInnerReadOnlyWrapper {
             .next()
             .transpose()?
             .map(|(_, checkpoint)| checkpoint.into())
-            .ok_or(SuiError::UserInputError {
+            .ok_or(SuiErrorKind::UserInputError {
                 error: UserInputError::LatestCheckpointSequenceNumberNotFound,
             })
             .map_err(sui_types::storage::error::Error::custom)
@@ -638,7 +635,7 @@ impl ReadStore for PersistedStoreInnerReadOnlyWrapper {
             .expect("Fatal: DB read failed")
     }
 
-    fn get_events(&self, event_digest: &TransactionEventsDigest) -> Option<TransactionEvents> {
+    fn get_events(&self, event_digest: &TransactionDigest) -> Option<TransactionEvents> {
         self.sync();
         self.inner
             .events
@@ -646,18 +643,19 @@ impl ReadStore for PersistedStoreInnerReadOnlyWrapper {
             .expect("Fatal: DB read failed")
     }
 
-    fn get_full_checkpoint_contents_by_sequence_number(
+    fn get_full_checkpoint_contents(
         &self,
-        _sequence_number: CheckpointSequenceNumber,
+        _sequence_number: Option<CheckpointSequenceNumber>,
+        _digest: &CheckpointContentsDigest,
     ) -> Option<sui_types::messages_checkpoint::FullCheckpointContents> {
         todo!()
     }
 
-    fn get_full_checkpoint_contents(
+    fn get_unchanged_loaded_runtime_objects(
         &self,
-        _digest: &CheckpointContentsDigest,
-    ) -> Option<sui_types::messages_checkpoint::FullCheckpointContents> {
-        todo!()
+        _digest: &TransactionDigest,
+    ) -> Option<Vec<sui_types::storage::ObjectKey>> {
+        None
     }
 }
 
@@ -676,6 +674,14 @@ impl RpcStateReader for PersistedStoreInnerReadOnlyWrapper {
 
     fn indexes(&self) -> Option<&dyn sui_types::storage::RpcIndexes> {
         None
+    }
+
+    fn get_struct_layout(
+        &self,
+        _: &move_core_types::language_storage::StructTag,
+    ) -> sui_types::storage::error::Result<Option<move_core_types::annotated_value::MoveTypeLayout>>
+    {
+        Ok(None)
     }
 }
 
@@ -705,7 +711,7 @@ impl Clone for PersistedStoreInnerReadOnlyWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{SeedableRng, rngs::StdRng};
 
     #[tokio::test]
     async fn deterministic_genesis() {
@@ -716,6 +722,8 @@ mod tests {
             ProtocolVersion::MAX,
             vec![],
             None,
+            false,
+            false,
         );
         let genesis_checkpoint_digest1 = *chain1
             .store()
@@ -730,6 +738,8 @@ mod tests {
             ProtocolVersion::MAX,
             vec![],
             None,
+            false,
+            false,
         );
         let genesis_checkpoint_digest2 = *chain2
             .store()
@@ -747,6 +757,8 @@ mod tests {
             ProtocolVersion::MAX,
             vec![],
             None,
+            false,
+            false,
         );
 
         assert_ne!(

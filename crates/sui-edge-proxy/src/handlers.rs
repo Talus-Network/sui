@@ -6,8 +6,8 @@ use crate::metrics::AppMetrics;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::request::Parts,
     http::StatusCode,
+    http::request::Parts,
     response::Response,
 };
 use bytes::Bytes;
@@ -66,6 +66,11 @@ pub async fn proxy_handler(
         Ok(bytes) => bytes,
         Err(e) => {
             warn!("Failed to read request body: {}", e);
+            state
+                .metrics
+                .request_body_read_failures
+                .with_label_values(&[])
+                .inc();
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from("Failed to read request body"))
@@ -131,7 +136,7 @@ async fn proxy_request(
 
         let should_sample = !is_health_check && !is_grafana_agent && !is_grpc;
         let rate = state.logging_config.read_request_sample_rate;
-        if should_sample && rand::thread_rng().gen::<f64>() < rate {
+        if should_sample && rand::thread_rng().r#gen::<f64>() < rate {
             tracing::info!(
                 headers = ?parts.headers,
                 body = ?body_bytes,
@@ -190,20 +195,19 @@ async fn proxy_request(
         }
         Err(e) => {
             warn!("Failed to send request: {}", e);
-            metrics
-                .upstream_response_latency
-                .with_label_values(&[peer_type_str, "error"])
-                .observe(upstream_start.elapsed().as_secs_f64());
-            metrics
-                .requests_total
-                .with_label_values(&[peer_type_str, "error"])
-                .inc();
-            if e.is_timeout() {
+            let error_type = if e.is_timeout() {
                 metrics
                     .timeouts_total
                     .with_label_values(&[peer_type_str])
                     .inc();
-            }
+                "timeout"
+            } else {
+                "send_failure"
+            };
+            metrics
+                .upstream_request_failures
+                .with_label_values(&[peer_type_str, error_type])
+                .inc();
             return Err((StatusCode::BAD_GATEWAY, format!("Request failed: {}", e)));
         }
     };

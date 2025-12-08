@@ -1,8 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use move_binary_format::normalized;
 use move_binary_format::{
-    binary_config::BinaryConfig, compatibility::Compatibility, CompiledModule,
+    CompiledModule, binary_config::BinaryConfig, compatibility::Compatibility,
 };
 use move_core_types::gas_algebra::InternalGas;
 use serde::{Deserialize, Serialize};
@@ -10,14 +11,14 @@ use std::fmt::Formatter;
 use std::sync::LazyLock;
 use sui_types::base_types::ObjectRef;
 use sui_types::storage::ObjectStore;
+use sui_types::{BRIDGE_PACKAGE_ID, DEEPBOOK_PACKAGE_ID};
 use sui_types::{
+    MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID, SUI_SYSTEM_PACKAGE_ID,
     base_types::ObjectID,
     digests::TransactionDigest,
     move_package::MovePackage,
-    object::{Object, OBJECT_START_VERSION},
-    MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID, SUI_SYSTEM_PACKAGE_ID,
+    object::{OBJECT_START_VERSION, Object},
 };
-use sui_types::{BRIDGE_PACKAGE_ID, DEEPBOOK_PACKAGE_ID};
 use tracing::error;
 
 /// Encapsulates a system package in the framework
@@ -248,14 +249,17 @@ pub async fn compare_system_package<S: ObjectStore>(
         .try_as_package_mut()
         .expect("Created as package");
 
-    let cur_normalized = match cur_pkg.normalize(binary_config) {
+    let pool = &mut normalized::RcPool::new();
+    let cur_normalized = match cur_pkg.normalize(pool, binary_config, /* include code */ false) {
         Ok(v) => v,
         Err(e) => {
             error!("Could not normalize existing package: {e:?}");
             return None;
         }
     };
-    let mut new_normalized = new_pkg.normalize(binary_config).ok()?;
+    let mut new_normalized = new_pkg
+        .normalize(pool, binary_config, /* include code */ false)
+        .ok()?;
 
     for (name, cur_module) in cur_normalized {
         let new_module = new_normalized.remove(&name)?;

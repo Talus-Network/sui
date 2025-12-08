@@ -9,8 +9,8 @@ use futures::StreamExt;
 use mysten_metrics::spawn_monitored_task;
 #[cfg(not(target_os = "macos"))]
 use notify::{RecommendedWatcher, RecursiveMode};
-use object_store::path::Path;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
@@ -80,7 +80,7 @@ impl CheckpointReader {
     /// Reads files in a local directory, validates them, and forwards `CheckpointData` to the executor.
     async fn read_local_files(&self) -> Result<Vec<Arc<CheckpointData>>> {
         let mut checkpoints = vec![];
-        for offset in 0..MAX_CHECKPOINTS_IN_PROGRESS {
+        for offset in 0..*MAX_CHECKPOINTS_IN_PROGRESS {
             let sequence_number = self.current_checkpoint_number + offset as u64;
             if self.exceeds_capacity(sequence_number) {
                 break;
@@ -97,11 +97,11 @@ impl CheckpointReader {
     }
 
     fn exceeds_capacity(&self, checkpoint_number: CheckpointSequenceNumber) -> bool {
-        ((MAX_CHECKPOINTS_IN_PROGRESS as u64 + self.last_pruned_watermark) <= checkpoint_number)
+        ((*MAX_CHECKPOINTS_IN_PROGRESS as u64 + self.last_pruned_watermark) <= checkpoint_number)
             || self.data_limiter.exceeds()
     }
 
-    async fn fetch_from_object_store(
+    pub async fn fetch_from_object_store(
         store: &dyn ObjectStore,
         checkpoint_number: CheckpointSequenceNumber,
     ) -> Result<(Arc<CheckpointData>, usize)> {
@@ -118,7 +118,10 @@ impl CheckpointReader {
         client: &Client,
         checkpoint_number: CheckpointSequenceNumber,
     ) -> Result<(Arc<CheckpointData>, usize)> {
-        let checkpoint = client.get_full_checkpoint(checkpoint_number).await?;
+        let checkpoint = client
+            .clone()
+            .get_full_checkpoint(checkpoint_number)
+            .await?;
         let size = bcs::serialized_size(&checkpoint)?;
         Ok((Arc::new(checkpoint), size))
     }
@@ -148,14 +151,20 @@ impl CheckpointReader {
         checkpoint_number: CheckpointSequenceNumber,
     ) -> Result<(Arc<CheckpointData>, usize)> {
         let mut backoff = backoff::ExponentialBackoff::default();
-        backoff.max_elapsed_time = Some(Duration::from_secs(60));
+        let max_elapsed_time = Duration::from_secs(60);
+        backoff.max_elapsed_time = Some(max_elapsed_time);
         backoff.initial_interval = Duration::from_millis(100);
         backoff.current_interval = backoff.initial_interval;
         backoff.multiplier = 1.0;
         loop {
-            match Self::remote_fetch_checkpoint_internal(store, checkpoint_number).await {
-                Ok(data) => return Ok(data),
-                Err(err) => match backoff.next_backoff() {
+            match tokio::time::timeout(
+                max_elapsed_time,
+                Self::remote_fetch_checkpoint_internal(store, checkpoint_number),
+            )
+            .await
+            {
+                Ok(Ok(data)) => return Ok(data),
+                Ok(Err(err)) => match backoff.next_backoff() {
                     Some(duration) => {
                         if !err.to_string().contains("404") {
                             debug!(
@@ -167,6 +176,10 @@ impl CheckpointReader {
                         tokio::time::sleep(duration).await
                     }
                     None => return Err(err),
+                },
+                Err(err) => match backoff.next_backoff() {
+                    Some(duration) => tokio::time::sleep(duration).await,
+                    None => return Err(err.into()),
                 },
             }
         }
@@ -300,10 +313,10 @@ impl CheckpointReader {
         for entry in fs::read_dir(self.path.clone())? {
             let entry = entry?;
             let filename = entry.file_name();
-            if let Some(sequence_number) = Self::checkpoint_number_from_file_path(&filename) {
-                if sequence_number < watermark {
-                    fs::remove_file(entry.path())?;
-                }
+            if let Some(sequence_number) = Self::checkpoint_number_from_file_path(&filename)
+                && sequence_number < watermark
+            {
+                fs::remove_file(entry.path())?;
             }
         }
         Ok(())
@@ -328,8 +341,8 @@ impl CheckpointReader {
         mpsc::Sender<CheckpointSequenceNumber>,
         oneshot::Sender<()>,
     ) {
-        let (checkpoint_sender, checkpoint_recv) = mpsc::channel(MAX_CHECKPOINTS_IN_PROGRESS);
-        let (processed_sender, processed_receiver) = mpsc::channel(MAX_CHECKPOINTS_IN_PROGRESS);
+        let (checkpoint_sender, checkpoint_recv) = mpsc::channel(*MAX_CHECKPOINTS_IN_PROGRESS);
+        let (processed_sender, processed_receiver) = mpsc::channel(*MAX_CHECKPOINTS_IN_PROGRESS);
         let (exit_sender, exit_receiver) = oneshot::channel();
         let reader = Self {
             path,

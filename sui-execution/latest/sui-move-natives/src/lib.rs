@@ -34,46 +34,52 @@ use self::{
     tx_context::{
         TxContextDeriveIdCostParams, TxContextEpochCostParams, TxContextEpochTimestampMsCostParams,
         TxContextFreshIdCostParams, TxContextGasBudgetCostParams, TxContextGasPriceCostParams,
-        TxContextIdsCreatedCostParams, TxContextReplaceCostParams, TxContextSenderCostParams,
-        TxContextSponsorCostParams,
+        TxContextIdsCreatedCostParams, TxContextRGPCostParams, TxContextReplaceCostParams,
+        TxContextSenderCostParams, TxContextSponsorCostParams,
     },
     types::TypesIsOneTimeWitnessCostParams,
     validator::ValidatorValidateMetadataBcsCostParams,
 };
-use crate::crypto::group_ops;
 use crate::crypto::group_ops::GroupOpsCostParams;
 use crate::crypto::poseidon::PoseidonBN254CostParams;
 use crate::crypto::zklogin;
 use crate::crypto::zklogin::{CheckZkloginIdCostParams, CheckZkloginIssuerCostParams};
+use crate::{crypto::group_ops, transfer::PartyTransferInternalCostParams};
 use better_any::{Tid, TidAble};
 use crypto::nitro_attestation::{self, NitroAttestationCostParams};
 use crypto::vdf::{self, VDFCostParams};
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_core_types::{
     annotated_value as A,
-    gas_algebra::InternalGas,
+    gas_algebra::{AbstractMemorySize, InternalGas},
     identifier::Identifier,
     language_storage::{StructTag, TypeTag},
     runtime_value as R,
     vm_status::StatusCode,
 };
 use move_stdlib_natives::{self as MSN, GasParameters};
-use move_vm_runtime::native_functions::{NativeContext, NativeFunction, NativeFunctionTable};
+use move_vm_runtime::{
+    native_extensions::NativeExtensionMarker,
+    native_functions::{NativeContext, NativeFunction, NativeFunctionTable},
+};
 use move_vm_types::{
     loaded_data::runtime_types::Type,
     natives::function::NativeResult,
     values::{Struct, Value},
+    views::{SizeConfig, ValueView},
 };
 use std::sync::Arc;
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{MOVE_STDLIB_ADDRESS, SUI_FRAMEWORK_ADDRESS, SUI_SYSTEM_ADDRESS};
 use transfer::TransferReceiveObjectInternalCostParams;
 
+mod accumulator;
 mod address;
 mod config;
 mod crypto;
 mod dynamic_field;
-mod event;
+pub mod event;
+mod funds_accumulator;
 mod object;
 pub mod object_runtime;
 mod random;
@@ -116,6 +122,7 @@ pub struct NativesCostTable {
 
     // Transfer
     pub transfer_transfer_internal_cost_params: TransferInternalCostParams,
+    pub transfer_party_transfer_internal_cost_params: PartyTransferInternalCostParams,
     pub transfer_freeze_object_cost_params: TransferFreezeObjectCostParams,
     pub transfer_share_object_cost_params: TransferShareObjectCostParams,
 
@@ -126,6 +133,7 @@ pub struct NativesCostTable {
     pub tx_context_epoch_cost_params: TxContextEpochCostParams,
     pub tx_context_epoch_timestamp_ms_cost_params: TxContextEpochTimestampMsCostParams,
     pub tx_context_sponsor_cost_params: TxContextSponsorCostParams,
+    pub tx_context_rgp_cost_params: TxContextRGPCostParams,
     pub tx_context_gas_price_cost_params: TxContextGasPriceCostParams,
     pub tx_context_gas_budget_cost_params: TxContextGasBudgetCostParams,
     pub tx_context_ids_created_cost_params: TxContextIdsCreatedCostParams,
@@ -189,6 +197,8 @@ pub struct NativesCostTable {
     // nitro attestation
     pub nitro_attestation_cost_params: NitroAttestationCostParams,
 }
+
+impl NativeExtensionMarker<'_> for NativesCostTable {}
 
 impl NativesCostTable {
     pub fn from_protocol_config(protocol_config: &ProtocolConfig) -> NativesCostTable {
@@ -293,6 +303,9 @@ impl NativesCostTable {
                     .event_emit_output_cost_per_byte()
                     .into(),
                 event_emit_cost_base: protocol_config.event_emit_cost_base().into(),
+                event_emit_auth_stream_cost: protocol_config
+                    .event_emit_auth_stream_cost_as_option()
+                    .map(Into::into),
             },
 
             borrow_uid_cost_params: BorrowUidCostParams {
@@ -344,6 +357,11 @@ impl NativesCostTable {
                 transfer_transfer_internal_cost_base: protocol_config
                     .transfer_transfer_internal_cost_base()
                     .into(),
+            },
+            transfer_party_transfer_internal_cost_params: PartyTransferInternalCostParams {
+                transfer_party_transfer_internal_cost_base: protocol_config
+                    .transfer_party_transfer_internal_cost_base_as_option()
+                    .map(Into::into),
             },
             transfer_freeze_object_cost_params: TransferFreezeObjectCostParams {
                 transfer_freeze_object_cost_base: protocol_config
@@ -397,6 +415,12 @@ impl NativesCostTable {
                 } else {
                     DEFAULT_UNUSED_TX_CONTEXT_ENTRY_COST.into()
                 },
+            },
+            tx_context_rgp_cost_params: TxContextRGPCostParams {
+                tx_context_rgp_cost_base: protocol_config
+                    .tx_context_rgp_cost_base_as_option()
+                    .unwrap_or(DEFAULT_UNUSED_TX_CONTEXT_ENTRY_COST)
+                    .into(),
             },
             tx_context_gas_price_cost_params: TxContextGasPriceCostParams {
                 tx_context_gas_price_cost_base: if protocol_config.move_native_context() {
@@ -827,6 +851,9 @@ pub fn make_stdlib_gas_params_for_protocol_config(
                 base: get_gas_cost_or_default!(type_name_get_base_cost_as_option),
                 per_byte: get_gas_cost_or_default!(type_name_get_per_byte_cost_as_option),
             },
+            id: MSN::type_name::IdGasParameters::new(
+                protocol_config.type_name_id_base_cost_as_option(),
+            ),
         },
         MSN::vector::GasParameters {
             empty: MSN::vector::EmptyGasParameters {
@@ -859,6 +886,21 @@ pub fn make_stdlib_gas_params_for_protocol_config(
 
 pub fn all_natives(silent: bool, protocol_config: &ProtocolConfig) -> NativeFunctionTable {
     let sui_framework_natives: &[(&str, &str, NativeFunction)] = &[
+        (
+            "accumulator",
+            "emit_deposit_event",
+            make_native!(accumulator::emit_deposit_event),
+        ),
+        (
+            "accumulator",
+            "emit_withdraw_event",
+            make_native!(accumulator::emit_withdraw_event),
+        ),
+        (
+            "accumulator_settlement",
+            "record_settlement_sui_conservation",
+            make_native!(accumulator::record_settlement_sui_conservation),
+        ),
         ("address", "from_bytes", make_native!(address::from_bytes)),
         ("address", "to_u256", make_native!(address::to_u256)),
         ("address", "from_u256", make_native!(address::from_u256)),
@@ -947,10 +989,25 @@ pub fn all_natives(silent: bool, protocol_config: &ProtocolConfig) -> NativeFunc
         ("event", "emit", make_native!(event::emit)),
         (
             "event",
+            "emit_authenticated_impl",
+            make_native!(event::emit_authenticated_impl),
+        ),
+        (
+            "event",
             "events_by_type",
             make_native!(event::get_events_by_type),
         ),
         ("event", "num_events", make_native!(event::num_events)),
+        (
+            "funds_accumulator",
+            "add_to_accumulator_address",
+            make_native!(funds_accumulator::add_to_accumulator_address),
+        ),
+        (
+            "funds_accumulator",
+            "withdraw_from_accumulator_address",
+            make_native!(funds_accumulator::withdraw_from_accumulator_address),
+        ),
         (
             "groth16",
             "verify_groth16_proof_internal",
@@ -1092,6 +1149,11 @@ pub fn all_natives(silent: bool, protocol_config: &ProtocolConfig) -> NativeFunc
         ),
         (
             "transfer",
+            "party_transfer_impl",
+            make_native!(transfer::party_transfer_internal),
+        ),
+        (
+            "transfer",
             "freeze_object_impl",
             make_native!(transfer::freeze_object),
         ),
@@ -1136,6 +1198,7 @@ pub fn all_natives(silent: bool, protocol_config: &ProtocolConfig) -> NativeFunc
             "native_sponsor",
             make_native!(tx_context::sponsor),
         ),
+        ("tx_context", "native_rgp", make_native!(tx_context::rgp)),
         (
             "tx_context",
             "native_gas_price",
@@ -1283,7 +1346,7 @@ pub(crate) fn get_tag_and_layouts(
             return Err(
                 PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                     .with_message("Sui verifier guarantees this is a struct".to_string()),
-            )
+            );
         }
     };
     let Some(layout) = context.type_to_type_layout(ty)? else {
@@ -1306,6 +1369,57 @@ macro_rules! make_native {
     };
 }
 
+#[macro_export]
+macro_rules! get_extension {
+    ($context: expr, $ext: ty) => {
+        $context.extensions().get::<$ext>()
+    };
+    ($context: expr) => {
+        $context.extensions().get()
+    };
+}
+
+#[macro_export]
+macro_rules! get_extension_mut {
+    ($context: expr, $ext: ty) => {
+        $context.extensions_mut().get_mut::<$ext>()
+    };
+    ($context: expr) => {
+        $context.extensions_mut().get_mut()
+    };
+}
+
+#[macro_export]
+macro_rules! charge_cache_or_load_gas {
+    ($context:ident, $cache_info:expr) => {{
+        use sui_types::base_types::SUI_ADDRESS_LENGTH;
+        use $crate::object_runtime::object_store::CacheInfo;
+        match $cache_info {
+            CacheInfo::CachedObject | CacheInfo::CachedValue => (),
+            CacheInfo::Loaded(bytes_opt) => {
+                let config = get_extension!($context, ObjectRuntime)?.protocol_config;
+                if config.object_runtime_charge_cache_load_gas() {
+                    let bytes = bytes_opt.unwrap_or(SUI_ADDRESS_LENGTH as usize);
+                    let cost = bytes * config.obj_access_cost_read_per_byte() as usize;
+                    native_charge_gas_early_exit!($context, InternalGas::new(cost as u64));
+                }
+            }
+        }
+    }};
+}
+
 pub(crate) fn legacy_test_cost() -> InternalGas {
     InternalGas::new(0)
+}
+
+pub(crate) fn abstract_size(protocol_config: &ProtocolConfig, v: &Value) -> AbstractMemorySize {
+    if protocol_config.abstract_size_in_object_runtime() {
+        v.abstract_memory_size(&SizeConfig {
+            include_vector_size: true,
+            traverse_references: false,
+        })
+    } else {
+        // TODO: Remove this (with glee!) in the next execution version cut.
+        v.legacy_size()
+    }
 }

@@ -5,16 +5,16 @@ use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Result;
 use fastcrypto::traits::KeyPair;
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use sui_config::genesis::{GenesisCeremonyParameters, TokenAllocation};
 use sui_config::node::{DEFAULT_COMMISSION_RATE, DEFAULT_VALIDATOR_GAS_PRICE};
-use sui_config::{local_ip_utils, Config};
+use sui_config::{Config, local_ip_utils};
 use sui_genesis_builder::validator_info::{GenesisValidatorInfo, ValidatorInfo};
 use sui_types::base_types::SuiAddress;
 use sui_types::crypto::{
-    generate_proof_of_possession, get_key_pair_from_rng, AccountKeyPair, AuthorityKeyPair,
-    AuthorityPublicKeyBytes, NetworkKeyPair, NetworkPublicKey, PublicKey, SuiKeyPair,
+    AccountKeyPair, AuthorityKeyPair, AuthorityPublicKeyBytes, NetworkKeyPair, NetworkPublicKey,
+    PublicKey, SuiKeyPair, generate_proof_of_possession, get_key_pair_from_rng,
 };
 use sui_types::multiaddr::Multiaddr;
 use tracing::info;
@@ -97,6 +97,7 @@ pub struct ValidatorGenesisConfigBuilder {
     protocol_key_pair: Option<AuthorityKeyPair>,
     account_key_pair: Option<AccountKeyPair>,
     ip: Option<String>,
+    stake: Option<u64>,
     gas_price: Option<u64>,
     /// If set, the validator will use deterministic addresses based on the port offset.
     /// This is useful for benchmarking.
@@ -125,6 +126,11 @@ impl ValidatorGenesisConfigBuilder {
         self
     }
 
+    pub fn with_stake(mut self, stake: u64) -> Self {
+        self.stake = Some(stake);
+        self
+    }
+
     pub fn with_gas_price(mut self, gas_price: u64) -> Self {
         self.gas_price = Some(gas_price);
         self
@@ -142,6 +148,7 @@ impl ValidatorGenesisConfigBuilder {
 
     pub fn build<R: rand::RngCore + rand::CryptoRng>(self, rng: &mut R) -> ValidatorGenesisConfig {
         let ip = self.ip.unwrap_or_else(local_ip_utils::get_new_ip);
+        let stake = self.stake.unwrap_or(default_stake());
         let localhost = local_ip_utils::localhost_for_testing();
 
         let protocol_key_pair = self
@@ -206,7 +213,7 @@ impl ValidatorGenesisConfigBuilder {
             narwhal_primary_address,
             narwhal_worker_address,
             consensus_address,
-            stake: sui_types::governance::VALIDATOR_LOW_STAKE_THRESHOLD_MIST,
+            stake,
             name: None,
         }
     }
@@ -267,7 +274,7 @@ fn default_multiaddr_address() -> Multiaddr {
 }
 
 fn default_stake() -> u64 {
-    sui_types::governance::VALIDATOR_LOW_STAKE_THRESHOLD_MIST
+    20_000_000_000_000_000
 }
 
 fn default_bls12381_key_pair() -> AuthorityKeyPair {

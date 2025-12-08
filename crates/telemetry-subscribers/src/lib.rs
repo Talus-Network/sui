@@ -5,29 +5,28 @@ use atomic_float::AtomicF64;
 use crossterm::tty::IsTty;
 use once_cell::sync::Lazy;
 use opentelemetry::{
-    trace::{Link, SamplingResult, SpanKind, TraceId, TracerProvider as _},
     Context, KeyValue,
+    trace::{Link, SamplingResult, SpanKind, TraceId, TracerProvider as _},
 };
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_sdk::{
-    self, runtime,
+    self, Resource, runtime,
     trace::{BatchSpanProcessor, ShouldSample, TracerProvider},
-    Resource,
 };
 use span_latency_prom::PrometheusSpanLatencyLayer;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{
     env,
-    io::{stderr, Write},
+    io::{Write, stderr},
     str::FromStr,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
 };
 use tracing::metadata::LevelFilter;
-use tracing::{error, info, Level};
+use tracing::{Level, error, info};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
-use tracing_subscriber::{filter, fmt, layer::SubscriberExt, reload, EnvFilter, Layer, Registry};
+use tracing_subscriber::{EnvFilter, Layer, Registry, filter, fmt, layer::SubscriberExt, reload};
 
 use crate::file_exporter::{CachedOpenFile, FileExporter};
 
@@ -381,10 +380,21 @@ impl TelemetryConfig {
 
         if config.enable_otlp_tracing {
             let trace_file = env::var("TRACE_FILE").ok();
-            let resource = Resource::new(vec![opentelemetry::KeyValue::new(
+            let mut otel_kv_vec = vec![opentelemetry::KeyValue::new(
                 "service.name",
                 service_name.clone(),
-            )]);
+            )];
+            if let Ok(namespace) = env::var("NAMESPACE") {
+                otel_kv_vec.push(opentelemetry::KeyValue::new("service.namespace", namespace));
+            }
+            if let Ok(hostname) = env::var("HOSTNAME") {
+                otel_kv_vec.push(opentelemetry::KeyValue::new("host", hostname));
+            }
+            if let Ok(network) = env::var("NETWORK") {
+                otel_kv_vec.push(opentelemetry::KeyValue::new("network", network));
+            }
+
+            let resource = Resource::new(otel_kv_vec);
             let sampler = Sampler::ParentBased(Box::new(sampler.clone()));
 
             // We can either do file output or OTLP, but not both. tracing-opentelemetry

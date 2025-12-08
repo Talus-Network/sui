@@ -13,16 +13,16 @@
 
 use fastcrypto::encoding::{Base64, Encoding};
 use move_binary_format::{
-    binary_config::BinaryConfig, file_format::SignatureToken, CompiledModule,
+    CompiledModule, binary_config::BinaryConfig, file_format::SignatureToken,
 };
 use move_command_line_common::{
-    display::{try_render_constant, RenderResult},
+    display::{RenderResult, try_render_constant},
     error_bitset::ErrorBitset,
 };
 use move_core_types::account_address::AccountAddress;
 use sui_json_rpc_types::{SuiObjectDataOptions, SuiRawData};
 use sui_sdk::apis::ReadApi;
-use sui_types::{base_types::ObjectID, Identifier};
+use sui_types::{Identifier, base_types::ObjectID};
 
 /// Take a Move abort status string and render it into a more human-readable error message using
 /// by parsing the string (as best we can) and seeing if the abort code is a Clever Error abort
@@ -105,12 +105,18 @@ pub(crate) async fn render_clever_error_opt(
             RenderResult::AsValue(v_str) => v_str,
         };
 
+        let code_str = match error_bitset.error_code() {
+            Some(code) => format!("error code {} --", code),
+            None => "".to_string(),
+        };
+
         format!(
-            "function '{}::{}::{}' at line {}. Aborted with '{}' -- {}",
+            "function '{}::{}::{}' at line {}. Aborted with {}'{}' -- {}",
             address.to_canonical_display(true),
             module_name,
             function_name,
             line_number,
+            code_str,
             error_identifier,
             const_str
         )
@@ -182,11 +188,14 @@ mod tests {
             r#"Failure { error: "MoveAbort(MoveLocation { module: ModuleId { address: 60197a0c146e31dd12689e890208767fe2fefb2f726710b4a9fa0b857f7a2c20, name: Identifier(\"clever_errors\") }, function: 3, instruction: 1, function_name: Some(\"clever_aborter_not_a_string\") }, 9223372135639154691) in command 0" }"#,
             r#"MoveAbort(MoveLocation { module: ModuleId { address: 24bf9e624820625ac1e38076901421d2630b2b225b638aaf0b85264b857a608b, name: Identifier(\"tester\") }, function: 0, instruction: 1, function_name: Some(\"test\") }, 9223372071214514177) in command 0"#,
             r#"MoveAbort(MoveLocation { module: ModuleId { address: 24bf9e624820625ac1e38076901421d2630b2b225b638aaf0b85264b857a608b, name: Identifier("tester") }, function: 0, instruction: 1, function_name: Some("test") }, 9223372071214514177) in command 0"#,
+            r#"MoveAbort(MoveLocation { module: ModuleId { address: 24bf9e624820625ac1e38076901421d2630b2b225b638aaf0b85264b857a608b, name: Identifier("tester") }, function: 0, instruction: 1, function_name: Some("test") }, 13835339534553907201) in command 0"#,
+            r#"MoveAbort(MoveLocation { module: ModuleId { address: 24bf9e624820625ac1e38076901421d2630b2b225b638aaf0b85264b857a608b, name: Identifier("tester") }, function: 0, instruction: 1, function_name: Some("test") }, 13835339534553907201) in command 0"#,
         ];
         let parsed: Vec<_> = corpus.into_iter().map(|c| {
             let (address, module_name, function_name, instruction, abort_code, command_index) =
                 parse_abort_status_string(c).unwrap();
-            format!("original abort message: {}\n address: {}\n module_name: {}\n function_name: {}\n instruction: {}\n abort_code: {}\n command_index: {}", c, address, module_name, function_name, instruction, abort_code, command_index)
+            let clever_abort_code = format!("{:#?}", ErrorBitset::from_u64(abort_code));
+            format!("original abort message: {}\n address: {}\n module_name: {}\n function_name: {}\n instruction: {}\n abort_code: {}\n clever_abort_code: {}\n command_index: {}", c, address, module_name, function_name, instruction, abort_code, clever_abort_code, command_index)
         }).collect();
         insta::assert_snapshot!(parsed.join("\n------\n"));
     }

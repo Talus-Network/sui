@@ -1,9 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use diesel_migrations::{embed_migrations, EmbeddedMigrations};
+use diesel_migrations::{EmbeddedMigrations, embed_migrations};
 
 pub mod checkpoints;
+pub mod cp_sequence_numbers;
 pub mod displays;
 pub mod epochs;
 pub mod events;

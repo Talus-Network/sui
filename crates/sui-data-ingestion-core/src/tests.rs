@@ -7,8 +7,8 @@ use crate::{ReaderOptions, Worker};
 use anyhow::Result;
 use async_trait::async_trait;
 use prometheus::Registry;
-use rand::prelude::StdRng;
 use rand::SeedableRng;
+use rand::prelude::StdRng;
 use std::path::PathBuf;
 use std::time::Duration;
 use sui_protocol_config::ProtocolConfig;
@@ -109,7 +109,7 @@ async fn basic_flow() {
 fn temp_dir() -> std::path::PathBuf {
     tempfile::tempdir()
         .expect("Failed to open temporary directory")
-        .into_path()
+        .keep()
 }
 
 fn create_executor_bundle() -> ExecutorBundle {
@@ -147,6 +147,7 @@ fn mock_checkpoint_data_bytes(seq_number: CheckpointSequenceNumber) -> Vec<u8> {
         GasCostSummary::default(),
         None,
         0,
+        Vec::new(),
         Vec::new(),
     );
 

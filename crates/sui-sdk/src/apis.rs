@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use fastcrypto::encoding::Base64;
-use futures::stream;
 use futures::StreamExt;
+use futures::stream;
 use futures_core::Stream;
 use jsonrpsee::core::client::Subscription;
 use std::collections::BTreeMap;
@@ -16,8 +16,8 @@ use sui_json_rpc_types::SuiData;
 use sui_json_rpc_types::ZkLoginIntentScope;
 use sui_json_rpc_types::ZkLoginVerifyResult;
 
-use crate::error::{Error, SuiRpcResult};
 use crate::RpcClient;
+use crate::error::{Error, SuiRpcResult};
 use sui_json_rpc_api::{
     CoinReadApiClient, GovernanceReadApiClient, IndexerApiClient, MoveUtilsClient, ReadApiClient,
     WriteApiClient,
@@ -42,8 +42,8 @@ use sui_types::sui_serde::BigInt;
 use sui_types::sui_system_state::sui_system_state_summary::SuiSystemStateSummary;
 use sui_types::transaction::{Transaction, TransactionData, TransactionKind};
 
-const WAIT_FOR_LOCAL_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 const WAIT_FOR_LOCAL_EXECUTION_DELAY: Duration = Duration::from_millis(200);
+
 const WAIT_FOR_LOCAL_EXECUTION_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The main read API structure with functions for retrieving data about different objects and transactions
@@ -660,8 +660,8 @@ impl ReadApi {
     ///   construct calls involving objects you do not own).
     /// - Calls are not checked for visibility (you can call private functions on modules)
     /// - Inputs of any type can be constructed and passed in, (including
-    ///    Coins and other objects that would usually need to be constructed
-    ///    with a move call).
+    ///   Coins and other objects that would usually need to be constructed
+    ///   with a move call).
     /// - Function returns do not need to be used, even if they do not have `drop`.
     ///
     /// Dev inspect's output includes a breakdown of results returned by every transaction
@@ -1173,7 +1173,13 @@ impl QuorumDriverApi {
         }
 
         // JSON-RPC ignores WaitForLocalExecution, so simulate it by polling for the transaction.
-        let mut poll_response = tokio::time::timeout(WAIT_FOR_LOCAL_EXECUTION_TIMEOUT, async {
+        let wait_for_local_execution_timeout: Duration = if cfg!(msim) {
+            // In simtests, fullnodes can stop receiving checkpoints for > 30s.
+            Duration::from_secs(120)
+        } else {
+            Duration::from_secs(60)
+        };
+        let mut poll_response = tokio::time::timeout(wait_for_local_execution_timeout, async {
             // Apply a short delay to give the full node a chance to catch up.
             tokio::time::sleep(WAIT_FOR_LOCAL_EXECUTION_DELAY).await;
 

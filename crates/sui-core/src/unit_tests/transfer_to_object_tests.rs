@@ -5,22 +5,23 @@ use std::{collections::HashSet, sync::Arc};
 
 use sui_protocol_config::{Chain, PerObjectCongestionControlMode, ProtocolConfig, ProtocolVersion};
 use sui_types::{
-    base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress},
-    crypto::{get_key_pair, AccountKeyPair},
+    base_types::{FullObjectRef, ObjectID, ObjectRef, SequenceNumber, SuiAddress},
+    crypto::{AccountKeyPair, get_key_pair},
     digests::ObjectDigest,
     effects::{TransactionEffects, TransactionEffectsAPI},
-    error::{SuiError, UserInputError},
+    error::{SuiError, SuiErrorKind, UserInputError},
     execution_status::{ExecutionFailureStatus, ExecutionStatus},
     object::{Object, Owner},
     programmable_transaction_builder::ProgrammableTransactionBuilder,
     transaction::{
-        CallArg, ObjectArg, ProgrammableTransaction, VerifiedCertificate,
-        TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        CallArg, ObjectArg, ProgrammableTransaction, SharedObjectMutability,
+        TEST_ONLY_GAS_UNIT_FOR_PUBLISH, VerifiedCertificate,
     },
 };
 
 use crate::{
     authority::{
+        AuthorityState,
         authority_test_utils::{certify_transaction, send_consensus},
         authority_tests::{
             build_programmable_transaction, execute_programmable_transaction,
@@ -28,7 +29,6 @@ use crate::{
         },
         move_integration_tests::build_and_publish_test_package_with_upgrade_cap,
         test_authority_builder::TestAuthorityBuilder,
-        AuthorityState,
     },
     move_call,
 };
@@ -245,7 +245,7 @@ impl TestRunner {
         // Call `execute_certificate` instead of `execute_certificate_with_execution_error` to make sure we go through TM
         let effects = self
             .authority_state
-            .execute_certificate(&ct, &epoch_store)
+            .wait_for_certificate_execution(&ct, &epoch_store)
             .await
             .unwrap();
 
@@ -359,7 +359,7 @@ async fn test_tto_intersection_input_and_receiving_objects() {
         let child_receiving_arg = CallArg::Object(ObjectArg::Receiving(child.0));
 
         // Duplicate object reference between receiving and input object arguments.
-        let SuiError::UserInputError { error } = runner
+        let SuiErrorKind::UserInputError { error } = runner
             .signing_error({
                 let mut builder = ProgrammableTransactionBuilder::new();
                 let parent = builder.obj(ObjectArg::ImmOrOwnedObject(parent.0)).unwrap();
@@ -372,13 +372,13 @@ async fn test_tto_intersection_input_and_receiving_objects() {
                 built.inputs.push(parent_receiving_arg);
                 built
             })
-            .await else {
+            .await.into_inner() else {
                 panic!("expected signing error");
             };
         assert!(matches!(error, UserInputError::DuplicateObjectRefInput));
 
         // Duplicate object reference in receiving object arguments.
-        let SuiError::UserInputError { error } = runner
+        let SuiErrorKind::UserInputError { error } = runner
             .signing_error({
                 let mut builder = ProgrammableTransactionBuilder::new();
                 let parent = builder.obj(ObjectArg::ImmOrOwnedObject(parent.0)).unwrap();
@@ -391,7 +391,7 @@ async fn test_tto_intersection_input_and_receiving_objects() {
                 built.inputs.push(child_receiving_arg);
                 built
             })
-            .await else {
+            .await.into_inner() else {
                 panic!("expected signing error");
             };
         assert!(matches!(error, UserInputError::DuplicateObjectRefInput));
@@ -488,7 +488,7 @@ async fn test_tto_invalid_receiving_arguments() {
         ];
 
         for (i, (mutate, expect)) in mutations.into_iter().enumerate() {
-            let SuiError::UserInputError { error } = runner.signing_error({
+            let SuiErrorKind::UserInputError { error } = runner.signing_error({
                 let mut builder = ProgrammableTransactionBuilder::new();
                 let parent = builder.obj(ObjectArg::ImmOrOwnedObject(parent.0)).unwrap();
                 let child = builder.obj(ObjectArg::Receiving(mutate(child.0))).unwrap();
@@ -498,7 +498,7 @@ async fn test_tto_invalid_receiving_arguments() {
                 };
                 builder.finish()
             })
-            .await else {
+            .await.into_inner() else {
                 panic!("failed on iteration {}", i);
             };
             assert!(
@@ -943,7 +943,7 @@ async fn verify_tto_not_locked(
     let fake_parent = effects
         .created()
         .iter()
-        .find(|(obj_ref, _)| obj_ref.0 != parent.0 .0 && obj_ref.0 != child.0 .0)
+        .find(|(obj_ref, _)| obj_ref.0 != parent.0.0 && obj_ref.0 != child.0.0)
         .cloned()
         .unwrap();
 
@@ -1095,7 +1095,7 @@ async fn test_tto_valid_dependencies() {
                 {
                     let mut builder = ProgrammableTransactionBuilder::new();
                     builder
-                        .transfer_object(SuiAddress::from(parent.0 .0), child.0)
+                        .transfer_object(SuiAddress::from(parent.0 .0), FullObjectRef::from_object_ref_and_owner(child.0, &child.1))
                         .unwrap();
                     builder.finish()
                 },
@@ -1195,7 +1195,7 @@ async fn test_tto_valid_dependencies_delete_on_receive() {
                 {
                     let mut builder = ProgrammableTransactionBuilder::new();
                     builder
-                        .transfer_object(SuiAddress::from(parent.0 .0), child.0)
+                        .transfer_object(SuiAddress::from(parent.0 .0), FullObjectRef::from_object_ref_and_owner(child.0, &child.1))
                         .unwrap();
                     builder.finish()
                 },
@@ -1291,7 +1291,7 @@ async fn test_tto_dependencies_dont_receive() {
                 {
                     let mut builder = ProgrammableTransactionBuilder::new();
                     builder
-                        .transfer_object(SuiAddress::from(parent.0 .0), old_child.0)
+                        .transfer_object(SuiAddress::from(parent.0 .0), FullObjectRef::from_object_ref_and_owner(old_child.0, &old_child.1))
                         .unwrap();
                     builder.finish()
                 },
@@ -1389,7 +1389,7 @@ async fn test_tto_dependencies_dont_receive_but_abort() {
                 {
                     let mut builder = ProgrammableTransactionBuilder::new();
                     builder
-                        .transfer_object(SuiAddress::from(parent.0 .0), old_child.0)
+                        .transfer_object(SuiAddress::from(parent.0 .0), FullObjectRef::from_object_ref_and_owner(old_child.0, &old_child.1))
                         .unwrap();
                     builder.finish()
                 },
@@ -1485,7 +1485,7 @@ async fn test_tto_dependencies_receive_and_abort() {
                 {
                     let mut builder = ProgrammableTransactionBuilder::new();
                     builder
-                        .transfer_object(SuiAddress::from(parent.0 .0), old_child.0)
+                        .transfer_object(SuiAddress::from(parent.0 .0), FullObjectRef::from_object_ref_and_owner(old_child.0, &old_child.1))
                         .unwrap();
                     builder.finish()
                 },
@@ -1580,7 +1580,7 @@ async fn test_tto_dependencies_receive_and_type_mismatch() {
                 {
                     let mut builder = ProgrammableTransactionBuilder::new();
                     builder
-                        .transfer_object(SuiAddress::from(parent.0 .0), old_child.0)
+                        .transfer_object(SuiAddress::from(parent.0 .0), FullObjectRef::from_object_ref_and_owner(old_child.0, &old_child.1))
                         .unwrap();
                     builder.finish()
                 },
@@ -1687,7 +1687,7 @@ async fn receive_and_dof_interleave() {
                         .obj(ObjectArg::SharedObject {
                             id: shared.0 .0,
                             initial_shared_version,
-                            mutable: true,
+                            mutability: SharedObjectMutability::Mutable,
                         })
                         .unwrap();
                     let child = builder.obj(ObjectArg::Receiving(owned.0)).unwrap();
@@ -1709,7 +1709,7 @@ async fn receive_and_dof_interleave() {
                         .obj(ObjectArg::SharedObject {
                             id: shared.0 .0,
                             initial_shared_version,
-                            mutable: true,
+                            mutability: SharedObjectMutability::Mutable,
                         })
                         .unwrap();
                     let child = builder.obj(ObjectArg::ImmOrOwnedObject(owned.0)).unwrap();
@@ -1769,8 +1769,8 @@ async fn test_have_deleted_owned_object() {
 
         assert!(cache.get_object(&new_child.0.0).is_some());
         // Should not show as deleted for either versions
-        assert!(!cache.have_deleted_fastpath_object_at_version_or_after(new_child.0.0, new_child.0.1, 0, true));
-        assert!(!cache.have_deleted_fastpath_object_at_version_or_after(new_child.0.0, child.0.1, 0, true));
+        assert!(!cache.fastpath_stream_ended_at_version_or_after(new_child.0.0, new_child.0.1, 0));
+        assert!(!cache.fastpath_stream_ended_at_version_or_after(new_child.0.0, child.0.1, 0));
 
         let effects = runner
             .run({
@@ -1787,13 +1787,13 @@ async fn test_have_deleted_owned_object() {
 
         let deleted_child = effects.deleted().into_iter().find(|(id, _, _)| *id == new_child.0 .0).unwrap();
         assert!(cache.get_object(&deleted_child.0).is_none());
-        assert!(cache.have_deleted_fastpath_object_at_version_or_after(deleted_child.0, deleted_child.1, 0, true));
-        assert!(cache.have_deleted_fastpath_object_at_version_or_after(deleted_child.0, new_child.0.1, 0, true));
-        assert!(cache.have_deleted_fastpath_object_at_version_or_after(deleted_child.0, child.0.1, 0, true));
+        assert!(cache.fastpath_stream_ended_at_version_or_after(deleted_child.0, deleted_child.1, 0));
+        assert!(cache.fastpath_stream_ended_at_version_or_after(deleted_child.0, new_child.0.1, 0));
+        assert!(cache.fastpath_stream_ended_at_version_or_after(deleted_child.0, child.0.1, 0));
         // Should not show as deleted for versions after this though
-        assert!(!cache.have_deleted_fastpath_object_at_version_or_after(deleted_child.0, deleted_child.1.next(), 0, true));
+        assert!(!cache.fastpath_stream_ended_at_version_or_after(deleted_child.0, deleted_child.1.next(), 0));
         // Should not show as deleted for other epochs outside of our current epoch too
-        assert!(!cache.have_deleted_fastpath_object_at_version_or_after(deleted_child.0, deleted_child.1, 1, true));
+        assert!(!cache.fastpath_stream_ended_at_version_or_after(deleted_child.0, deleted_child.1, 1));
     }
     }
 }

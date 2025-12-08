@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    FileMetadata, FileType, Manifest, MAGIC_BYTES, MANIFEST_FILE_MAGIC, OBJECT_FILE_MAGIC,
+    FileMetadata, FileType, MAGIC_BYTES, MANIFEST_FILE_MAGIC, Manifest, OBJECT_FILE_MAGIC,
     OBJECT_ID_BYTES, OBJECT_REF_BYTES, REFERENCE_FILE_MAGIC, SEQUENCE_NUM_BYTES, SHA3_BYTES,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use byteorder::{BigEndian, ReadBytesExt};
 use bytes::{Buf, Bytes};
 use fastcrypto::hash::MultisetHash;
@@ -21,25 +21,25 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 use sui_config::object_storage_config::ObjectStoreConfig;
-use sui_core::authority::authority_store_tables::{AuthorityPerpetualTables, LiveObject};
 use sui_core::authority::AuthorityStore;
+use sui_core::authority::authority_store_tables::{AuthorityPerpetualTables, LiveObject};
 use sui_indexer_alt_framework::task::TrySpawnStreamExt;
 use sui_storage::blob::{Blob, BlobEncoding};
 use sui_storage::object_store::http::HttpDownloaderBuilder;
 use sui_storage::object_store::util::{copy_file, copy_files, path_to_filesystem};
 use sui_storage::object_store::{ObjectStoreGetExt, ObjectStoreListExt, ObjectStorePutExt};
-use sui_types::accumulator::Accumulator;
 use sui_types::base_types::{ObjectDigest, ObjectID, ObjectRef, SequenceNumber};
+use sui_types::global_state_hash::GlobalStateHash;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::Duration;
 use tokio::time::Instant;
 use tracing::{error, info};
 
-pub type SnapshotChecksums = (DigestByBucketAndPartition, Accumulator);
+pub type SnapshotChecksums = (DigestByBucketAndPartition, GlobalStateHash);
 pub type DigestByBucketAndPartition = BTreeMap<u32, BTreeMap<u32, [u8; 32]>>;
 pub type Sha3DigestType = Arc<Mutex<BTreeMap<u32, BTreeMap<u32, [u8; 32]>>>>;
 #[derive(Clone)]
@@ -52,9 +52,46 @@ pub struct StateSnapshotReaderV1 {
     object_files: BTreeMap<u32, BTreeMap<u32, FileMetadata>>,
     m: MultiProgress,
     concurrency: usize,
+    max_retries: usize,
 }
 
 impl StateSnapshotReaderV1 {
+    async fn copy_file_with_retry<S: ObjectStoreGetExt, D: ObjectStorePutExt>(
+        src: &Path,
+        dest: &Path,
+        src_store: &S,
+        dest_store: &D,
+        max_retries: usize,
+    ) -> Result<()> {
+        let mut attempts = 0;
+        let max_attempts = max_retries + 1;
+        loop {
+            attempts += 1;
+            match copy_file(src, dest, src_store, dest_store).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempts >= max_attempts => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to download {} after {} attempts: {}",
+                        src,
+                        attempts,
+                        e
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to download {} (attempt {}/{}): {}, retrying in {}ms",
+                        src,
+                        attempts,
+                        max_attempts,
+                        e,
+                        1000 * attempts
+                    );
+                    tokio::time::sleep(Duration::from_millis(1000 * attempts as u64)).await;
+                }
+            }
+        }
+    }
+
     pub async fn new(
         epoch: u64,
         remote_store_config: &ObjectStoreConfig,
@@ -62,6 +99,7 @@ impl StateSnapshotReaderV1 {
         download_concurrency: NonZeroUsize,
         m: MultiProgress,
         skip_reset_local_store: bool,
+        max_retries: usize,
     ) -> Result<Self> {
         let epoch_dir = format!("epoch_{}", epoch);
         let remote_object_store = if remote_store_config.no_sign_request {
@@ -87,11 +125,12 @@ impl StateSnapshotReaderV1 {
         }
         // Download MANIFEST first
         let manifest_file_path = Path::from(epoch_dir.clone()).child("MANIFEST");
-        copy_file(
+        Self::copy_file_with_retry(
             &manifest_file_path,
             &manifest_file_path,
             &remote_object_store,
             &local_object_store,
+            max_retries,
         )
         .await?;
         let manifest = Self::read_manifest(path_to_filesystem(
@@ -186,6 +225,7 @@ impl StateSnapshotReaderV1 {
             object_files,
             m,
             concurrency: download_concurrency.get(),
+            max_retries,
         })
     }
 
@@ -193,7 +233,7 @@ impl StateSnapshotReaderV1 {
         &mut self,
         perpetual_db: &AuthorityPerpetualTables,
         abort_registration: AbortRegistration,
-        sender: Option<tokio::sync::mpsc::Sender<(Accumulator, u64)>>,
+        sender: Option<tokio::sync::mpsc::Sender<(GlobalStateHash, u64)>>,
     ) -> Result<()> {
         // This computes and stores the sha3 digest of object references in REFERENCE file for each
         // bucket partition. When downloading objects, we will match sha3 digest of object references
@@ -286,7 +326,7 @@ impl StateSnapshotReaderV1 {
 
     fn spawn_accumulation_tasks(
         &self,
-        sender: tokio::sync::mpsc::Sender<(Accumulator, u64)>,
+        sender: tokio::sync::mpsc::Sender<(GlobalStateHash, u64)>,
         num_part_files: usize,
     ) -> JoinHandle<()> {
         // Spawn accumulation progress bar
@@ -352,7 +392,7 @@ impl StateSnapshotReaderV1 {
                         .collect::<Vec<ObjectDigest>>();
                         let sender_clone = sender.clone();
                         tokio::spawn(async move {
-                            let mut partial_acc = Accumulator::default();
+                            let mut partial_acc = GlobalStateHash::default();
                             let num_objects = obj_digests.len();
                             partial_acc.insert_all(obj_digests);
                             sender_clone

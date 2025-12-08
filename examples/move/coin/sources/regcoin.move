@@ -4,10 +4,12 @@
 //docs::#regulate
 module examples::regcoin;
 
-use sui::{coin::{Self, DenyCapV2}, deny_list::DenyList};
+use sui::coin::{Self, DenyCapV2};
+use sui::deny_list::DenyList;
 
 public struct REGCOIN has drop {}
 
+#[allow(deprecated_usage)]
 fun init(witness: REGCOIN, ctx: &mut TxContext) {
     let (treasury, deny_cap, metadata) = coin::create_regulated_currency_v2(
         witness,

@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Reducer, Worker, MAX_CHECKPOINTS_IN_PROGRESS};
+use crate::{MAX_CHECKPOINTS_IN_PROGRESS, Reducer, Worker};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -19,7 +19,7 @@ pub(crate) async fn reduce<W: Worker>(
 ) -> Result<()> {
     // convert to a stream of MAX size. This way, each iteration of the loop will process all ready messages
     let mut stream =
-        ReceiverStream::new(progress_receiver).ready_chunks(MAX_CHECKPOINTS_IN_PROGRESS);
+        ReceiverStream::new(progress_receiver).ready_chunks(*MAX_CHECKPOINTS_IN_PROGRESS);
     let mut unprocessed = HashMap::new();
     let mut batch = vec![];
     let mut progress_update = None;

@@ -9,9 +9,9 @@ use std::{
 };
 
 use anemo::{
-    rpc::Status,
-    types::{response::StatusCode, PeerInfo},
     PeerId, Response,
+    rpc::Status,
+    types::{PeerInfo, response::StatusCode},
 };
 use anemo_tower::{
     auth::{AllowedPeers, RequireAuthorizationLayer},
@@ -23,11 +23,13 @@ use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
 use consensus_config::{AuthorityIndex, NetworkKeyPair};
+use consensus_types::block::{BlockRef, Round};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, warn};
 
 use super::{
+    BlockStream, ExtendedSerializedBlock, NetworkClient, NetworkManager, NetworkService,
     anemo_gen::{
         consensus_rpc_client::ConsensusRpcClient,
         consensus_rpc_server::{ConsensusRpc, ConsensusRpcServer},
@@ -35,14 +37,13 @@ use super::{
     connection_monitor::{AnemoConnectionMonitor, ConnectionMonitorHandle},
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     metrics_layer::{MetricsCallbackMaker, MetricsResponseCallback, SizedRequest, SizedResponse},
-    BlockStream, ExtendedSerializedBlock, NetworkClient, NetworkManager, NetworkService,
 };
 use crate::{
-    block::{BlockRef, VerifiedBlock},
+    CommitIndex,
+    block::VerifiedBlock,
     commit::CommitRange,
     context::Context,
     error::{ConsensusError, ConsensusResult},
-    CommitIndex, Round,
 };
 
 /// Implements Anemo RPC client for Consensus.
@@ -161,6 +162,7 @@ impl NetworkClient for AnemoClient {
         peer: AuthorityIndex,
         block_refs: Vec<BlockRef>,
         highest_accepted_rounds: Vec<Round>,
+        breadth_first: bool,
         timeout: Duration,
     ) -> ConsensusResult<Vec<Bytes>> {
         let mut client = self.get_client(peer, timeout).await?;
@@ -176,6 +178,7 @@ impl NetworkClient for AnemoClient {
                 })
                 .collect(),
             highest_accepted_rounds,
+            breadth_first,
         };
         let response = client
             .fetch_blocks(anemo::Request::new(request).with_timeout(timeout))
@@ -343,10 +346,10 @@ impl<S: NetworkService> ConsensusRpc for AnemoServiceProxy<S> {
             .collect();
 
         let highest_accepted_rounds = body.highest_accepted_rounds;
-
+        let breadth_first = body.breadth_first;
         let blocks = self
             .service
-            .handle_fetch_blocks(index, block_refs, highest_accepted_rounds)
+            .handle_fetch_blocks(index, block_refs, highest_accepted_rounds, breadth_first)
             .await
             .map_err(|e| {
                 anemo::rpc::Status::new_with_message(
@@ -752,6 +755,7 @@ pub(crate) struct SendBlockResponse {}
 pub(crate) struct FetchBlocksRequest {
     block_refs: Vec<Vec<u8>>,
     highest_accepted_rounds: Vec<Round>,
+    breadth_first: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

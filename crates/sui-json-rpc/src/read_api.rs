@@ -1,30 +1,33 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use backoff::future::retry;
 use backoff::ExponentialBackoff;
+use backoff::future::retry;
 use fastcrypto::encoding::Base64;
 use fastcrypto_zkp::bn254::zk_login_api::ZkLoginEnv;
 use futures::future::join_all;
 use im::hashmap::HashMap as ImHashMap;
 use indexmap::map::IndexMap;
 use itertools::Itertools;
-use jsonrpsee::core::RpcResult;
 use jsonrpsee::RpcModule;
+use jsonrpsee::core::RpcResult;
 use move_bytecode_utils::module_cache::GetModule;
-use move_core_types::annotated_value::{MoveStruct, MoveStructLayout, MoveValue};
+use move_core_types::annotated_value::{MoveStructLayout, MoveTypeLayout};
 use move_core_types::language_storage::StructTag;
+use once_cell::sync::Lazy;
 use shared_crypto::intent::{IntentMessage, PersonalMessage};
+use sui_display::v1::Format;
 use sui_json_rpc_types::ZkLoginIntentScope;
 use sui_types::base_types::SuiAddress;
 use sui_types::signature::{GenericSignature, VerifyParams};
 use sui_types::signature_verification::VerifiedDigestCache;
+use sui_types::storage::ObjectKey;
 use tap::TapFallible;
 use tracing::{debug, error, info, instrument, trace, warn};
 
@@ -32,21 +35,19 @@ use mysten_metrics::add_server_timing;
 use mysten_metrics::spawn_monitored_task;
 use sui_core::authority::AuthorityState;
 use sui_json_rpc_api::{
-    validate_limit, JsonRpcMetrics, ReadApiOpenRpc, ReadApiServer, QUERY_MAX_RESULT_LIMIT,
-    QUERY_MAX_RESULT_LIMIT_CHECKPOINTS,
+    JsonRpcMetrics, QUERY_MAX_RESULT_LIMIT, QUERY_MAX_RESULT_LIMIT_CHECKPOINTS, ReadApiOpenRpc,
+    ReadApiServer, validate_limit,
 };
 use sui_json_rpc_types::{
     BalanceChange, Checkpoint, CheckpointId, CheckpointPage, DisplayFieldsResponse, EventFilter,
-    ObjectChange, ProtocolConfigResponse, SuiEvent, SuiGetPastObjectRequest, SuiMoveStruct,
-    SuiMoveValue, SuiMoveVariant, SuiObjectDataOptions, SuiObjectResponse, SuiPastObjectResponse,
-    SuiTransactionBlock, SuiTransactionBlockEvents, SuiTransactionBlockResponse,
-    SuiTransactionBlockResponseOptions,
+    ObjectChange, ProtocolConfigResponse, SuiEvent, SuiGetPastObjectRequest, SuiObjectDataOptions,
+    SuiObjectResponse, SuiPastObjectResponse, SuiTransactionBlock, SuiTransactionBlockEvents,
+    SuiTransactionBlockResponse, SuiTransactionBlockResponseOptions,
 };
 use sui_open_rpc::Module;
 use sui_protocol_config::{ProtocolConfig, ProtocolVersion};
 use sui_storage::key_value_store::TransactionKeyValueStore;
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
-use sui_types::collection_types::VecMap;
 use sui_types::crypto::AggregateAuthoritySignature;
 use sui_types::display::DisplayVersionUpdatedEvent;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI, TransactionEvents};
@@ -61,16 +62,35 @@ use sui_types::transaction::{Transaction, TransactionData};
 
 use crate::authority_state::{StateRead, StateReadError, StateReadResult};
 use crate::error::{Error, RpcInterimResult, SuiRpcInputError};
+use crate::{ObjectProvider, with_tracing};
 use crate::{
-    get_balance_changes_from_effect, get_object_changes, ObjectProviderCache, SuiRpcModule,
+    ObjectProviderCache, SuiRpcModule, get_balance_changes_from_effect, get_object_changes,
 };
-use crate::{with_tracing, ObjectProvider};
 use fastcrypto::encoding::Encoding;
 use fastcrypto::traits::ToFromBytes;
 use shared_crypto::intent::Intent;
 use sui_json_rpc_types::ZkLoginVerifyResult;
-use sui_types::authenticator_state::{get_authenticator_state, ActiveJwk};
+use sui_types::authenticator_state::{ActiveJwk, get_authenticator_state};
+
+/// A field access in a  Display string cannot exceed this level of nesting.
 const MAX_DISPLAY_NESTED_LEVEL: usize = 10;
+
+/// Default budget for Display output size.
+const DEFAULT_MAX_DISPLAY_OUTPUT_SIZE: usize = 1024 * 1024;
+
+/// Overall display output cannot exceed this size.
+static MAX_DISPLAY_OUTPUT_SIZE: Lazy<usize> = Lazy::new(|| {
+    let max_opt = std::env::var("MAX_DISPLAY_OUTPUT_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
+    if let Some(max) = max_opt {
+        info!("Using custom value for 'MAX_DISPLAY_OUTPUT_SIZE': {max}");
+        max
+    } else {
+        DEFAULT_MAX_DISPLAY_OUTPUT_SIZE
+    }
+});
 
 // An implementation of the read portion of the JSON-RPC interface intended for use in
 // Fullnodes.
@@ -321,10 +341,10 @@ impl ReadApi {
             trace!("getting events");
             let mut non_empty_digests = vec![];
             for cache_entry in temp_response.values() {
-                if let Some(effects) = &cache_entry.effects {
-                    if effects.events_digest().is_some() {
-                        non_empty_digests.push(cache_entry.digest);
-                    }
+                if let Some(effects) = &cache_entry.effects
+                    && effects.events_digest().is_some()
+                {
+                    non_empty_digests.push(cache_entry.digest);
                 }
             }
             // fetch events from the DB with retry, retry each 0.5s for 3s
@@ -353,8 +373,8 @@ impl ReadApi {
             .await
             .map_err(|e| {
                 Error::UnexpectedError(format!(
-                "Retrieving events with retry failed for transaction digests {digests:?}: {e:?}"
-            ))
+                    "Retrieving events with retry failed for transaction digests {digests:?}: {e:?}"
+                ))
             })?
             .into_iter();
 
@@ -370,7 +390,9 @@ impl ReadApi {
                                 Some(to_sui_transaction_events(self, cache_entry.digest, ev)?)
                         }
                         None | Some(None) => {
-                            error!("Failed to fetch events with event digest {events_digest:?} for txn {transaction_digest}");
+                            error!(
+                                "Failed to fetch events with event digest {events_digest:?} for txn {transaction_digest}"
+                            );
                             cache_entry.errors.push(format!(
                                 "Failed to fetch events with event digest {events_digest:?}",
                             ))
@@ -384,8 +406,41 @@ impl ReadApi {
             }
         }
 
-        let object_cache =
+        let mut object_cache =
             ObjectProviderCache::new((self.state.clone(), self.transaction_kv_store.clone()));
+
+        // Prefetch the objects if we need to show balance or object changes
+        if opts.show_balance_changes || opts.show_object_changes {
+            let mut keys = vec![];
+            for resp in temp_response.values() {
+                let effects = resp.effects.as_ref().ok_or_else(|| {
+                    SuiRpcInputError::GenericNotFound(
+                        "unable to derive balance/object changes because effect is empty"
+                            .to_string(),
+                    )
+                })?;
+
+                for change in effects.object_changes() {
+                    if let Some(input_version) = change.input_version {
+                        keys.push(ObjectKey(change.id, input_version));
+                    }
+                    if let Some(output_version) = change.output_version {
+                        keys.push(ObjectKey(change.id, output_version));
+                    }
+                }
+            }
+
+            let objects = self
+                .transaction_kv_store
+                .multi_get_objects(&keys)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+
+            object_cache.insert_objects_into_cache(objects);
+        }
+
         if opts.show_balance_changes {
             trace!("getting balance changes");
 
@@ -733,7 +788,7 @@ impl ReadApiServer for ReadApi {
             let transaction_kv_store = self.transaction_kv_store.clone();
             let transaction = spawn_monitored_task!(async move {
                 let ret = transaction_kv_store.get_tx(digest).await.map_err(|err| {
-                    debug!(tx_digest=?digest, "Failed to get transaction: {:?}", err);
+                    debug!(tx_digest=?digest, "Failed to get transaction: {}", err);
                     Error::from(err)
                 });
                 add_server_timing("tx_kv_lookup");
@@ -824,50 +879,45 @@ impl ReadApiServer for ReadApi {
 
             let object_cache =
                 ObjectProviderCache::new((self.state.clone(), self.transaction_kv_store.clone()));
-            if opts.show_balance_changes {
-                if let Some(effects) = &temp_response.effects {
-                    let balance_changes = get_balance_changes_from_effect(
-                        &object_cache,
-                        effects,
-                        input_objects,
-                        None,
-                    )
-                    .await;
+            if opts.show_balance_changes
+                && let Some(effects) = &temp_response.effects
+            {
+                let balance_changes =
+                    get_balance_changes_from_effect(&object_cache, effects, input_objects, None)
+                        .await;
 
-                    if let Ok(balance_changes) = balance_changes {
-                        temp_response.balance_changes = Some(balance_changes);
-                    } else {
-                        temp_response.errors.push(format!(
-                            "Cannot retrieve balance changes: {}",
-                            balance_changes.unwrap_err()
-                        ));
-                    }
+                if let Ok(balance_changes) = balance_changes {
+                    temp_response.balance_changes = Some(balance_changes);
+                } else {
+                    temp_response.errors.push(format!(
+                        "Cannot retrieve balance changes: {}",
+                        balance_changes.unwrap_err()
+                    ));
                 }
             }
 
-            if opts.show_object_changes {
-                if let (Some(effects), Some(input)) =
+            if opts.show_object_changes
+                && let (Some(effects), Some(input)) =
                     (&temp_response.effects, &temp_response.transaction)
-                {
-                    let sender = input.data().intent_message().value.sender();
-                    let object_changes = get_object_changes(
-                        &object_cache,
-                        effects,
-                        sender,
-                        effects.modified_at_versions(),
-                        effects.all_changed_objects(),
-                        effects.all_removed_objects(),
-                    )
-                    .await;
+            {
+                let sender = input.data().intent_message().value.sender();
+                let object_changes = get_object_changes(
+                    &object_cache,
+                    effects,
+                    sender,
+                    effects.modified_at_versions(),
+                    effects.all_changed_objects(),
+                    effects.all_removed_objects(),
+                )
+                .await;
 
-                    if let Ok(object_changes) = object_changes {
-                        temp_response.object_changes = Some(object_changes);
-                    } else {
-                        temp_response.errors.push(format!(
-                            "Cannot retrieve object changes: {}",
-                            object_changes.unwrap_err()
-                        ));
-                    }
+                if let Ok(object_changes) = object_changes {
+                    temp_response.object_changes = Some(object_changes);
+                } else {
+                    temp_response.errors.push(format!(
+                        "Cannot retrieve object changes: {}",
+                        object_changes.unwrap_err()
+                    ));
                 }
             }
             let epoch_store = self.state.load_epoch_store_one_call_per_task();
@@ -1096,6 +1146,7 @@ impl ReadApiServer for ReadApi {
             true,
             true,
             Some(30),
+            true,
         );
         match intent_scope {
             ZkLoginIntentScope::TransactionData => {
@@ -1206,21 +1257,70 @@ async fn get_display_fields(
     original_object: &Object,
     original_layout: &Option<MoveStructLayout>,
 ) -> Result<DisplayFieldsResponse, ObjectDisplayError> {
-    let Some((object_type, layout)) = get_object_type_and_struct(original_object, original_layout)?
+    let Some(layout) = original_layout else {
+        return Ok(DisplayFieldsResponse {
+            data: None,
+            error: None,
+        });
+    };
+
+    let Some(move_object) = original_object.data.try_as_move() else {
+        return Err(ObjectDisplayError::MoveObject);
+    };
+
+    let Some(display_object) =
+        get_display_object_by_type(kv_store, fullnode_api, &layout.type_).await?
     else {
         return Ok(DisplayFieldsResponse {
             data: None,
             error: None,
         });
     };
-    if let Some(display_object) =
-        get_display_object_by_type(kv_store, fullnode_api, &object_type).await?
-    {
-        return get_rendered_fields(display_object.fields, &layout);
+
+    let format = match Format::parse(MAX_DISPLAY_NESTED_LEVEL, &display_object.fields) {
+        Ok(format) => format,
+        Err(e) => {
+            return Ok(DisplayFieldsResponse {
+                data: None,
+                error: Some(SuiObjectResponseError::DisplayError {
+                    error: e.to_string(),
+                }),
+            });
+        }
+    };
+
+    let layout = MoveTypeLayout::Struct(Box::new(layout.clone()));
+    let display = match format.display(*MAX_DISPLAY_OUTPUT_SIZE, move_object.contents(), &layout) {
+        Ok(fields) => fields,
+        Err(e) => {
+            return Ok(DisplayFieldsResponse {
+                data: None,
+                error: Some(SuiObjectResponseError::DisplayError {
+                    error: e.to_string(),
+                }),
+            });
+        }
+    };
+
+    let mut fields = BTreeMap::new();
+    let mut errors = vec![];
+
+    for (key, value) in display {
+        match value {
+            Ok(v) => {
+                fields.insert(key, v);
+            }
+            Err(e) => {
+                errors.push(e.to_string());
+            }
+        }
     }
+
     Ok(DisplayFieldsResponse {
-        data: None,
-        error: None,
+        data: (!fields.is_empty()).then_some(fields),
+        error: (!errors.is_empty()).then(|| SuiObjectResponseError::DisplayError {
+            error: errors.join("; "),
+        }),
     })
 }
 
@@ -1249,172 +1349,6 @@ async fn get_display_object_by_type(
         Ok(Some(display))
     } else {
         Ok(None)
-    }
-}
-
-pub fn get_object_type_and_struct(
-    o: &Object,
-    layout: &Option<MoveStructLayout>,
-) -> Result<Option<(StructTag, MoveStruct)>, ObjectDisplayError> {
-    if let Some(object_type) = o.type_() {
-        let move_struct = get_move_struct(o, layout)?;
-        Ok(Some((object_type.clone().into(), move_struct)))
-    } else {
-        Ok(None)
-    }
-}
-
-fn get_move_struct(
-    o: &Object,
-    layout: &Option<MoveStructLayout>,
-) -> Result<MoveStruct, ObjectDisplayError> {
-    let layout = layout.as_ref().ok_or_else(|| ObjectDisplayError::Layout)?;
-    Ok(o.data
-        .try_as_move()
-        .ok_or_else(|| ObjectDisplayError::MoveObject)?
-        .to_move_struct(layout)?)
-}
-
-pub fn get_rendered_fields(
-    fields: VecMap<String, String>,
-    move_struct: &MoveStruct,
-) -> Result<DisplayFieldsResponse, ObjectDisplayError> {
-    let sui_move_value: SuiMoveValue = MoveValue::Struct(move_struct.clone()).into();
-    if let SuiMoveValue::Struct(move_struct) = sui_move_value {
-        let fields =
-            fields
-                .contents
-                .iter()
-                .map(|entry| match parse_template(&entry.value, &move_struct) {
-                    Ok(value) => Ok((entry.key.clone(), value)),
-                    Err(e) => Err(e),
-                });
-        let (oks, errs): (Vec<_>, Vec<_>) = fields.partition(Result::is_ok);
-        let success = oks.into_iter().filter_map(Result::ok).collect();
-        let errors: Vec<_> = errs.into_iter().filter_map(Result::err).collect();
-        let error_string = errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<String>>()
-            .join("; ");
-        let error = if !error_string.is_empty() {
-            Some(SuiObjectResponseError::DisplayError {
-                error: anyhow!("{error_string}").to_string(),
-            })
-        } else {
-            None
-        };
-
-        return Ok(DisplayFieldsResponse {
-            data: Some(success),
-            error,
-        });
-    }
-    Err(ObjectDisplayError::NotMoveStruct)?
-}
-
-fn parse_template(template: &str, move_struct: &SuiMoveStruct) -> Result<String, Error> {
-    let mut output = template.to_string();
-    let mut var_name = String::new();
-    let mut in_braces = false;
-    let mut escaped = false;
-
-    for ch in template.chars() {
-        match ch {
-            '\\' => {
-                escaped = true;
-                continue;
-            }
-            '{' if !escaped => {
-                in_braces = true;
-                var_name.clear();
-            }
-            '}' if !escaped => {
-                in_braces = false;
-                let value = get_value_from_move_struct(move_struct, &var_name)?;
-                output = output.replace(&format!("{{{}}}", var_name), &value.to_string());
-            }
-            _ if !escaped => {
-                if in_braces {
-                    var_name.push(ch);
-                }
-            }
-            _ => {}
-        }
-        escaped = false;
-    }
-
-    Ok(output.replace('\\', ""))
-}
-
-fn get_value_from_move_struct(
-    move_struct: &SuiMoveStruct,
-    var_name: &str,
-) -> Result<String, Error> {
-    let parts: Vec<&str> = var_name.split('.').collect();
-    if parts.is_empty() {
-        Err(anyhow!("Display template value cannot be empty"))?;
-    }
-    if parts.len() > MAX_DISPLAY_NESTED_LEVEL {
-        Err(anyhow!(
-            "Display template value nested depth cannot exist {}",
-            MAX_DISPLAY_NESTED_LEVEL
-        ))?;
-    }
-    let mut current_value = &SuiMoveValue::Struct(move_struct.clone());
-    // iterate over the parts and try to access the corresponding field
-    for part in parts {
-        match current_value {
-            SuiMoveValue::Struct(move_struct) => {
-                if let SuiMoveStruct::WithTypes { type_: _, fields }
-                | SuiMoveStruct::WithFields(fields) = move_struct
-                {
-                    if let Some(value) = fields.get(part) {
-                        current_value = value;
-                    } else {
-                        Err(anyhow!(
-                            "Field value {} cannot be found in struct",
-                            var_name
-                        ))?;
-                    }
-                } else {
-                    Err(Error::UnexpectedError(format!(
-                        "Unexpected move struct type for field {}",
-                        var_name
-                    )))?;
-                }
-            }
-            SuiMoveValue::Variant(SuiMoveVariant {
-                fields, variant, ..
-            }) => {
-                if let Some(value) = fields.get(part) {
-                    current_value = value;
-                } else {
-                    Err(anyhow!(
-                        "Field value {var_name} cannot be found in variant {variant}",
-                    ))?
-                }
-            }
-            _ => {
-                return Err(Error::UnexpectedError(format!(
-                    "Unexpected move value type for field {}",
-                    var_name
-                )))?
-            }
-        }
-    }
-
-    match current_value {
-        SuiMoveValue::Option(move_option) => match move_option.as_ref() {
-            Some(move_value) => Ok(move_value.to_string()),
-            None => Ok("".to_string()),
-        },
-        SuiMoveValue::Vector(_) => Err(anyhow!(
-            "Vector is not supported as a Display value {}",
-            var_name
-        ))?,
-
-        _ => Ok(current_value.to_string()),
     }
 }
 

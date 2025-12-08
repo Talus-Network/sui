@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    get_nth_struct_field, get_tag_and_layouts, legacy_test_cost,
-    object_runtime::{object_store::ChildObjectEffects, ObjectRuntime, RuntimeResults},
+    get_extension, get_extension_mut, get_nth_struct_field, get_tag_and_layouts, legacy_test_cost,
+    object_runtime::{ObjectRuntime, RuntimeResults, object_store::ChildObjectEffects},
 };
 use better_any::{Tid, TidAble};
 use indexmap::{IndexMap, IndexSet};
@@ -15,12 +15,12 @@ use move_core_types::{
     language_storage::StructTag,
     vm_status::StatusCode,
 };
-use move_vm_runtime::native_functions::NativeContext;
+use move_vm_runtime::{native_extensions::NativeExtensionMarker, native_functions::NativeContext};
 use move_vm_types::{
     loaded_data::runtime_types::Type,
     natives::function::NativeResult,
     pop_arg,
-    values::{self, StructRef, Value},
+    values::{self, StructRef, Value, Vector, VectorSpecialization},
 };
 use smallvec::smallvec;
 use std::{
@@ -30,7 +30,8 @@ use std::{
     thread::LocalKey,
 };
 use sui_types::{
-    base_types::{ObjectID, SequenceNumber, SuiAddress},
+    TypeTag,
+    base_types::{MoveObjectType, ObjectID, SequenceNumber, SuiAddress},
     config,
     digests::{ObjectDigest, TransactionDigest},
     dynamic_field::DynamicFieldInfo,
@@ -39,7 +40,6 @@ use sui_types::{
     in_memory_storage::InMemoryStorage,
     object::{MoveObject, Object, Owner},
     storage::ChildObjectResolver,
-    TypeTag,
 };
 
 const E_COULD_NOT_GENERATE_EFFECTS: u64 = 0;
@@ -56,6 +56,7 @@ type Set<K> = IndexSet<K>;
 /// writing) while hiding mutability.
 #[derive(Tid)]
 pub struct InMemoryTestStore(pub &'static LocalKey<RefCell<InMemoryStorage>>);
+impl<'a> NativeExtensionMarker<'a> for &'a InMemoryTestStore {}
 
 impl ChildObjectResolver for InMemoryTestStore {
     fn read_child_object(
@@ -74,8 +75,6 @@ impl ChildObjectResolver for InMemoryTestStore {
         receiving_object_id: &ObjectID,
         receive_object_at_version: SequenceNumber,
         epoch_id: sui_types::committee::EpochId,
-        // TODO: Delete this parameter once table migration is complete.
-        use_object_per_epoch_marker_table_v2: bool,
     ) -> sui_types::error::SuiResult<Option<Object>> {
         self.0.with_borrow(|store| {
             store.get_object_received_at_version(
@@ -83,7 +82,6 @@ impl ChildObjectResolver for InMemoryTestStore {
                 receiving_object_id,
                 receive_object_at_version,
                 epoch_id,
-                use_object_per_epoch_marker_table_v2,
             )
         })
     }
@@ -99,7 +97,7 @@ pub fn end_transaction(
 ) -> PartialVMResult<NativeResult> {
     assert!(ty_args.is_empty());
     assert!(args.is_empty());
-    let object_runtime_ref: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let object_runtime_ref: &mut ObjectRuntime = get_extension_mut!(context)?;
     let taken_shared_or_imm: BTreeMap<_, _> = object_runtime_ref
         .test_inventories
         .taken
@@ -117,7 +115,7 @@ pub fn end_transaction(
     // * Remove all allocated_tickets in the test inventories.
     // * For each allocated ticket, if the ticket's object ID is loaded, move it to `received`.
     // * Otherwise re-insert the allocated ticket into the objects inventory, and mark it to be
-    //   removed from the backing storage (deferred due to needing to have acces to `context` which
+    //   removed from the backing storage (deferred due to needing to have access to `context` which
     //   has outstanding references at this point).
     let allocated_tickets =
         std::mem::take(&mut object_runtime_ref.test_inventories.allocated_tickets);
@@ -139,7 +137,7 @@ pub fn end_transaction(
 
     let object_runtime_state = object_runtime_ref.take_state();
     // Determine writes and deletes
-    // We pass the received objects since they should be viewed as "loaded" for the purposes of of
+    // We pass the received objects since they should be viewed as "loaded" for the purposes of
     // calculating the effects of the transaction.
     let results = object_runtime_state.finish(received, ChildObjectEffects::empty());
     let RuntimeResults {
@@ -148,6 +146,9 @@ pub fn end_transaction(
         loaded_child_objects: _,
         created_object_ids,
         deleted_object_ids,
+        accumulator_events: _,
+        settlement_input_sui: _,
+        settlement_output_sui: _,
     } = match results {
         Ok(res) => res,
         Err(_) => {
@@ -157,7 +158,7 @@ pub fn end_transaction(
             ));
         }
     };
-    let object_runtime_ref: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let object_runtime_ref: &mut ObjectRuntime = get_extension_mut!(context)?;
     let all_active_child_objects_with_values = object_runtime_ref
         .all_active_child_objects()
         .filter(|child| child.copied_value.is_some())
@@ -232,12 +233,10 @@ pub fn end_transaction(
                     .or_default()
                     .insert(id);
             }
-            Owner::ConsensusV2 { authenticator, .. } => {
-                // Treat ConsensusV2 objects the same as address-owned for now. This will have
-                // to be revisited when other Authenticators are added.
+            Owner::ConsensusAddressOwner { owner, .. } => {
                 inventories
                     .address_inventories
-                    .entry(*authenticator.as_single_owner())
+                    .entry(owner)
                     .or_default()
                     .entry(ty)
                     .or_default()
@@ -247,7 +246,7 @@ pub fn end_transaction(
     }
 
     // For any unused allocated tickets, remove them from the store.
-    let store: &&InMemoryTestStore = context.extensions().get();
+    let store: &&InMemoryTestStore = get_extension!(context)?;
     for id in unreceived {
         if store
             .0
@@ -272,7 +271,7 @@ pub fn end_transaction(
     }
     // find all wrapped objects
     let mut all_wrapped = BTreeSet::new();
-    let object_runtime_ref: &ObjectRuntime = context.extensions().get();
+    let object_runtime_ref: &ObjectRuntime = get_extension!(context)?;
     find_all_wrapped_objects(
         context,
         &mut all_wrapped,
@@ -306,17 +305,17 @@ pub fn end_transaction(
     }
 
     // new input objects are remaining taken objects not written/deleted
-    let object_runtime_ref: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let object_runtime_ref: &mut ObjectRuntime = get_extension_mut!(context)?;
     let mut config_settings = vec![];
     for child in object_runtime_ref.all_active_child_objects() {
-        let s: StructTag = child.move_type.clone().into();
+        let s: StructTag = child.ty.clone().into();
         let is_setting = DynamicFieldInfo::is_dynamic_field(&s)
             && matches!(&s.type_params[1], TypeTag::Struct(s) if config::is_setting(s));
         if is_setting {
             config_settings.push((
                 *child.owner,
                 *child.id,
-                child.move_type.clone(),
+                child.ty.clone(),
                 child.copied_value,
             ));
         }
@@ -339,13 +338,12 @@ pub fn end_transaction(
             .taken_immutable_values
             .get(&ty)
             .and_then(|values| values.get(&id))
+            && !value.equals(prev_value)?
         {
-            if !value.equals(prev_value)? {
-                return Ok(NativeResult::err(
-                    legacy_test_cost(),
-                    E_INVALID_SHARED_OR_IMMUTABLE_USAGE,
-                ));
-            }
+            return Ok(NativeResult::err(
+                legacy_test_cost(),
+                E_INVALID_SHARED_OR_IMMUTABLE_USAGE,
+            ));
         }
         object_runtime_ref
             .test_inventories
@@ -367,6 +365,7 @@ pub fn end_transaction(
         deleted,
         transferred,
         user_events.len() as u64,
+        // TODO: do we need accumulator events here?
     );
     Ok(NativeResult::ok(legacy_test_cost(), smallvec![effects]))
 }
@@ -382,14 +381,15 @@ pub fn take_from_address_by_id(
     let account: SuiAddress = pop_arg!(args, AccountAddress).into();
     pop_arg!(args, StructRef);
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let specified_obj_ty = object_type_of_type(context, &specified_ty)?;
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let res = take_from_inventory(
         |x| {
             inventories
                 .address_inventories
                 .get(&account)
-                .and_then(|inv| inv.get(&specified_ty))
+                .and_then(|inv| inv.get(&specified_obj_ty))
                 .map(|s| s.contains(x))
                 .unwrap_or(false)
         },
@@ -414,15 +414,16 @@ pub fn ids_for_address(
     let specified_ty = get_specified_ty(ty_args);
     let account: SuiAddress = pop_arg!(args, AccountAddress).into();
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let specified_obj_ty = object_type_of_type(context, &specified_ty)?;
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let ids = inventories
         .address_inventories
         .get(&account)
-        .and_then(|inv| inv.get(&specified_ty))
+        .and_then(|inv| inv.get(&specified_obj_ty))
         .map(|s| s.iter().map(|id| pack_id(*id)).collect::<Vec<Value>>())
         .unwrap_or_default();
-    let ids_vector = Value::vector_for_testing_only(ids);
+    let ids_vector = Vector::pack(VectorSpecialization::Container, ids).unwrap();
     Ok(NativeResult::ok(legacy_test_cost(), smallvec![ids_vector]))
 }
 
@@ -435,11 +436,12 @@ pub fn most_recent_id_for_address(
     let specified_ty = get_specified_ty(ty_args);
     let account: SuiAddress = pop_arg!(args, AccountAddress).into();
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let specified_obj_ty = object_type_of_type(context, &specified_ty)?;
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let most_recent_id = match inventories.address_inventories.get(&account) {
-        None => pack_option(None),
-        Some(inv) => most_recent_at_ty(&inventories.taken, inv, specified_ty),
+        None => pack_option(vector_specialization(&specified_ty), None),
+        Some(inv) => most_recent_at_ty(&inventories.taken, inv, &specified_ty, specified_obj_ty),
     };
     Ok(NativeResult::ok(
         legacy_test_cost(),
@@ -457,7 +459,7 @@ pub fn was_taken_from_address(
     let id = pop_id(&mut args)?;
     let account: SuiAddress = pop_arg!(args, AccountAddress).into();
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let was_taken = inventories
         .taken
@@ -480,13 +482,14 @@ pub fn take_immutable_by_id(
     let id = pop_id(&mut args)?;
     pop_arg!(args, StructRef);
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let specified_obj_ty = object_type_of_type(context, &specified_ty)?;
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let res = take_from_inventory(
         |x| {
             inventories
                 .immutable_inventory
-                .get(&specified_ty)
+                .get(&specified_obj_ty)
                 .map(|s| s.contains(x))
                 .unwrap_or(false)
         },
@@ -500,7 +503,7 @@ pub fn take_immutable_by_id(
         Ok(value) => {
             inventories
                 .taken_immutable_values
-                .entry(specified_ty)
+                .entry(specified_obj_ty)
                 .or_default()
                 .insert(id, value.copy_value().unwrap());
             NativeResult::ok(legacy_test_cost(), smallvec![value])
@@ -517,12 +520,14 @@ pub fn most_recent_immutable_id(
 ) -> PartialVMResult<NativeResult> {
     let specified_ty = get_specified_ty(ty_args);
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let specified_obj_ty = object_type_of_type(context, &specified_ty)?;
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let most_recent_id = most_recent_at_ty(
         &inventories.taken,
         &inventories.immutable_inventory,
-        specified_ty,
+        &specified_ty,
+        specified_obj_ty,
     );
     Ok(NativeResult::ok(
         legacy_test_cost(),
@@ -539,7 +544,7 @@ pub fn was_taken_immutable(
     assert!(ty_args.is_empty());
     let id = pop_id(&mut args)?;
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let was_taken = inventories
         .taken
@@ -562,13 +567,14 @@ pub fn take_shared_by_id(
     let id = pop_id(&mut args)?;
     pop_arg!(args, StructRef);
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let specified_obj_ty = object_type_of_type(context, &specified_ty)?;
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let res = take_from_inventory(
         |x| {
             inventories
                 .shared_inventory
-                .get(&specified_ty)
+                .get(&specified_obj_ty)
                 .map(|s| s.contains(x))
                 .unwrap_or(false)
         },
@@ -592,12 +598,14 @@ pub fn most_recent_id_shared(
 ) -> PartialVMResult<NativeResult> {
     let specified_ty = get_specified_ty(ty_args);
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let specified_obj_ty = object_type_of_type(context, &specified_ty)?;
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let most_recent_id = most_recent_at_ty(
         &inventories.taken,
         &inventories.shared_inventory,
-        specified_ty,
+        &specified_ty,
+        specified_obj_ty,
     );
     Ok(NativeResult::ok(
         legacy_test_cost(),
@@ -614,7 +622,7 @@ pub fn was_taken_shared(
     assert!(ty_args.is_empty());
     let id = pop_id(&mut args)?;
     assert!(args.is_empty());
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     let was_taken = inventories
         .taken
@@ -642,7 +650,7 @@ pub fn allocate_receiving_ticket_for_object(
             E_UNABLE_TO_ALLOCATE_RECEIVING_TICKET,
         ));
     };
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let object_version = SequenceNumber::new();
     let inventories = &mut object_runtime.test_inventories;
     if inventories.allocated_tickets.contains_key(&id) {
@@ -653,7 +661,7 @@ pub fn allocate_receiving_ticket_for_object(
     }
 
     let obj_value = inventories.objects.remove(&id).unwrap();
-    let Some(bytes) = obj_value.simple_serialize(&layout) else {
+    let Some(bytes) = obj_value.typed_serialize(&layout) else {
         return Ok(NativeResult::err(
             context.gas_used(),
             E_UNABLE_TO_ALLOCATE_RECEIVING_TICKET,
@@ -703,7 +711,7 @@ pub fn allocate_receiving_ticket_for_object(
     );
 
     // NB: Must be a `&&` reference since the extension stores a static ref to the object storage.
-    let store: &&InMemoryTestStore = context.extensions().get();
+    let store: &&InMemoryTestStore = get_extension!(context)?;
     store.0.with_borrow_mut(|store| store.insert_object(object));
 
     Ok(NativeResult::ok(
@@ -719,7 +727,7 @@ pub fn deallocate_receiving_ticket_for_object(
 ) -> PartialVMResult<NativeResult> {
     let id = pop_id(&mut args)?;
 
-    let object_runtime: &mut ObjectRuntime = context.extensions_mut().get_mut();
+    let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let inventories = &mut object_runtime.test_inventories;
     // Deallocate the ticket -- we should never hit this scenario
     let Some((_, value)) = inventories.allocated_tickets.remove(&id) else {
@@ -734,7 +742,7 @@ pub fn deallocate_receiving_ticket_for_object(
     inventories.objects.insert(id, value);
 
     // Remove the object from storage. We should never hit this scenario either.
-    let store: &&InMemoryTestStore = context.extensions().get();
+    let store: &&InMemoryTestStore = get_extension!(context)?;
     if store
         .0
         .with_borrow_mut(|store| store.remove_object(id).is_none())
@@ -772,21 +780,35 @@ fn take_from_inventory(
     Ok(obj.copy_value().unwrap())
 }
 
+fn vector_specialization(ty: &Type) -> VectorSpecialization {
+    match ty.try_into() {
+        Ok(s) => s,
+        Err(_) => {
+            debug_assert!(false, "Invalid vector specialization");
+            VectorSpecialization::Container
+        }
+    }
+}
+
 fn most_recent_at_ty(
     taken: &BTreeMap<ObjectID, Owner>,
-    inv: &BTreeMap<Type, Set<ObjectID>>,
-    ty: Type,
+    inv: &BTreeMap<MoveObjectType, Set<ObjectID>>,
+    runtime_ty: &Type,
+    ty: MoveObjectType,
 ) -> Value {
-    pack_option(most_recent_at_ty_opt(taken, inv, ty))
+    pack_option(
+        vector_specialization(runtime_ty),
+        most_recent_at_ty_opt(taken, inv, ty),
+    )
 }
 
 fn most_recent_at_ty_opt(
     taken: &BTreeMap<ObjectID, Owner>,
-    inv: &BTreeMap<Type, Set<ObjectID>>,
-    ty: Type,
+    inv: &BTreeMap<MoveObjectType, Set<ObjectID>>,
+    ty: MoveObjectType,
 ) -> Option<Value> {
     let s = inv.get(&ty)?;
-    let most_recent_id = s.iter().filter(|id| !taken.contains_key(id)).last()?;
+    let most_recent_id = s.iter().filter(|id| !taken.contains_key(id)).next_back()?;
     Some(pack_id(*most_recent_id))
 }
 
@@ -801,7 +823,7 @@ fn pop_id(args: &mut VecDeque<Value>) -> PartialVMResult<ObjectID> {
         None => {
             return Err(PartialVMError::new(
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-            ))
+            ));
         }
         Some(v) => v,
     };
@@ -815,15 +837,23 @@ fn pack_id(a: impl Into<AccountAddress>) -> Value {
 }
 
 fn pack_ids(items: impl IntoIterator<Item = impl Into<AccountAddress>>) -> Value {
-    Value::vector_for_testing_only(items.into_iter().map(pack_id))
+    Vector::pack(
+        VectorSpecialization::Container,
+        items.into_iter().map(pack_id),
+    )
+    .unwrap()
 }
 
 fn pack_vec_map(items: impl IntoIterator<Item = (Value, Value)>) -> Value {
-    Value::struct_(values::Struct::pack(vec![Value::vector_for_testing_only(
-        items
-            .into_iter()
-            .map(|(k, v)| Value::struct_(values::Struct::pack(vec![k, v]))),
-    )]))
+    Value::struct_(values::Struct::pack(vec![
+        Vector::pack(
+            VectorSpecialization::Container,
+            items
+                .into_iter()
+                .map(|(k, v)| Value::struct_(values::Struct::pack(vec![k, v]))),
+        )
+        .unwrap(),
+    ]))
 }
 
 fn transaction_effects(
@@ -845,12 +875,9 @@ fn transaction_effects(
             Owner::ObjectOwner(o) => transferred_to_object.push((pack_id(id), pack_id(o))),
             Owner::Shared { .. } => shared.push(id),
             Owner::Immutable => frozen.push(id),
-            // Treat ConsensusV2 objects the same as address-owned for now. This will have
-            // to be revisited when other Authenticators are added.
-            Owner::ConsensusV2 { authenticator, .. } => transferred_to_account.push((
-                pack_id(id),
-                Value::address((*authenticator.as_single_owner()).into()),
-            )),
+            Owner::ConsensusAddressOwner { owner, .. } => {
+                transferred_to_account.push((pack_id(id), Value::address(owner.into())))
+            }
         }
     }
 
@@ -874,20 +901,29 @@ fn transaction_effects(
     ]))
 }
 
-fn pack_option(opt: Option<Value>) -> Value {
+fn object_type_of_type(context: &NativeContext, ty: &Type) -> PartialVMResult<MoveObjectType> {
+    let TypeTag::Struct(s_tag) = context.type_to_type_tag(ty)? else {
+        return Err(PartialVMError::new(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+        ));
+    };
+    Ok(MoveObjectType::from(*s_tag))
+}
+
+fn pack_option(specialization: VectorSpecialization, opt: Option<Value>) -> Value {
     let item = match opt {
         Some(v) => vec![v],
         None => vec![],
     };
-    Value::struct_(values::Struct::pack(vec![Value::vector_for_testing_only(
-        item,
-    )]))
+    Value::struct_(values::Struct::pack(vec![
+        Vector::pack(specialization, item).unwrap(),
+    ]))
 }
 
 fn find_all_wrapped_objects<'a, 'i>(
     context: &NativeContext,
     ids: &'i mut BTreeSet<ObjectID>,
-    new_object_values: impl IntoIterator<Item = (&'a ObjectID, &'a Type, impl Borrow<Value>)>,
+    new_object_values: impl IntoIterator<Item = (&'a ObjectID, &'a MoveObjectType, impl Borrow<Value>)>,
 ) {
     #[derive(Copy, Clone)]
     enum LookingFor {
@@ -963,17 +999,24 @@ fn find_all_wrapped_objects<'a, 'i>(
 
     let uid = UID::layout();
     for (_id, ty, value) in new_object_values {
-        let Ok(Some(layout)) = context.type_to_type_layout(ty) else {
+        let type_tag = TypeTag::from(ty.clone());
+        // NB: We can get the layout from the VM's cache since the types and modules
+        // associated with all of these types must be in the type/module cache in the VM -- THIS IS
+        // BECAUSE WE ARE IN TEST SCENARIO ONLY AND THIS MAY NOT GENERALLY HOLD IN A
+        // MULTI-TRANSACTION SETTING.
+        let Ok(Some(layout)) = context.type_tag_to_layout_for_test_scenario_only(&type_tag) else {
             debug_assert!(false);
             continue;
         };
 
-        let Ok(Some(annotated_layout)) = context.type_to_fully_annotated_layout(ty) else {
+        let Ok(Some(annotated_layout)) =
+            context.type_tag_to_fully_annotated_layout_for_test_scenario_only(&type_tag)
+        else {
             debug_assert!(false);
             continue;
         };
 
-        let blob = value.borrow().simple_serialize(&layout).unwrap();
+        let blob = value.borrow().typed_serialize(&layout).unwrap();
         MoveValue::visit_deserialize(
             &blob,
             &annotated_layout,

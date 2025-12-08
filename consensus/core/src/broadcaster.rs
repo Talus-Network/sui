@@ -8,11 +8,11 @@ use std::{
 };
 
 use consensus_config::AuthorityIndex;
-use futures::{stream::FuturesUnordered, StreamExt as _};
+use futures::{StreamExt as _, stream::FuturesUnordered};
 use tokio::{
     sync::broadcast,
     task::JoinSet,
-    time::{error::Elapsed, sleep_until, timeout, Instant},
+    time::{Instant, error::Elapsed, sleep_until, timeout},
 };
 use tracing::{trace, warn};
 
@@ -165,11 +165,10 @@ impl Broadcaster {
                 }
 
                 _ = retry_timer.tick() => {
-                    if requests.is_empty() {
-                        if let Some(block) = last_block.clone() {
+                    if requests.is_empty()
+                        && let Some(block) = last_block.clone() {
                             requests.push(send_block(network_client.clone(), peer, rtt_estimate, block));
                         }
-                    }
                 }
             };
 
@@ -192,16 +191,16 @@ mod test {
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use consensus_types::block::{BlockRef, Round};
     use parking_lot::Mutex;
     use tokio::time::sleep;
 
     use super::*;
     use crate::{
-        block::{BlockRef, ExtendedBlock, TestBlock},
+        block::{ExtendedBlock, TestBlock},
         commit::CommitRange,
         core::CoreSignals,
         network::BlockStream,
-        Round,
     };
 
     struct FakeNetworkClient {
@@ -253,6 +252,7 @@ mod test {
             _peer: AuthorityIndex,
             _block_refs: Vec<BlockRef>,
             _highest_accepted_rounds: Vec<Round>,
+            _breadth_first: bool,
             _timeout: Duration,
         ) -> ConsensusResult<Vec<Bytes>> {
             unimplemented!("Unimplemented")

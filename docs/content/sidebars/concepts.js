@@ -3,6 +3,7 @@
 
 const concepts = [
 	'concepts',
+	'concepts/sui-for-ethereum',
 	'concepts/components',
 	{
 		type: 'category',
@@ -30,6 +31,7 @@ const concepts = [
 						items: [
 							'concepts/object-ownership/address-owned',
 							'concepts/object-ownership/immutable',
+							'concepts/object-ownership/party',
 							'concepts/object-ownership/shared',
 							'concepts/object-ownership/wrapped',
 						],
@@ -41,7 +43,9 @@ const concepts = [
 							type: 'doc',
 							id: 'concepts/transfers',
 						},
-						items: ['concepts/transfers/custom-rules', 'concepts/transfers/transfer-to-object'],
+						items: ['concepts/transfers/custom-rules', 
+								'concepts/transfers/transfer-policies',
+							    'concepts/transfers/transfer-to-object'],
 					},
 					'concepts/versioning',
 				],
@@ -67,7 +71,18 @@ const concepts = [
 							'concepts/sui-move-concepts/packages/automated-address-management',
 						],
 					},
-					'concepts/sui-move-concepts/conventions',
+					{
+						type: 'category',
+						label: 'Dynamic Fields',
+						link: {
+							type: 'doc',
+							id: 'concepts/dynamic-fields',
+						},
+						items: ['concepts/dynamic-fields/tables-bags'],
+					},
+					'concepts/sui-move-concepts/derived-objects',
+					'concepts/sui-move-concepts/conventions'
+					
 				],
 			},
 			{
@@ -83,8 +98,29 @@ const concepts = [
 					'concepts/transactions/gas-smashing',
 				],
 			},
-			'concepts/graphql-rpc',
+			'concepts/gaming'
 		],
+	},
+	{
+		type: 'category',
+		label: 'Data access',
+		items: [
+			'concepts/grpc-overview',
+			{ 
+				type: 'category',
+				label: 'GraphQL and Indexer Framework',
+				link: {
+					type: 'doc',
+					id: 'concepts/graphql-indexer',
+				},
+				items: [
+					'concepts/graphql-rpc',
+					'concepts/custom-indexing-framework',
+					'concepts/custom-indexer/pipeline-architecture'
+				]
+			},
+			'concepts/archival-store'
+		]
 	},
 	{
 		type: 'category',
@@ -111,6 +147,18 @@ const concepts = [
 			},
 			'concepts/cryptography/zklogin',
 			'concepts/cryptography/passkeys',
+			{
+				type: 'category',
+				label: 'Nautilus',
+				link: {
+					type: 'doc',
+					id: 'concepts/cryptography/nautilus',
+				},
+				items: [
+					'concepts/cryptography/nautilus/nautilus-design',
+					'concepts/cryptography/nautilus/using-nautilus',
+				],
+			},
 			'concepts/cryptography/system/checkpoint-verification',
 			/*{
 				type: 'category',
@@ -164,4 +212,4 @@ const concepts = [
 	},
 	'concepts/research-papers',
 ];
-module.exports = concepts;
+export default concepts;

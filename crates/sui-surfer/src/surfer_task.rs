@@ -3,14 +3,14 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use sui_core::authority::authority_store_tables::LiveObject;
 use sui_types::{
     base_types::{ObjectRef, SuiAddress},
     object::Owner,
 };
 use test_cluster::TestCluster;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 
 use crate::{
     surf_strategy::SurfStrategy,
@@ -49,7 +49,7 @@ impl SurferTask {
             .unwrap();
         let all_live_objects: Vec<_> = node.with(|node| {
             node.state()
-                .get_accumulator_store()
+                .get_global_state_hash_store()
                 .iter_cached_live_object_set_for_testing(false)
                 .collect()
         });
@@ -70,8 +70,8 @@ impl SurferTask {
                             Owner::Shared {
                                 initial_shared_version,
                             }
-                            // TODO: Implement full support for ConsensusV2 objects in sui-surfer.
-                            | Owner::ConsensusV2 {
+                            // TODO: Implement full support for ConsensusAddressOwner objects in sui-surfer.
+                            | Owner::ConsensusAddressOwner {
                                 start_version: initial_shared_version,
                                 ..
                             } => {
@@ -108,7 +108,7 @@ impl SurferTask {
             .into_iter()
             .enumerate()
             .map(|(id, (address, (gas_object, owned_objects)))| {
-                let seed = rng.gen::<u64>();
+                let seed = rng.r#gen::<u64>();
                 let state_rng = StdRng::seed_from_u64(seed);
                 let state = SurferState::new(
                     id,

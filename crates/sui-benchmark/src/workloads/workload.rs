@@ -1,14 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::ValidatorProxy;
 use crate::system_state_observer::SystemStateObserver;
 use crate::workloads::payload::Payload;
 use crate::workloads::{Gas, GasCoinConfig};
-use crate::ValidatorProxy;
 use anyhow::anyhow;
 use async_trait::async_trait;
-use rand::distributions::{Distribution, Standard};
 use rand::Rng;
+use rand::distributions::{Distribution, Standard};
 use std::str::FromStr;
 use std::sync::Arc;
 use strum::{EnumCount, IntoEnumIterator};
@@ -115,4 +115,5 @@ pub trait Workload<T: Payload + ?Sized>: Send + Sync + std::fmt::Debug {
         proxy: Arc<dyn ValidatorProxy + Sync + Send>,
         system_state_observer: Arc<SystemStateObserver>,
     ) -> Vec<Box<T>>;
+    fn name(&self) -> &str;
 }

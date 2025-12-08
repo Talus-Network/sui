@@ -1,22 +1,24 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use anyhow::Context as _;
 use diesel::prelude::*;
 use diesel::sql_types::Bool;
 use futures::future;
-use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use jsonrpsee::{core::RpcResult, http_client::HttpClient, proc_macros::rpc};
 use move_core_types::language_storage::{StructTag, TypeTag};
 use serde::{Deserialize, Serialize};
+use sui_indexer_alt_reader::coin_metadata::CoinMetadataKey;
 use sui_indexer_alt_schema::objects::StoredCoinOwnerKind;
 use sui_indexer_alt_schema::schema::coin_balance_buckets;
 use sui_json_rpc_types::{Balance, Coin, Page as PageResponse, SuiCoinMetadata};
 use sui_open_rpc::Module;
 use sui_open_rpc_macros::open_rpc;
 use sui_sql_macro::sql;
+use sui_types::coin::CoinMetadata;
+use sui_types::coin_registry::Currency;
 use sui_types::object::Object;
 use sui_types::{
     base_types::{ObjectID, SuiAddress},
@@ -24,9 +26,10 @@ use sui_types::{
 };
 
 use crate::{
+    config::NodeConfig,
     context::Context,
-    data::{coin_metadata::CoinMetadataKey, objects::load_latest},
-    error::{invalid_params, InternalContext, RpcError},
+    data::load_live,
+    error::{InternalContext, RpcError, client_error_to_error_object, invalid_params},
     paginate::{BcsCursor, Cursor as _, Page},
 };
 
@@ -50,14 +53,6 @@ trait CoinsApi {
         limit: Option<usize>,
     ) -> RpcResult<PageResponse<Coin, String>>;
 
-    /// Return the total coin balance for all coin types, owned by the address owner.
-    #[method(name = "getAllBalances")]
-    async fn get_all_balances(
-        &self,
-        /// the owner's Sui address
-        owner: SuiAddress,
-    ) -> RpcResult<Vec<Balance>>;
-
     /// Return metadata (e.g., symbol, decimals) for a coin. Note that if the coin's metadata was
     /// wrapped in the transaction that published its marker type, or the latest version of the
     /// metadata object is wrapped or deleted, it will not be found.
@@ -69,7 +64,32 @@ trait CoinsApi {
     ) -> RpcResult<Option<SuiCoinMetadata>>;
 }
 
+/// Delegation Coin API for endpoints that are delegated to FN RPC
+#[open_rpc(namespace = "suix", tag = "Delegation Coin API")]
+#[rpc(server, client, namespace = "suix")]
+trait DelegationCoinsApi {
+    /// Return the total coin balance for all coin types, owned by the address owner.
+    #[method(name = "getAllBalances")]
+    async fn get_all_balances(
+        &self,
+        /// the owner's Sui address
+        owner: SuiAddress,
+    ) -> RpcResult<Vec<Balance>>;
+
+    /// Return the total coin balance for one coin type, owned by the address.
+    /// If no coin type is specified, SUI coin balance is returned.
+    #[method(name = "getBalance")]
+    async fn get_balance(
+        &self,
+        /// the owner's Sui address
+        owner: SuiAddress,
+        /// optional type names for the coin (e.g., 0x168da5bf1f48dafc111b0a488fa454aca95e0b5e::usdc::USDC), default to 0x2::sui::SUI if not specified.
+        coin_type: Option<String>,
+    ) -> RpcResult<Balance>;
+}
+
 pub(crate) struct Coins(pub Context);
+pub(crate) struct DelegationCoins(HttpClient);
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum Error {
@@ -89,6 +109,13 @@ struct BalanceCursor {
 }
 
 type Cursor = BcsCursor<BalanceCursor>;
+
+impl DelegationCoins {
+    pub fn new(fullnode_rpc_url: url::Url, config: NodeConfig) -> anyhow::Result<Self> {
+        let client = config.client(fullnode_rpc_url)?;
+        Ok(Self(client))
+    }
+}
 
 #[async_trait::async_trait]
 impl CoinsApiServer for Coins {
@@ -136,55 +163,65 @@ impl CoinsApiServer for Coins {
         })
     }
 
-    async fn get_all_balances(&self, owner: SuiAddress) -> RpcResult<Vec<Balance>> {
-        let Self(ctx) = self;
-        let coin_ids = filter_coins(ctx, owner, None, None).await?;
-        let coin_futures = coin_ids
-            .data
-            .iter()
-            .map(|id| object_with_coin_data(ctx, *id));
-        let coins = future::join_all(coin_futures)
-            .await
-            .into_iter()
-            .zip(coin_ids.data)
-            .map(|(r, c)| {
-                let id = c;
-                r.with_internal_context(|| format!("Failed to get object {id}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Using a BTreeMap so that the ordering of keys is deterministic.
-        let mut balance_map: BTreeMap<String, (usize, u128)> = BTreeMap::new();
-        for (_, coin_type, balance) in coins {
-            let entry = balance_map.entry(coin_type).or_insert((0, 0));
-            entry.0 += 1;
-            entry.1 += balance as u128;
-        }
-        let balances: Vec<Balance> = balance_map
-            .into_iter()
-            .map(|(coin_type, (coin_object_count, total_balance))| Balance {
-                coin_type,
-                coin_object_count,
-                total_balance,
-                // LockedCoin is deprecated
-                locked_balance: HashMap::new(),
-            })
-            .collect();
-        Ok(balances)
-    }
-
     async fn get_coin_metadata(&self, coin_type: String) -> RpcResult<Option<SuiCoinMetadata>> {
         let Self(ctx) = self;
 
-        Ok(coin_metadata_response(ctx, &coin_type)
+        if let Some(currency) = coin_registry_response(ctx, &coin_type)
             .await
-            .with_internal_context(|| format!("Failed to fetch CoinMetadata for {coin_type:?}"))?)
+            .with_internal_context(|| format!("Failed to fetch Currency for {coin_type:?}"))?
+        {
+            return Ok(Some(currency));
+        }
+
+        if let Some(metadata) = coin_metadata_response(ctx, &coin_type)
+            .await
+            .with_internal_context(|| format!("Failed to fetch CoinMetadata for {coin_type:?}"))?
+        {
+            return Ok(Some(metadata));
+        }
+
+        Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl DelegationCoinsApiServer for DelegationCoins {
+    async fn get_all_balances(&self, owner: SuiAddress) -> RpcResult<Vec<Balance>> {
+        let Self(client) = self;
+
+        client
+            .get_all_balances(owner)
+            .await
+            .map_err(client_error_to_error_object)
+    }
+
+    async fn get_balance(
+        &self,
+        owner: SuiAddress,
+        coin_type: Option<String>,
+    ) -> RpcResult<Balance> {
+        let Self(client) = self;
+
+        client
+            .get_balance(owner, coin_type)
+            .await
+            .map_err(client_error_to_error_object)
     }
 }
 
 impl RpcModule for Coins {
     fn schema(&self) -> Module {
         CoinsApiOpenRpc::module_doc()
+    }
+
+    fn into_impl(self) -> jsonrpsee::RpcModule<Self> {
+        self.into_rpc()
+    }
+}
+
+impl RpcModule for DelegationCoins {
+    fn schema(&self) -> Module {
+        DelegationCoinsApiOpenRpc::module_doc()
     }
 
     fn into_impl(self) -> jsonrpsee::RpcModule<Self> {
@@ -327,6 +364,33 @@ async fn coin_response(ctx: &Context, id: ObjectID) -> Result<Coin, RpcError<Err
     })
 }
 
+async fn coin_registry_response(
+    ctx: &Context,
+    coin_type: &str,
+) -> Result<Option<SuiCoinMetadata>, RpcError<Error>> {
+    let coin_type = TypeTag::from_str(coin_type)
+        .map_err(|e| invalid_params(Error::BadType(coin_type.to_owned(), e)))?;
+
+    let currency_id = Currency::derive_object_id(coin_type)
+        .context("Failed to derive object id for coin registry Currency")?;
+
+    let Some(object) = load_live(ctx, currency_id)
+        .await
+        .context("Failed to load Currency object")?
+    else {
+        return Ok(None);
+    };
+
+    let Some(move_object) = object.data.try_as_move() else {
+        return Ok(None);
+    };
+
+    let currency: Currency =
+        bcs::from_bytes(move_object.contents()).context("Failed to parse Currency object")?;
+
+    Ok(Some(currency.into()))
+}
+
 async fn coin_metadata_response(
     ctx: &Context,
     coin_type: &str,
@@ -345,27 +409,30 @@ async fn coin_metadata_response(
 
     let id = ObjectID::from_bytes(&stored.object_id).context("Failed to parse ObjectID")?;
 
-    let Some(object) = load_latest(ctx, id)
+    let Some(object) = load_live(ctx, id)
         .await
         .context("Failed to load latest version of CoinMetadata")?
     else {
         return Ok(None);
     };
 
-    let coin_metadata = object
-        .try_into()
-        .context("Failed to parse object as CoinMetadata")?;
+    let Some(move_object) = object.data.try_as_move() else {
+        return Ok(None);
+    };
 
-    Ok(Some(coin_metadata))
+    let coin_metadata: CoinMetadata =
+        bcs::from_bytes(move_object.contents()).context("Failed to parse Currency object")?;
+
+    Ok(Some(coin_metadata.into()))
 }
 
 async fn object_with_coin_data(
     ctx: &Context,
     id: ObjectID,
 ) -> Result<(Object, String, u64), RpcError<Error>> {
-    let object = load_latest(ctx, id)
+    let object = load_live(ctx, id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("Failed to load latest object {}", id))?;
+        .with_context(|| format!("Failed to load latest object {id}"))?;
 
     let coin = object
         .as_coin_maybe()

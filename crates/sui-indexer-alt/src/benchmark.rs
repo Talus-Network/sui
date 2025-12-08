@@ -3,18 +3,19 @@
 
 use std::{path::PathBuf, time::Instant};
 
+use crate::{BootstrapGenesis, config::IndexerConfig, setup_indexer};
 use prometheus::Registry;
 use sui_indexer_alt_framework::{
-    db::{reset_database, DbArgs},
+    IndexerArgs,
     ingestion::ClientArgs,
-    Indexer, IndexerArgs,
+    postgres::{DbArgs, reset_database},
 };
 use sui_indexer_alt_schema::MIGRATIONS;
+use sui_indexer_alt_schema::checkpoints::StoredGenesis;
+use sui_indexer_alt_schema::epochs::StoredEpochStart;
 use sui_synthetic_ingestion::synthetic_ingestion::read_ingestion_data;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-
-use crate::{config::IndexerConfig, setup_indexer};
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct BenchmarkArgs {
@@ -44,12 +45,7 @@ pub async fn run_benchmark(
     let last_checkpoint = *ingestion_data.keys().last().unwrap();
     let num_transactions: usize = ingestion_data.values().map(|c| c.transactions.len()).sum();
 
-    reset_database(
-        database_url.clone(),
-        db_args.clone(),
-        Some(Indexer::migrations(Some(&MIGRATIONS))),
-    )
-    .await?;
+    reset_database(database_url.clone(), db_args.clone(), Some(&MIGRATIONS)).await?;
 
     let indexer_args = IndexerArgs {
         first_checkpoint: Some(first_checkpoint),
@@ -74,7 +70,20 @@ pub async fn run_benchmark(
         indexer_args,
         client_args,
         indexer_config,
-        false, /* with_genesis */
+        Some(BootstrapGenesis {
+            stored_genesis: StoredGenesis {
+                genesis_digest: [0u8; 32].to_vec(),
+                initial_protocol_version: 0,
+            },
+            stored_epoch_start: StoredEpochStart {
+                epoch: 0,
+                protocol_version: 0,
+                cp_lo: 0,
+                start_timestamp_ms: 0,
+                reference_gas_price: 0,
+                system_state: vec![],
+            },
+        }),
         &Registry::new(),
         CancellationToken::new(),
     )

@@ -8,11 +8,11 @@ use std::sync::Arc;
 use sui_protocol_config::ProtocolConfig;
 use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::base_types::{
-    random_object_ref, ExecutionDigests, ObjectID, SequenceNumber, VersionNumber,
+    ExecutionDigests, FullObjectRef, ObjectID, SequenceNumber, VersionNumber, random_object_ref,
 };
 use sui_types::committee::Committee;
 use sui_types::crypto::KeypairTraits;
-use sui_types::crypto::{get_key_pair, AccountKeyPair};
+use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::digests::{CheckpointContentsDigest, CheckpointDigest, TransactionDigest};
 use sui_types::effects::{
     TestEffectsBuilder, TransactionEffects, TransactionEffectsAPI, TransactionEvents,
@@ -34,7 +34,10 @@ fn random_tx() -> Transaction {
     let (sender, key): (_, AccountKeyPair) = get_key_pair();
     let gas = random_object_ref();
     TestTransactionBuilder::new(sender, gas, 1)
-        .transfer(random_object_ref(), sender)
+        .transfer(
+            FullObjectRef::from_fastpath_ref(random_object_ref()),
+            sender,
+        )
         .build_and_sign(&key)
 }
 
@@ -100,6 +103,7 @@ impl MockTxStore {
             Default::default(),
             None,
             0,
+            Vec::new(),
             Vec::new(),
         );
 
@@ -197,6 +201,13 @@ impl TransactionKeyValueStoreTrait for MockTxStore {
         version: VersionNumber,
     ) -> SuiResult<Option<Object>> {
         Ok(self.objects.get(&ObjectKey(object_id, version)).cloned())
+    }
+
+    async fn multi_get_objects(&self, object_keys: &[ObjectKey]) -> SuiResult<Vec<Option<Object>>> {
+        Ok(object_keys
+            .iter()
+            .map(|key| self.objects.get(key).cloned())
+            .collect())
     }
 
     async fn multi_get_transaction_checkpoint(
@@ -542,7 +553,7 @@ fn test_key_to_path_and_back() {
         key
     );
 
-    let key = Key::ObjectKey(ObjectID::random(), SequenceNumber::from_u64(42));
+    let key = Key::ObjectKey(ObjectKey(ObjectID::random(), SequenceNumber::from_u64(42)));
     let path_elts = key.to_path_elements();
     assert_eq!(
         path_elements_to_key(path_elts.0.as_str(), path_elts.1).unwrap(),

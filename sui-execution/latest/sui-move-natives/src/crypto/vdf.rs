@@ -1,11 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use crate::object_runtime::ObjectRuntime;
-use crate::NativesCostTable;
-use fastcrypto_vdf::class_group::discriminant::DISCRIMINANT_3072;
+use crate::{NativesCostTable, get_extension};
 use fastcrypto_vdf::class_group::QuadraticForm;
-use fastcrypto_vdf::vdf::wesolowski::DefaultVDF;
+use fastcrypto_vdf::class_group::discriminant::DISCRIMINANT_3072;
 use fastcrypto_vdf::vdf::VDF;
+use fastcrypto_vdf::vdf::wesolowski::DefaultVDF;
 use move_binary_format::errors::PartialVMResult;
 use move_core_types::gas_algebra::InternalGas;
 use move_core_types::vm_status::StatusCode;
@@ -23,12 +23,10 @@ use std::collections::VecDeque;
 pub const INVALID_INPUT_ERROR: u64 = 0;
 pub const NOT_SUPPORTED_ERROR: u64 = 1;
 
-fn is_supported(context: &NativeContext) -> bool {
-    context
-        .extensions()
-        .get::<ObjectRuntime>()
+fn is_supported(context: &NativeContext) -> PartialVMResult<bool> {
+    Ok(get_extension!(context, ObjectRuntime)?
         .protocol_config
-        .enable_vdf()
+        .enable_vdf())
 }
 
 #[derive(Clone)]
@@ -54,14 +52,12 @@ pub fn vdf_verify_internal(
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
     let cost = context.gas_used();
-    if !is_supported(context) {
+    if !is_supported(context)? {
         return Ok(NativeResult::err(cost, NOT_SUPPORTED_ERROR));
     }
 
     // Load the cost parameters from the protocol config
-    let cost_params = &context
-        .extensions()
-        .get::<NativesCostTable>()
+    let cost_params = get_extension!(context, NativesCostTable)?
         .vdf_cost_params
         .clone();
 
@@ -124,14 +120,12 @@ pub fn hash_to_input_internal(
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
     let cost = context.gas_used();
-    if !is_supported(context) {
+    if !is_supported(context)? {
         return Ok(NativeResult::err(cost, NOT_SUPPORTED_ERROR));
     }
 
     // Load the cost parameters from the protocol config
-    let cost_params = &context
-        .extensions()
-        .get::<NativesCostTable>()
+    let cost_params = get_extension!(context, NativesCostTable)?
         .vdf_cost_params
         .clone();
 

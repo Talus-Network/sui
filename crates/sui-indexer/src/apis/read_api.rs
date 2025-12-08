@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use async_trait::async_trait;
-use jsonrpsee::core::RpcResult;
 use jsonrpsee::RpcModule;
+use jsonrpsee::core::RpcResult;
 use sui_json_rpc::error::SuiRpcInputError;
 use sui_types::error::SuiObjectResponseError;
 use sui_types::object::ObjectRead;
@@ -11,7 +11,7 @@ use sui_types::object::ObjectRead;
 use crate::errors::IndexerError;
 use crate::indexer_reader::IndexerReader;
 use sui_json_rpc::SuiRpcModule;
-use sui_json_rpc_api::{ReadApiServer, QUERY_MAX_RESULT_LIMIT};
+use sui_json_rpc_api::{QUERY_MAX_RESULT_LIMIT, ReadApiServer};
 use sui_json_rpc_types::ZkLoginIntentScope;
 use sui_json_rpc_types::ZkLoginVerifyResult;
 use sui_json_rpc_types::{
@@ -64,7 +64,7 @@ impl ReadApiServer for ReadApi {
         options: Option<SuiObjectDataOptions>,
     ) -> RpcResult<SuiObjectResponse> {
         let object_read = self.inner.get_object_read(object_id).await?;
-        object_read_to_object_response(&self.inner, object_read, options.unwrap_or_default()).await
+        object_read_to_object_response(object_read, options.unwrap_or_default()).await
     }
 
     // For ease of implementation we just forward to the single object query, although in the
@@ -87,7 +87,7 @@ impl ReadApiServer for ReadApi {
             let object_read = stored_object
                 .try_into_object_read(self.inner.package_resolver())
                 .await?;
-            object_read_to_object_response(&self.inner, object_read, options.clone()).await
+            object_read_to_object_response(object_read, options.clone()).await
         });
 
         let mut objects = futures::future::try_join_all(futures).await?;
@@ -257,7 +257,6 @@ impl SuiRpcModule for ReadApi {
 }
 
 async fn object_read_to_object_response(
-    indexer_reader: &IndexerReader,
     object_read: ObjectRead,
     options: SuiObjectDataOptions,
 ) -> RpcResult<SuiObjectResponse> {
@@ -266,26 +265,14 @@ async fn object_read_to_object_response(
             SuiObjectResponseError::NotExists { object_id: id },
         )),
         ObjectRead::Exists(object_ref, o, layout) => {
-            let mut display_fields = None;
             if options.show_display {
-                match indexer_reader.get_display_fields(&o, &layout).await {
-                    Ok(rendered_fields) => display_fields = Some(rendered_fields),
-                    Err(e) => {
-                        return Ok(SuiObjectResponse::new(
-                            Some(
-                                (object_ref, o, layout, options, None)
-                                    .try_into()
-                                    .map_err(IndexerError::from)?,
-                            ),
-                            Some(SuiObjectResponseError::DisplayError {
-                                error: e.to_string(),
-                            }),
-                        ));
-                    }
-                }
+                return Err(IndexerError::NotSupportedError(
+                    "Display fields are not supported".to_owned(),
+                )
+                .into());
             }
             Ok(SuiObjectResponse::new_with_data(
-                (object_ref, o, layout, options, display_fields)
+                (object_ref, o, layout, options, None)
                     .try_into()
                     .map_err(IndexerError::from)?,
             ))

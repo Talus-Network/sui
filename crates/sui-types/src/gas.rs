@@ -3,19 +3,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub use checked::*;
+use serde::{Deserialize, Serialize};
+
+use crate::{base_types::ObjectID, gas_model::gas_v2::PerObjectStorage};
 
 #[sui_macros::with_checked_arithmetic]
 pub mod checked {
 
+    use crate::gas::GasUsageReport;
     use crate::gas_model::gas_predicates::gas_price_too_high;
     use crate::{
+        ObjectID,
         effects::{TransactionEffects, TransactionEffectsAPI},
         error::{ExecutionError, SuiResult, UserInputError, UserInputResult},
         gas_model::{gas_v2::SuiGasStatus as SuiGasStatusV2, tables::GasStatus},
         object::Object,
         sui_serde::{BigInt, Readable},
         transaction::ObjectReadResult,
-        ObjectID,
     };
     use enum_dispatch::enum_dispatch;
     use itertools::MultiUnzip;
@@ -29,10 +33,11 @@ pub mod checked {
         fn is_unmetered(&self) -> bool;
         fn move_gas_status(&self) -> &GasStatus;
         fn move_gas_status_mut(&mut self) -> &mut GasStatus;
-        fn bucketize_computation(&mut self) -> Result<(), ExecutionError>;
+        fn bucketize_computation(&mut self, aborted: Option<bool>) -> Result<(), ExecutionError>;
         fn summary(&self) -> GasCostSummary;
         fn gas_budget(&self) -> u64;
         fn gas_price(&self) -> u64;
+        fn reference_gas_price(&self) -> u64;
         fn storage_gas_units(&self) -> u64;
         fn storage_rebate(&self) -> u64;
         fn unmetered_storage_rebate(&self) -> u64;
@@ -48,6 +53,7 @@ pub mod checked {
         ) -> u64;
         fn charge_storage_and_rebate(&mut self) -> Result<(), ExecutionError>;
         fn adjust_computation_on_out_of_gas(&mut self);
+        fn gas_usage_report(&self) -> GasUsageReport;
     }
 
     /// Version aware enum for gas status.
@@ -231,7 +237,10 @@ pub mod checked {
             write!(
                 f,
                 "computation_cost: {}, storage_cost: {},  storage_rebate: {}, non_refundable_storage_fee: {}",
-                self.computation_cost, self.storage_cost, self.storage_rebate, self.non_refundable_storage_fee,
+                self.computation_cost,
+                self.storage_cost,
+                self.storage_rebate,
+                self.non_refundable_storage_fee,
             )
         }
     }
@@ -282,4 +291,16 @@ pub mod checked {
             })
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GasUsageReport {
+    pub cost_summary: GasCostSummary,
+    pub gas_used: u64,
+    pub gas_budget: u64,
+    pub gas_price: u64,
+    pub reference_gas_price: u64,
+    pub storage_gas_price: u64,
+    pub rebate_rate: u64,
+    pub per_object_storage: Vec<(ObjectID, PerObjectStorage)>,
 }

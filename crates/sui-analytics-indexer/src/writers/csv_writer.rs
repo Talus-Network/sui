@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::{fs, fs::File, path::PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use csv::{Writer, WriterBuilder};
 use serde::Serialize;
 
@@ -24,6 +24,7 @@ pub(crate) struct CSVWriter {
     writer: Writer<File>,
     epoch: EpochId,
     checkpoint_range: Range<u64>,
+    row_count: usize,
 }
 
 impl CSVWriter {
@@ -45,6 +46,7 @@ impl CSVWriter {
             writer,
             epoch: 0,
             checkpoint_range,
+            row_count: 0,
         })
     }
 
@@ -82,10 +84,13 @@ impl<S: Serialize + ParquetSchema> AnalyticsWriter<S> for CSVWriter {
         Ok(FileFormat::CSV)
     }
 
-    fn write(&mut self, rows: &[S]) -> Result<()> {
+    fn write(&mut self, rows: Box<dyn Iterator<Item = S> + Send + Sync>) -> Result<()> {
+        let mut count = 0;
         for row in rows {
             self.writer.serialize(row)?;
+            count += 1;
         }
+        self.row_count += count;
         Ok(())
     }
 
@@ -110,6 +115,7 @@ impl<S: Serialize + ParquetSchema> AnalyticsWriter<S> for CSVWriter {
             self.epoch,
             self.checkpoint_range.clone(),
         )?;
+        self.row_count = 0;
         Ok(())
     }
 
@@ -117,5 +123,9 @@ impl<S: Serialize + ParquetSchema> AnalyticsWriter<S> for CSVWriter {
         let file_path = self.file_path(self.epoch, self.checkpoint_range.clone())?;
         let len = fs::metadata(file_path)?.len();
         Ok(Some(len))
+    }
+
+    fn rows(&self) -> Result<usize> {
+        Ok(self.row_count)
     }
 }

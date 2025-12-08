@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{anyhow, Ok};
+use anyhow::{Ok, anyhow};
 use clap::{Parser, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Row, Table};
 use prometheus::Registry;
@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
 use strum_macros::EnumString;
-use sui_archival::reader::ArchiveReaderBalancer;
 use sui_config::node::AuthorityStorePruningConfig;
 use sui_core::authority::authority_per_epoch_store::AuthorityEpochTables;
 use sui_core::authority::authority_store_pruner::{
     AuthorityStorePruner, AuthorityStorePruningMetrics, EPOCH_DURATION_MS_FOR_TESTING,
+    PrunerWatermarks,
 };
 use sui_core::authority::authority_store_tables::AuthorityPerpetualTables;
 use sui_core::authority::authority_store_types::{StoreData, StoreObject};
@@ -24,7 +24,7 @@ use sui_core::jsonrpc_index::IndexStoreTables;
 use sui_core::rpc_index::RpcIndexStore;
 use sui_types::base_types::{EpochId, ObjectID};
 use tracing::info;
-use typed_store::rocks::{default_db_options, MetricConf};
+use typed_store::rocks::{MetricConf, default_db_options};
 use typed_store::rocksdb::MultiThreaded;
 use typed_store::traits::{Map, TableSummary};
 
@@ -101,23 +101,21 @@ pub fn print_table_metadata(
             if epoch_tables.contains_key(table_name) {
                 let epoch = epoch.ok_or_else(|| anyhow!("--epoch is required"))?;
                 AuthorityEpochTables::open_readonly(epoch, &db_path)
-                    .next_shared_object_versions
-                    .rocksdb
+                    .next_shared_object_versions_v2
+                    .db
             } else {
-                AuthorityPerpetualTables::open_readonly(&db_path)
-                    .objects
-                    .rocksdb
+                AuthorityPerpetualTables::open_readonly(&db_path).objects.db
             }
         }
         StoreName::Index => {
             IndexStoreTables::get_read_only_handle(db_path, None, None, MetricConf::default())
                 .event_by_move_module
-                .rocksdb
+                .db
         }
         StoreName::Epoch => {
             CommitteeStoreTables::get_read_only_handle(db_path, None, None, MetricConf::default())
                 .committee_map
-                .rocksdb
+                .db
         }
     };
 
@@ -171,36 +169,45 @@ pub fn duplicate_objects_summary(db_path: PathBuf) -> anyhow::Result<(usize, usi
 
     for item in iter {
         let (key, value) = item?;
-        if let StoreObject::Value(store_object) = value.migrate().into_inner() {
-            if let StoreData::Move(object) = store_object.data {
-                if object_id != key.0 {
-                    for (k, cnt) in data.iter() {
-                        total_bytes += k.len() * cnt;
-                        duplicated_bytes += k.len() * (cnt - 1);
-                        total_count += cnt;
-                        duplicate_count += cnt - 1;
-                    }
-                    object_id = key.0;
-                    data.clear();
+        if let StoreObject::Value(store_object) = value.migrate().into_inner()
+            && let StoreData::Move(object) = store_object.data
+        {
+            if object_id != key.0 {
+                for (k, cnt) in data.iter() {
+                    total_bytes += k.len() * cnt;
+                    duplicated_bytes += k.len() * (cnt - 1);
+                    total_count += cnt;
+                    duplicate_count += cnt - 1;
                 }
-                *data.entry(object.contents().to_vec()).or_default() += 1;
+                object_id = key.0;
+                data.clear();
             }
+            *data.entry(object.contents().to_vec()).or_default() += 1;
         }
     }
     Ok((total_count, duplicate_count, total_bytes, duplicated_bytes))
 }
 
 pub fn compact(db_path: PathBuf) -> anyhow::Result<()> {
-    let perpetual = Arc::new(AuthorityPerpetualTables::open(&db_path, None));
+    let perpetual = Arc::new(AuthorityPerpetualTables::open(&db_path, None, None));
     AuthorityStorePruner::compact(&perpetual)?;
     Ok(())
 }
 
 pub async fn prune_objects(db_path: PathBuf) -> anyhow::Result<()> {
-    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(&db_path.join("store"), None));
-    let checkpoint_store = CheckpointStore::new(&db_path.join("checkpoints"));
+    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(
+        &db_path.join("store"),
+        None,
+        None,
+    ));
+    let checkpoint_store = CheckpointStore::new(
+        &db_path.join("checkpoints"),
+        Arc::new(PrunerWatermarks::default()),
+    );
     let rpc_index = RpcIndexStore::new_without_init(&db_path);
-    let highest_pruned_checkpoint = checkpoint_store.get_highest_pruned_checkpoint_seq_number()?;
+    let highest_pruned_checkpoint = checkpoint_store
+        .get_highest_pruned_checkpoint_seq_number()?
+        .unwrap_or(0);
     let latest_checkpoint = checkpoint_store.get_highest_executed_checkpoint()?;
     info!(
         "Latest executed checkpoint sequence num: {}",
@@ -228,8 +235,15 @@ pub async fn prune_objects(db_path: PathBuf) -> anyhow::Result<()> {
 }
 
 pub async fn prune_checkpoints(db_path: PathBuf) -> anyhow::Result<()> {
-    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(&db_path.join("store"), None));
-    let checkpoint_store = CheckpointStore::new(&db_path.join("checkpoints"));
+    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(
+        &db_path.join("store"),
+        None,
+        None,
+    ));
+    let checkpoint_store = CheckpointStore::new(
+        &db_path.join("checkpoints"),
+        Arc::new(PrunerWatermarks::default()),
+    );
     let rpc_index = RpcIndexStore::new_without_init(&db_path);
     let metrics = AuthorityStorePruningMetrics::new(&Registry::default());
     info!("Pruning setup for db at path: {:?}", db_path.display());
@@ -238,7 +252,8 @@ pub async fn prune_checkpoints(db_path: PathBuf) -> anyhow::Result<()> {
         ..Default::default()
     };
     info!("Starting txns and effects pruning");
-    let archive_readers = ArchiveReaderBalancer::default();
+    use sui_core::authority::authority_store_pruner::PrunerWatermarks;
+    let watermarks = std::sync::Arc::new(PrunerWatermarks::default());
     AuthorityStorePruner::prune_checkpoints_for_eligible_epochs(
         &perpetual_db,
         &checkpoint_store,
@@ -246,8 +261,8 @@ pub async fn prune_checkpoints(db_path: PathBuf) -> anyhow::Result<()> {
         None,
         pruning_config,
         metrics,
-        archive_readers,
         EPOCH_DURATION_MS_FOR_TESTING,
+        &watermarks,
     )
     .await?;
     Ok(())
@@ -273,6 +288,8 @@ pub fn dump_table(
                     page_number,
                 )
             } else {
+                let perpetual_tables = AuthorityPerpetualTables::describe_tables();
+                assert!(perpetual_tables.contains_key(table_name));
                 AuthorityPerpetualTables::open_readonly(&db_path).dump(
                     table_name,
                     page_size,
@@ -300,15 +317,15 @@ mod test {
     use sui_core::authority::authority_per_epoch_store::AuthorityEpochTables;
     use sui_core::authority::authority_store_tables::AuthorityPerpetualTables;
 
-    use crate::db_tool::db_dump::{dump_table, list_tables, StoreName};
+    use crate::db_tool::db_dump::{StoreName, dump_table, list_tables};
 
     #[tokio::test]
     async fn db_dump_population() -> Result<(), anyhow::Error> {
-        let primary_path = tempfile::tempdir()?.into_path();
+        let primary_path = tempfile::tempdir()?.keep();
 
         // Open the DB for writing
         let _: AuthorityEpochTables = AuthorityEpochTables::open(0, &primary_path, None);
-        let _: AuthorityPerpetualTables = AuthorityPerpetualTables::open(&primary_path, None);
+        let _: AuthorityPerpetualTables = AuthorityPerpetualTables::open(&primary_path, None, None);
 
         // Get all the tables for AuthorityEpochTables
         let tables = {

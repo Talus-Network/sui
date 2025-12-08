@@ -8,21 +8,24 @@ use anyhow::Result;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use sui_indexer_alt_framework::{
-    db,
-    models::cp_sequence_numbers::tx_interval,
-    pipeline::{concurrent::Handler, Processor},
+    pipeline::{Processor, concurrent::Handler},
+    postgres::{Connection, Db},
     types::full_checkpoint_content::CheckpointData,
 };
 use sui_indexer_alt_schema::{schema::tx_digests, transactions::StoredTxDigest};
 
+use crate::handlers::cp_sequence_numbers::tx_interval;
+use async_trait::async_trait;
+
 pub(crate) struct TxDigests;
 
+#[async_trait]
 impl Processor for TxDigests {
     const NAME: &'static str = "tx_digests";
 
     type Value = StoredTxDigest;
 
-    fn process(&self, checkpoint: &Arc<CheckpointData>) -> Result<Vec<Self::Value>> {
+    async fn process(&self, checkpoint: &Arc<CheckpointData>) -> Result<Vec<Self::Value>> {
         let CheckpointData {
             transactions,
             checkpoint_summary,
@@ -42,12 +45,14 @@ impl Processor for TxDigests {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Handler for TxDigests {
+    type Store = Db;
+
     const MIN_EAGER_ROWS: usize = 100;
     const MAX_PENDING_ROWS: usize = 10000;
 
-    async fn commit(values: &[Self::Value], conn: &mut db::Connection<'_>) -> Result<usize> {
+    async fn commit<'a>(values: &[Self::Value], conn: &mut Connection<'a>) -> Result<usize> {
         Ok(diesel::insert_into(tx_digests::table)
             .values(values)
             .on_conflict_do_nothing()
@@ -55,11 +60,11 @@ impl Handler for TxDigests {
             .await?)
     }
 
-    async fn prune(
+    async fn prune<'a>(
         &self,
         from: u64,
         to_exclusive: u64,
-        conn: &mut db::Connection<'_>,
+        conn: &mut Connection<'a>,
     ) -> Result<usize> {
         let Range {
             start: from_tx,
@@ -77,12 +82,13 @@ mod tests {
     use super::*;
     use diesel_async::RunQueryDsl;
     use sui_indexer_alt_framework::{
-        handlers::cp_sequence_numbers::CpSequenceNumbers,
-        types::test_checkpoint_data_builder::TestCheckpointDataBuilder, Indexer,
+        Indexer, types::test_checkpoint_data_builder::TestCheckpointDataBuilder,
     };
     use sui_indexer_alt_schema::MIGRATIONS;
 
-    async fn get_all_tx_digests(conn: &mut db::Connection<'_>) -> Result<Vec<i64>> {
+    use crate::handlers::cp_sequence_numbers::CpSequenceNumbers;
+
+    async fn get_all_tx_digests(conn: &mut Connection<'_>) -> Result<Vec<i64>> {
         Ok(tx_digests::table
             .select(tx_digests::tx_sequence_number)
             .load(conn)
@@ -92,7 +98,7 @@ mod tests {
     #[tokio::test]
     async fn test_tx_digests_pruning_complains_if_no_mapping() {
         let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
-        let mut conn = indexer.db().connect().await.unwrap();
+        let mut conn = indexer.store().connect().await.unwrap();
 
         let result = TxDigests.prune(0, 2, &mut conn).await;
 
@@ -108,22 +114,22 @@ mod tests {
     #[tokio::test]
     async fn test_tx_digests_pruning() {
         let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
-        let mut conn = indexer.db().connect().await.unwrap();
+        let mut conn = indexer.store().connect().await.unwrap();
 
         let mut builder = TestCheckpointDataBuilder::new(0);
         builder = builder.start_transaction(0).finish_transaction();
         let checkpoint = Arc::new(builder.build_checkpoint());
-        let values = TxDigests.process(&checkpoint).unwrap();
+        let values = TxDigests.process(&checkpoint).await.unwrap();
         TxDigests::commit(&values, &mut conn).await.unwrap();
-        let values = CpSequenceNumbers.process(&checkpoint).unwrap();
+        let values = CpSequenceNumbers.process(&checkpoint).await.unwrap();
         CpSequenceNumbers::commit(&values, &mut conn).await.unwrap();
 
         builder = builder.start_transaction(0).finish_transaction();
         builder = builder.start_transaction(1).finish_transaction();
         let checkpoint = Arc::new(builder.build_checkpoint());
-        let values = TxDigests.process(&checkpoint).unwrap();
+        let values = TxDigests.process(&checkpoint).await.unwrap();
         TxDigests::commit(&values, &mut conn).await.unwrap();
-        let values = CpSequenceNumbers.process(&checkpoint).unwrap();
+        let values = CpSequenceNumbers.process(&checkpoint).await.unwrap();
         CpSequenceNumbers::commit(&values, &mut conn).await.unwrap();
 
         builder = builder.start_transaction(0).finish_transaction();
@@ -131,9 +137,9 @@ mod tests {
         builder = builder.start_transaction(2).finish_transaction();
         builder = builder.start_transaction(3).finish_transaction();
         let checkpoint = Arc::new(builder.build_checkpoint());
-        let values = TxDigests.process(&checkpoint).unwrap();
+        let values = TxDigests.process(&checkpoint).await.unwrap();
         TxDigests::commit(&values, &mut conn).await.unwrap();
-        let values = CpSequenceNumbers.process(&checkpoint).unwrap();
+        let values = CpSequenceNumbers.process(&checkpoint).await.unwrap();
         CpSequenceNumbers::commit(&values, &mut conn).await.unwrap();
 
         let fetched_results = get_all_tx_digests(&mut conn).await.unwrap();
