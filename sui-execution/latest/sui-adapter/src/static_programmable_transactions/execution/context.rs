@@ -11,9 +11,12 @@ use crate::{
     sp,
     static_programmable_transactions::{
         env::Env,
-        execution::values::{Local, Locals, Value},
+        execution::{
+            trace_utils,
+            values::{Local, Locals, Value},
+        },
         linkage::resolved_linkage::{ResolvedLinkage, RootedLinkage},
-        loading::ast::ObjectMutability,
+        loading::ast::{Datatype, ObjectMutability},
         typing::ast::{self as T, Type},
     },
 };
@@ -32,7 +35,7 @@ use move_core_types::{
 use move_trace_format::format::MoveTraceBuilder;
 use move_vm_runtime::native_extensions::NativeContextExtensions;
 use move_vm_types::{
-    gas::GasMeter,
+    gas::{GasMeter, SimpleInstruction},
     values::{VMValueCast, Value as VMValue},
 };
 use std::{
@@ -78,11 +81,14 @@ macro_rules! object_runtime_mut {
 }
 
 macro_rules! charge_gas_ {
-    ($gas_charger:expr, $env:expr, $case:ident, $value_view:expr) => {{
+    ($gas_charger:expr, $env:expr, $call:ident($($args:expr),*)) => {{
         SuiGasMeter($gas_charger.move_gas_status_mut())
-            .$case($value_view)
+            .$call($($args),*)
             .map_err(|e| $env.convert_vm_error(e.finish(Location::Undefined)))
     }};
+    ($gas_charger:expr, $env:expr, $case:ident, $value_view:expr) => {
+        charge_gas_!($gas_charger, $env, $case($value_view))
+    };
 }
 
 macro_rules! charge_gas {
@@ -118,6 +124,8 @@ struct Locations {
     /// The runtime value for the input objects args
     input_object_metadata: Vec<(T::InputIndex, InputObjectMetadata)>,
     object_inputs: Locals,
+    input_withdrawal_metadata: Vec<T::WithdrawalInput>,
+    withdrawal_inputs: Locals,
     pure_input_bytes: IndexSet<Vec<u8>>,
     pure_input_metadata: Vec<T::PureInput>,
     pure_inputs: Locals,
@@ -170,6 +178,9 @@ impl Locations {
                 ResolvedLocation::Local(gas_locals.local(0)?)
             }
             T::Location::ObjectInput(i) => ResolvedLocation::Local(self.object_inputs.local(i)?),
+            T::Location::WithdrawalInput(i) => {
+                ResolvedLocation::Local(self.withdrawal_inputs.local(i)?)
+            }
             T::Location::Result(i, j) => {
                 let result = unwrap!(self.results.get_mut(i as usize), "bounds already verified");
                 ResolvedLocation::Local(result.local(j)?)
@@ -210,6 +221,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         gas_charger: &'gas mut GasCharger,
         pure_input_bytes: IndexSet<Vec<u8>>,
         object_inputs: Vec<T::ObjectInput>,
+        input_withdrawal_metadata: Vec<T::WithdrawalInput>,
         pure_input_metadata: Vec<T::PureInput>,
         receiving_input_metadata: Vec<T::ReceivingInput>,
     ) -> Result<Self, ExecutionError>
@@ -225,6 +237,12 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
             object_values.push(Some(v));
         }
         let object_inputs = Locals::new(object_values)?;
+        let mut withdrawal_values = Vec::with_capacity(input_withdrawal_metadata.len());
+        for withdrawal_input in &input_withdrawal_metadata {
+            let v = load_withdrawal_arg(gas_charger, env, withdrawal_input)?;
+            withdrawal_values.push(Some(v));
+        }
+        let withdrawal_inputs = Locals::new(withdrawal_values)?;
         let pure_inputs = Locals::new_invalid(pure_input_metadata.len())?;
         let receiving_inputs = Locals::new_invalid(receiving_input_metadata.len())?;
         let gas = match gas_charger.gas_coin() {
@@ -257,6 +275,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
             tx_context.clone(),
         );
 
+        debug_assert_eq!(gas_charger.move_gas_status().stack_height_current(), 0);
         let tx_context_value = Locals::new(vec![Some(Value::new_tx_context(
             tx_context.borrow().digest(),
         )?)])?;
@@ -272,6 +291,8 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
                 gas,
                 input_object_metadata,
                 object_inputs,
+                input_withdrawal_metadata,
+                withdrawal_inputs,
                 pure_input_bytes,
                 pure_input_metadata,
                 pure_inputs,
@@ -382,10 +403,10 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         let mut written_objects = BTreeMap::new();
 
         for (id, (recipient, ty, value)) in writes {
-            let ty: Type = env.load_type_from_struct(&ty.clone().into())?;
+            let (ty, layout) = env.load_type_and_layout_from_struct(&ty.clone().into())?;
             let abilities = ty.abilities();
             let has_public_transfer = abilities.has_store();
-            let Some(bytes) = value.serialize() else {
+            let Some(bytes) = value.typed_serialize(&layout) else {
                 invariant_violation!("Failed to serialize already deserialized Move value");
             };
             // safe because has_public_transfer has been determined by the abilities
@@ -442,7 +463,9 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         linkage: &RootedLinkage,
     ) -> Result<(), ExecutionError> {
         let events = object_runtime_mut!(self)?.take_user_events();
-        let num_events = self.user_events.len() + events.len();
+        let Some(num_events) = self.user_events.len().checked_add(events.len()) else {
+            invariant_violation!("usize overflow, too many events emitted")
+        };
         let max_events = self.env.protocol_config.max_num_event_emit();
         if num_events as u64 > max_events {
             let err = max_event_error(max_events)
@@ -453,7 +476,8 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         let new_events = events
             .into_iter()
             .map(|(tag, value)| {
-                let Some(bytes) = value.serialize() else {
+                let layout = self.env.type_layout_for_struct(&tag)?;
+                let Some(bytes) = value.typed_serialize(&layout) else {
                     invariant_violation!("Failed to serialize Move event");
                 };
                 Ok((storage_id.clone(), tag, bytes))
@@ -498,13 +522,24 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
             }
         };
         Ok(match usage {
-            UsageKind::Move => local.move_()?,
+            UsageKind::Move => {
+                let value = local.move_()?;
+                charge_gas_!(self.gas_charger, self.env, charge_move_loc, &value)?;
+                value
+            }
             UsageKind::Copy => {
                 let value = local.copy()?;
                 charge_gas_!(self.gas_charger, self.env, charge_copy_loc, &value)?;
                 value
             }
-            UsageKind::Borrow => local.borrow()?,
+            UsageKind::Borrow => {
+                charge_gas_!(
+                    self.gas_charger,
+                    self.env,
+                    charge_simple_instr(SimpleInstruction::MutBorrowLoc)
+                )?;
+                local.borrow()?
+            }
         })
     }
 
@@ -533,7 +568,10 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
     where
         VMValue: VMValueCast<V>,
     {
+        let before_height = self.gas_charger.move_gas_status().stack_height_current();
         let value = self.argument_value(arg)?;
+        let after_height = self.gas_charger.move_gas_status().stack_height_current();
+        debug_assert_eq!(before_height.saturating_add(1), after_height);
         let value: V = value.cast()?;
         Ok(value)
     }
@@ -549,6 +587,36 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         self.locations
             .results
             .push(Locals::new(result.into_iter().map(|v| v.map(|v| v.0)))?);
+        Ok(())
+    }
+
+    pub fn charge_command(
+        &mut self,
+        is_move_call: bool,
+        num_args: usize,
+        num_return: usize,
+    ) -> Result<(), ExecutionError> {
+        let move_gas_status = self.gas_charger.move_gas_status_mut();
+        let before_size = move_gas_status.stack_size_current();
+        // Pop all of the arguments
+        // If the return values came from the Move VM directly (via a Move call), pop those
+        // as well
+        let num_popped = if is_move_call {
+            num_args.checked_add(num_return).ok_or_else(|| {
+                make_invariant_violation!("usize overflow when charging gas for command",)
+            })?
+        } else {
+            num_args
+        };
+        move_gas_status
+            .charge(1, 0, num_popped as u64, 0, /* unused */ 1)
+            .map_err(|e| self.env.convert_vm_error(e.finish(Location::Undefined)))?;
+        let after_size = move_gas_status.stack_size_current();
+        assert_invariant!(
+            before_size == after_size,
+            "We assume currently that the stack size is not decremented. \
+            If this changes, we need to actually account for it here"
+        );
         Ok(())
     }
 
@@ -598,7 +666,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         &mut self,
         function: T::LoadedFunction,
         args: Vec<CtxValue>,
-        trace_builder_opt: Option<&mut MoveTraceBuilder>,
+        trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> Result<Vec<CtxValue>, ExecutionError> {
         let result = self.execute_function_bypass_visibility(
             &function.runtime_id,
@@ -624,7 +692,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         ty_args: &[Type],
         args: Vec<CtxValue>,
         linkage: &RootedLinkage,
-        tracer: Option<&mut MoveTraceBuilder>,
+        tracer: &mut Option<MoveTraceBuilder>,
     ) -> Result<Vec<CtxValue>, ExecutionError> {
         let ty_args = ty_args
             .iter()
@@ -645,7 +713,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
                 &mut data_store,
                 &mut SuiGasMeter(gas_status),
                 &mut self.native_extensions,
-                tracer,
+                tracer.as_mut(),
             )
             .map_err(|e| self.env.convert_linked_vm_error(e, linkage))?;
         Ok(values.into_iter().map(|v| CtxValue(v.into())).collect())
@@ -705,7 +773,10 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         let mut fetched = vec![];
         let mut missing = vec![];
 
-        for id in dependency_ids {
+        // Collect into a set to avoid duplicate fetches and preserve existing behavior
+        let dependency_ids: BTreeSet<_> = dependency_ids.iter().collect();
+
+        for id in &dependency_ids {
             match self.env.linkable_store.get_package(id) {
                 Err(e) => {
                     return Err(ExecutionError::new_with_source(
@@ -799,7 +870,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         package_id: ObjectID,
         modules: &[CompiledModule],
         linkage: &RootedLinkage,
-        mut trace_builder_opt: Option<&mut MoveTraceBuilder>,
+        trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> Result<(), ExecutionError> {
         for module in modules {
             let Some((fdef_idx, fdef)) = module.find_function_def_by_name(INIT_FN_NAME.as_str())
@@ -818,19 +889,25 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
                 .map_err(|e| {
                     make_invariant_violation!("Failed to get tx context for init function: {}", e)
                 })?;
+            // balance the stack after borrowing the tx context
+            charge_gas!(self, charge_store_loc, &tx_context)?;
+
             let args = if has_otw {
                 vec![CtxValue(Value::one_time_witness()?), CtxValue(tx_context)]
             } else {
                 vec![CtxValue(tx_context)]
             };
+            debug_assert_eq!(self.gas_charger.move_gas_status().stack_height_current(), 0);
+            trace_utils::trace_move_call_start(trace_builder_opt);
             let return_values = self.execute_function_bypass_visibility(
                 &module.self_id(),
                 INIT_FN_NAME,
                 &[],
                 args,
                 linkage,
-                trace_builder_opt.as_deref_mut(),
+                trace_builder_opt,
             )?;
+            trace_utils::trace_move_call_end(trace_builder_opt);
 
             let storage_id = ModuleId::new(package_id.into(), module.self_id().name().to_owned());
             self.take_user_events(
@@ -842,7 +919,8 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
             assert_invariant!(
                 return_values.is_empty(),
                 "init should not have return values"
-            )
+            );
+            debug_assert_eq!(self.gas_charger.move_gas_status().stack_height_current(), 0);
         }
 
         Ok(())
@@ -853,7 +931,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         mut modules: Vec<CompiledModule>,
         dep_ids: &[ObjectID],
         linkage: ResolvedLinkage,
-        trace_builder_opt: Option<&mut MoveTraceBuilder>,
+        trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> Result<ObjectID, ExecutionError> {
         let runtime_id = if <Mode>::packages_are_predefined() {
             // do not calculate or substitute id for predefined packages
@@ -1070,7 +1148,8 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
                 invariant_violation!("read should not return a reference")
             }
         };
-        let Some(bytes) = value.serialize() else {
+        let layout = self.env.runtime_layout(&ty)?;
+        let Some(bytes) = value.typed_serialize(&layout) else {
             invariant_violation!("Failed to serialize Move value");
         };
         let arg = match location {
@@ -1080,6 +1159,11 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
             T::Location::ObjectInput(i) => {
                 TxArgument::Input(self.locations.input_object_metadata[i as usize].0.0)
             }
+            T::Location::WithdrawalInput(i) => TxArgument::Input(
+                self.locations.input_withdrawal_metadata[i as usize]
+                    .original_input_index
+                    .0,
+            ),
             T::Location::PureInput(i) => TxArgument::Input(
                 self.locations.pure_input_metadata[i as usize]
                     .original_input_index
@@ -1123,7 +1207,8 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
             }
             _ => (result, ty),
         };
-        let Some(bytes) = v.serialize() else {
+        let layout = self.env.runtime_layout(&ty)?;
+        let Some(bytes) = v.typed_serialize(&layout) else {
             invariant_violation!("Failed to serialize Move value");
         };
         let Ok(tag): Result<TypeTag, _> = ty.try_into() else {
@@ -1161,6 +1246,11 @@ impl CtxValue {
 
     pub fn into_upgrade_ticket(self) -> Result<UpgradeTicket, ExecutionError> {
         self.0.into_upgrade_ticket()
+    }
+
+    /// Used to get access the inner Value for tracing.
+    pub(super) fn inner_for_tracing(&self) -> &Value {
+        &self.0
     }
 }
 
@@ -1202,6 +1292,7 @@ fn load_object_arg_impl(
     else {
         invariant_violation!("Expected a Move object");
     };
+    assert_expected_move_object_type(&object_metadata.type_, move_obj.type_())?;
     let contained_uids = {
         let fully_annotated_layout = env.fully_annotated_layout(&ty)?;
         get_all_uids(&fully_annotated_layout, move_obj.contents()).map_err(|e| {
@@ -1219,7 +1310,25 @@ fn load_object_arg_impl(
 
     let v = Value::deserialize(env, move_obj.contents(), ty)?;
     charge_gas_!(meter, env, charge_copy_loc, &v)?;
+    charge_gas_!(meter, env, charge_store_loc, &v)?;
     Ok((object_metadata, v))
+}
+
+fn load_withdrawal_arg(
+    meter: &mut GasCharger,
+    env: &Env,
+    withdrawal: &T::WithdrawalInput,
+) -> Result<Value, ExecutionError> {
+    let T::WithdrawalInput {
+        original_input_index: _,
+        ty: _,
+        owner,
+        amount,
+    } = withdrawal;
+    let loaded = Value::funds_accumulator_withdrawal(*owner, *amount);
+    charge_gas_!(meter, env, charge_copy_loc, &loaded)?;
+    charge_gas_!(meter, env, charge_store_loc, &loaded)?;
+    Ok(loaded)
 }
 
 fn load_pure_value(
@@ -1231,6 +1340,7 @@ fn load_pure_value(
     let loaded = Value::deserialize(env, bytes, metadata.ty.clone())?;
     // ByteValue::Receiving { id, version } => Value::receiving(*id, *version),
     charge_gas_!(meter, env, charge_copy_loc, &loaded)?;
+    charge_gas_!(meter, env, charge_store_loc, &loaded)?;
     Ok(loaded)
 }
 
@@ -1242,11 +1352,13 @@ fn load_receiving_value(
     let (id, version, _) = metadata.object_ref;
     let loaded = Value::receiving(id, version);
     charge_gas_!(meter, env, charge_copy_loc, &loaded)?;
+    charge_gas_!(meter, env, charge_store_loc, &loaded)?;
     Ok(loaded)
 }
 
 fn copy_value(meter: &mut GasCharger, env: &Env, value: &Value) -> Result<Value, ExecutionError> {
     charge_gas_!(meter, env, charge_copy_loc, value)?;
+    charge_gas_!(meter, env, charge_pop, value)?;
     value.copy()
 }
 
@@ -1317,4 +1429,95 @@ unsafe fn create_written_object<Mode: ExecutionMode>(
             Mode::packages_are_predefined(),
         )
     }
+}
+
+/// Assert the type inferred matches the object's type. This has already been done during loading,
+/// but is checked again as an invariant. This may be removed safely at a later time if needed.
+fn assert_expected_move_object_type(
+    actual: &Type,
+    expected: &MoveObjectType,
+) -> Result<(), ExecutionError> {
+    let Type::Datatype(actual) = actual else {
+        invariant_violation!("Expected a datatype for a Move object");
+    };
+    let (a, m, n) = actual.qualified_ident();
+    assert_invariant!(
+        a == &expected.address(),
+        "Actual address does not match expected. actual: {actual:?} vs expected: {expected:?}"
+    );
+    assert_invariant!(
+        m == expected.module(),
+        "Actual module does not match expected. actual: {actual:?} vs expected: {expected:?}"
+    );
+    assert_invariant!(
+        n == expected.name(),
+        "Actual struct does not match expected. actual: {actual:?} vs expected: {expected:?}"
+    );
+    let actual_type_arguments = &actual.type_arguments;
+    let expected_type_arguments = expected.type_params();
+    assert_invariant!(
+        actual_type_arguments.len() == expected_type_arguments.len(),
+        "Actual type arg length does not match expected. \
+       actual: {actual:?} vs expected: {expected:?}",
+    );
+    for (actual_ty, expected_ty) in actual_type_arguments.iter().zip(&expected_type_arguments) {
+        assert_expected_type(actual_ty, expected_ty)?;
+    }
+    Ok(())
+}
+
+/// Assert the type inferred matches the expected type. This has already been done during typing,
+/// but is checked again as an invariant. This may be removed safely at a later time if needed.
+fn assert_expected_type(actual: &Type, expected: &TypeTag) -> Result<(), ExecutionError> {
+    match (actual, expected) {
+        (Type::Bool, TypeTag::Bool)
+        | (Type::U8, TypeTag::U8)
+        | (Type::U16, TypeTag::U16)
+        | (Type::U32, TypeTag::U32)
+        | (Type::U64, TypeTag::U64)
+        | (Type::U128, TypeTag::U128)
+        | (Type::U256, TypeTag::U256)
+        | (Type::Address, TypeTag::Address)
+        | (Type::Signer, TypeTag::Signer) => Ok(()),
+        (Type::Vector(inner_actual), TypeTag::Vector(inner_expected)) => {
+            assert_expected_type(&inner_actual.element_type, inner_expected)
+        }
+        (Type::Datatype(actual_dt), TypeTag::Struct(expected_st)) => {
+            assert_expected_data_type(actual_dt, expected_st)
+        }
+        _ => invariant_violation!(
+            "Type mismatch between actual: {actual:?} and expected: {expected:?}"
+        ),
+    }
+}
+/// Assert the type inferred matches the expected type. This has already been done during typing,
+/// but is checked again as an invariant. This may be removed safely at a later time if needed.
+fn assert_expected_data_type(
+    actual: &Datatype,
+    expected: &StructTag,
+) -> Result<(), ExecutionError> {
+    let (a, m, n) = actual.qualified_ident();
+    assert_invariant!(
+        a == &expected.address,
+        "Actual address does not match expected. actual: {actual:?} vs expected: {expected:?}"
+    );
+    assert_invariant!(
+        m == expected.module.as_ident_str(),
+        "Actual module does not match expected. actual: {actual:?} vs expected: {expected:?}"
+    );
+    assert_invariant!(
+        n == expected.name.as_ident_str(),
+        "Actual struct does not match expected. actual: {actual:?} vs expected: {expected:?}"
+    );
+    let actual_type_arguments = &actual.type_arguments;
+    let expected_type_arguments = &expected.type_params;
+    assert_invariant!(
+        actual_type_arguments.len() == expected_type_arguments.len(),
+        "Actual type arg length does not match expected. \
+       actual: {actual:?} vs expected: {expected:?}",
+    );
+    for (actual_ty, expected_ty) in actual_type_arguments.iter().zip(expected_type_arguments) {
+        assert_expected_type(actual_ty, expected_ty)?;
+    }
+    Ok(())
 }

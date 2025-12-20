@@ -77,9 +77,16 @@ impl CommitObserver {
         // Recover blocks needed for future commits (and block proposals).
         // Some blocks might have been recovered as committed blocks in recover_and_send_commits().
         // They will just be ignored.
-        observer
-            .transaction_certifier
-            .recover_blocks_after_round(observer.dag_state.read().gc_round());
+        tokio::runtime::Handle::current()
+            .spawn_blocking({
+                let transaction_certifier = observer.transaction_certifier.clone();
+                let gc_round = observer.dag_state.read().gc_round();
+                move || {
+                    transaction_certifier.recover_blocks_after_round(gc_round);
+                }
+            })
+            .await
+            .expect("Spawn blocking should not fail");
 
         observer
     }
@@ -208,7 +215,7 @@ impl CommitObserver {
                 .recover_commits_to_write(unsent_commits.clone());
 
             info!(
-                "Recovered {} unsent commits in range [{start_index}..={end_index}]",
+                "Recovering {} unsent commits in range [{start_index}..={end_index}]",
                 unsent_commits.len()
             );
 
@@ -238,9 +245,13 @@ impl CommitObserver {
                     reputation_scores,
                 );
 
-                if !committed_sub_dag.recovered_rejected_transactions {
+                if !committed_sub_dag.recovered_rejected_transactions && !seen_unfinalized_commit {
+                    info!(
+                        "Starting to recover unfinalized commit from {}",
+                        committed_sub_dag.commit_ref
+                    );
                     // When the commit has no associated storage entry for rejected transactions,
-                    // even if an empty set, the commit is unfinalized.
+                    // not even an empty set, the commit is unfinalized.
                     seen_unfinalized_commit = true;
                 }
 

@@ -30,7 +30,7 @@ use sui_types::{
     digests::TransactionDigest,
     error::SuiResult,
     executable_transaction::VerifiedExecutableTransaction,
-    storage::{InputKey, ObjectStore},
+    storage::{ChildObjectResolver, InputKey},
     transaction::{
         SenderSignedData, SharedInputObject, SharedObjectMutability, TransactionData,
         TransactionDataAPI, TransactionKey,
@@ -87,7 +87,6 @@ impl BarrierDependencyBuilder {
 #[derive(Clone)]
 pub struct ExecutionScheduler {
     object_cache_read: Arc<dyn ObjectCacheRead>,
-    object_store: Arc<dyn ObjectStore + Send + Sync>,
     transaction_cache_read: Arc<dyn TransactionCacheRead>,
     overload_tracker: Arc<OverloadTracker>,
     tx_ready_certificates: UnboundedSender<PendingCertificate>,
@@ -128,19 +127,21 @@ impl Drop for PendingGuard<'_> {
 impl ExecutionScheduler {
     pub fn new(
         object_cache_read: Arc<dyn ObjectCacheRead>,
-        object_store: Arc<dyn ObjectStore + Send + Sync>,
+        child_object_resolver: Arc<dyn ChildObjectResolver + Send + Sync>,
         transaction_cache_read: Arc<dyn TransactionCacheRead>,
         tx_ready_certificates: UnboundedSender<PendingCertificate>,
         epoch_store: &Arc<AuthorityPerEpochStore>,
         metrics: Arc<AuthorityMetrics>,
     ) -> Self {
         tracing::info!("Creating new ExecutionScheduler");
-        let balance_withdraw_scheduler = Arc::new(Mutex::new(
-            Self::initialize_balance_withdraw_scheduler(epoch_store, &object_store),
-        ));
+        let balance_withdraw_scheduler =
+            Arc::new(Mutex::new(Self::initialize_balance_withdraw_scheduler(
+                epoch_store,
+                &object_cache_read,
+                child_object_resolver,
+            )));
         Self {
             object_cache_read,
-            object_store,
             transaction_cache_read,
             overload_tracker: Arc::new(OverloadTracker::new()),
             tx_ready_certificates,
@@ -151,19 +152,20 @@ impl ExecutionScheduler {
 
     fn initialize_balance_withdraw_scheduler(
         epoch_store: &Arc<AuthorityPerEpochStore>,
-        object_store: &Arc<dyn ObjectStore + Send + Sync>,
+        object_cache_read: &Arc<dyn ObjectCacheRead>,
+        child_object_resolver: Arc<dyn ChildObjectResolver + Send + Sync>,
     ) -> Option<BalanceWithdrawScheduler> {
         let withdraw_scheduler_enabled =
             epoch_store.is_validator() && epoch_store.accumulators_enabled();
         if !withdraw_scheduler_enabled {
             return None;
         }
-        let starting_accumulator_version = object_store
+        let starting_accumulator_version = object_cache_read
             .get_object(&SUI_ACCUMULATOR_ROOT_OBJECT_ID)
             .expect("Accumulator root object must be present if balance accumulator is enabled")
             .version();
         Some(BalanceWithdrawScheduler::new(
-            Arc::new(object_store.clone()),
+            Arc::new(child_object_resolver),
             starting_accumulator_version,
         ))
     }
@@ -226,7 +228,14 @@ impl ExecutionScheduler {
             .zip(availability)
             .filter_map(|(key, available)| if !available { Some(key) } else { None })
             .collect();
-        if missing_input_keys.is_empty() {
+
+        let has_missing_barrier_dependencies = self
+            .transaction_cache_read
+            .multi_get_executed_effects_digests(&execution_env.barrier_dependencies)
+            .into_iter()
+            .any(|r| r.is_none());
+
+        if missing_input_keys.is_empty() && !has_missing_barrier_dependencies {
             self.metrics
                 .transaction_manager_num_enqueued_certificates
                 .with_label_values(&["ready"])
@@ -314,8 +323,7 @@ impl ExecutionScheduler {
         for (cert, env) in &certs {
             let tx_withdraws = cert
                 .transaction_data()
-                .process_funds_withdrawals()
-                .expect("Balance withdraws should have already been checked");
+                .process_funds_withdrawals_for_execution();
             assert!(!tx_withdraws.is_empty());
             let accumulator_version = env
                 .assigned_versions
@@ -511,6 +519,12 @@ impl ExecutionScheduler {
                 Schedulable::AccumulatorSettlement(_, _) => {
                     settlement_txns.push((schedulable.key(), env));
                 }
+                Schedulable::ConsensusCommitPrologue(_, _, _) => {
+                    // we only use Schedulable::ConsensusCommitPrologue as a temporary placeholder
+                    // during version assignment, by the time we schedule transactions it should be
+                    // converted to Schedulable::Transaction
+                    unreachable!("Schedulable::ConsensusCommitPrologue should not be enqueued");
+                }
             }
         }
 
@@ -590,9 +604,16 @@ impl ExecutionScheduler {
 
     /// Reconfigure internal state at epoch start. This resets the balance withdraw scheduler
     /// to the current accumulator root object version.
-    pub fn reconfigure(&self, new_epoch_store: &Arc<AuthorityPerEpochStore>) {
-        let scheduler =
-            Self::initialize_balance_withdraw_scheduler(new_epoch_store, &self.object_store);
+    pub fn reconfigure(
+        &self,
+        new_epoch_store: &Arc<AuthorityPerEpochStore>,
+        child_object_resolver: &Arc<dyn ChildObjectResolver + Send + Sync>,
+    ) {
+        let scheduler = Self::initialize_balance_withdraw_scheduler(
+            new_epoch_store,
+            &self.object_cache_read,
+            child_object_resolver.clone(),
+        );
         let mut guard = self.balance_withdraw_scheduler.lock();
         if let Some(old_scheduler) = guard.as_ref() {
             old_scheduler.close_epoch();
@@ -666,7 +687,7 @@ mod test {
         let (tx_ready_certificates, rx_ready_certificates) = unbounded_channel();
         let execution_scheduler = ExecutionScheduler::new(
             state.get_object_cache_reader().clone(),
-            state.get_object_store().clone(),
+            state.get_child_object_resolver().clone(),
             state.get_transaction_cache_reader().clone(),
             tx_ready_certificates,
             &state.epoch_store_for_testing(),

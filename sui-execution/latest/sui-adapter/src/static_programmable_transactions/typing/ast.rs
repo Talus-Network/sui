@@ -5,8 +5,9 @@ use crate::static_programmable_transactions::{
     linkage::resolved_linkage::ResolvedLinkage, loading::ast as L, spanned::Spanned,
 };
 use indexmap::IndexSet;
+use move_core_types::{account_address::AccountAddress, u256::U256};
 use move_vm_types::values::VectorSpecialization;
-use std::{cell::OnceCell, vec};
+use std::cell::OnceCell;
 use sui_types::base_types::{ObjectID, ObjectRef};
 
 //**************************************************************************************************
@@ -19,6 +20,8 @@ pub struct Transaction {
     pub bytes: IndexSet<Vec<u8>>,
     // All input objects
     pub objects: Vec<ObjectInput>,
+    /// All Withdrawal inputs
+    pub withdrawals: Vec<WithdrawalInput>,
     /// All pure inputs
     pub pure: Vec<PureInput>,
     /// All receiving inputs
@@ -58,6 +61,16 @@ pub struct ReceivingInput {
     pub ty: Type,
     // Information about where this constraint came from
     pub constraint: BytesConstraint,
+}
+
+#[derive(Debug)]
+pub struct WithdrawalInput {
+    pub original_input_index: InputIndex,
+    /// The full type `sui::funds_accumulator::Withdrawal<T>`
+    pub ty: Type,
+    pub owner: AccountAddress,
+    /// This amount is verified to be <= the max for the type described by the `T` in `ty`
+    pub amount: U256,
 }
 
 pub type Commands = Vec<Command>;
@@ -127,6 +140,7 @@ pub enum Location {
     TxContext,
     GasCoin,
     ObjectInput(u16),
+    WithdrawalInput(u16),
     PureInput(u16),
     ReceivingInput(u16),
     Result(u16, u16),
@@ -215,21 +229,21 @@ impl Argument__ {
 }
 
 impl Command__ {
-    pub fn arguments(&self) -> Vec<&Argument> {
+    pub fn arguments(&self) -> Box<dyn Iterator<Item = &Argument> + '_> {
         match self {
-            Command__::MoveCall(mc) => mc.arguments.iter().collect(),
+            Command__::MoveCall(mc) => Box::new(mc.arguments.iter()),
             Command__::TransferObjects(objs, addr) => {
-                objs.iter().chain(std::iter::once(addr)).collect()
+                Box::new(objs.iter().chain(std::iter::once(addr)))
             }
             Command__::SplitCoins(_, coin, amounts) => {
-                std::iter::once(coin).chain(amounts).collect()
+                Box::new(std::iter::once(coin).chain(amounts))
             }
             Command__::MergeCoins(_, target, sources) => {
-                std::iter::once(target).chain(sources).collect()
+                Box::new(std::iter::once(target).chain(sources))
             }
-            Command__::MakeMoveVec(_, elems) => elems.iter().collect(),
-            Command__::Publish(_, _, _) => vec![],
-            Command__::Upgrade(_, _, _, arg, _) => vec![arg],
+            Command__::MakeMoveVec(_, elems) => Box::new(elems.iter()),
+            Command__::Publish(_, _, _) => Box::new(std::iter::empty()),
+            Command__::Upgrade(_, _, _, arg, _) => Box::new(std::iter::once(arg)),
         }
     }
 
@@ -262,6 +276,20 @@ impl Command__ {
             }
             Command__::Publish(_, _, _) => Box::new(std::iter::empty()),
         }
+    }
+
+    pub fn arguments_len(&self) -> usize {
+        let n = match self {
+            Command__::MoveCall(mc) => mc.arguments.len(),
+            Command__::TransferObjects(objs, _) => objs.len().saturating_add(1),
+            Command__::SplitCoins(_, _, amounts) => amounts.len().saturating_add(1),
+            Command__::MergeCoins(_, _, sources) => sources.len().saturating_add(1),
+            Command__::MakeMoveVec(_, elems) => elems.len(),
+            Command__::Publish(_, _, _) => 0,
+            Command__::Upgrade(_, _, _, _, _) => 1,
+        };
+        debug_assert_eq!(self.arguments().count(), n);
+        n
     }
 }
 

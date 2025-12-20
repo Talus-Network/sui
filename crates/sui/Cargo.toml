@@ -52,6 +52,7 @@ url.workspace = true
 
 sui-config.workspace = true
 sui-bridge.workspace = true
+sui-data-store.workspace = true
 sui-execution.workspace = true
 sui-faucet.workspace = true
 sui-swarm-config.workspace = true
@@ -107,6 +108,7 @@ move-ir-types.workspace = true
 move-command-line-common.workspace = true
 move-cli.workspace = true
 move-symbol-pool.workspace = true
+normalize-line-endings = "0.3.0"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemalloc-ctl.workspace = true

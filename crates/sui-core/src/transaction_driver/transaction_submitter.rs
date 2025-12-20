@@ -71,6 +71,7 @@ impl TransactionSubmitter {
             client_monitor,
             tx_type,
             options.allowed_validators.clone(),
+            options.blocked_validators.clone(),
         );
 
         let ping_label = if request.ping_type.is_some() {
@@ -146,7 +147,7 @@ impl TransactionSubmitter {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     self.metrics
                         .submit_transaction_latency
-                        .with_label_values(&[&display_name, tx_type.as_str(), ping_label])
+                        .with_label_values(&[tx_type.as_str(), ping_label])
                         .observe(elapsed);
 
                     return Ok((name, result));

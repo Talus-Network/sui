@@ -67,10 +67,6 @@ pub(crate) struct Core {
     /// The block manager which is responsible for keeping track of the DAG dependencies when processing new blocks
     /// and accept them or suspend if we are missing their causal history
     block_manager: BlockManager,
-    /// Whether there are subscribers waiting for new blocks proposed by this authority.
-    /// Core stops proposing new blocks when there is no subscriber, because new proposed blocks
-    /// will likely contain only stale info when they propagate to peers.
-    subscriber_exists: bool,
     /// Estimated delay by round for propagating blocks to a quorum.
     /// Because of the nature of TCP and block streaming, propagation delay is expected to be
     /// 0 in most cases, even when the actual latency of broadcasting blocks is high.
@@ -126,7 +122,6 @@ impl Core {
         transaction_consumer: TransactionConsumer,
         transaction_certifier: TransactionCertifier,
         block_manager: BlockManager,
-        subscriber_exists: bool,
         commit_observer: CommitObserver,
         signals: CoreSignals,
         block_signer: ProtocolKeyPair,
@@ -190,7 +185,6 @@ impl Core {
             transaction_consumer,
             transaction_certifier,
             block_manager,
-            subscriber_exists,
             propagation_delay: 0,
             committer,
             commit_observer,
@@ -631,15 +625,14 @@ impl Core {
             .take_commit_votes(MAX_COMMIT_VOTES_PER_BLOCK);
 
         let transaction_votes = if self.context.protocol_config.mysticeti_fastpath() {
-            let hard_linked_ancestors = {
+            let new_causal_history = {
                 let mut dag_state = self.dag_state.write();
                 ancestors
                     .iter()
                     .flat_map(|ancestor| dag_state.link_causal_history(ancestor.reference()))
                     .collect()
             };
-            self.transaction_certifier
-                .get_own_votes(hard_linked_ancestors)
+            self.transaction_certifier.get_own_votes(new_causal_history)
         } else {
             vec![]
         };
@@ -740,7 +733,7 @@ impl Core {
         // Update round tracker with our own highest accepted blocks
         self.round_tracker
             .write()
-            .update_from_accepted_block(&extended_block);
+            .update_from_verified_block(&extended_block);
 
         Some(extended_block)
     }
@@ -922,12 +915,6 @@ impl Core {
         self.block_manager.missing_blocks()
     }
 
-    /// Sets if there is consumer available to consume blocks produced by the core.
-    pub(crate) fn set_subscriber_exists(&mut self, exists: bool) {
-        info!("Block subscriber exists: {exists}");
-        self.subscriber_exists = exists;
-    }
-
     /// Sets the delay by round for propagating blocks to a quorum.
     pub(crate) fn set_propagation_delay(&mut self, delay: Round) {
         info!("Propagation round delay set to: {delay}");
@@ -951,14 +938,6 @@ impl Core {
     pub(crate) fn should_propose(&self) -> bool {
         let clock_round = self.dag_state.read().threshold_clock_round();
         let core_skipped_proposals = &self.context.metrics.node_metrics.core_skipped_proposals;
-
-        if !self.subscriber_exists {
-            debug!("Skip proposing for round {clock_round}, no subscriber exists.");
-            core_skipped_proposals
-                .with_label_values(&["no_subscriber"])
-                .inc();
-            return false;
-        }
 
         if self.propagation_delay
             > self
@@ -1475,7 +1454,6 @@ impl CoreTextFixture {
             transaction_consumer,
             transaction_certifier.clone(),
             block_manager,
-            true,
             commit_observer,
             signals,
             block_signer,
@@ -1622,7 +1600,6 @@ mod test {
             transaction_consumer,
             transaction_certifier.clone(),
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
@@ -1764,7 +1741,6 @@ mod test {
             transaction_consumer,
             transaction_certifier,
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
@@ -1865,7 +1841,6 @@ mod test {
             transaction_consumer,
             transaction_certifier,
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
@@ -2116,7 +2091,6 @@ mod test {
             transaction_consumer,
             transaction_certifier,
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
@@ -2284,7 +2258,6 @@ mod test {
             transaction_consumer,
             transaction_certifier.clone(),
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
@@ -2365,7 +2338,6 @@ mod test {
             transaction_consumer,
             transaction_certifier.clone(),
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
@@ -2724,7 +2696,6 @@ mod test {
             transaction_consumer,
             transaction_certifier.clone(),
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
@@ -3025,7 +2996,6 @@ mod test {
             transaction_consumer,
             transaction_certifier.clone(),
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
@@ -3077,79 +3047,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_core_set_subscriber_exists() {
-        telemetry_subscribers::init_for_testing();
-        let (context, mut key_pairs) = Context::new_for_test(4);
-        let context = Arc::new(context);
-        let store = Arc::new(MemStore::new());
-        let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
-
-        let block_manager = BlockManager::new(context.clone(), dag_state.clone());
-        let leader_schedule = Arc::new(LeaderSchedule::from_store(
-            context.clone(),
-            dag_state.clone(),
-        ));
-
-        let (_transaction_client, tx_receiver) = TransactionClient::new(context.clone());
-        let transaction_consumer = TransactionConsumer::new(tx_receiver, context.clone());
-        let (blocks_sender, _blocks_receiver) =
-            monitored_mpsc::unbounded_channel("consensus_block_output");
-        let transaction_certifier = TransactionCertifier::new(
-            context.clone(),
-            Arc::new(NoopBlockVerifier {}),
-            dag_state.clone(),
-            blocks_sender,
-        );
-        let (signals, signal_receivers) = CoreSignals::new(context.clone());
-        // Need at least one subscriber to the block broadcast channel.
-        let _block_receiver = signal_receivers.block_broadcast_receiver();
-
-        let (commit_consumer, _commit_receiver, _transaction_receiver) =
-            CommitConsumerArgs::new(0, 0);
-        let commit_observer = CommitObserver::new(
-            context.clone(),
-            commit_consumer,
-            dag_state.clone(),
-            transaction_certifier.clone(),
-            leader_schedule.clone(),
-        )
-        .await;
-
-        let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
-        let mut core = Core::new(
-            context.clone(),
-            leader_schedule,
-            transaction_consumer,
-            transaction_certifier.clone(),
-            block_manager,
-            // Set to no subscriber exists initially.
-            false,
-            commit_observer,
-            signals,
-            key_pairs.remove(context.own_index.value()).1,
-            dag_state.clone(),
-            false,
-            round_tracker,
-        );
-
-        // There is no proposal during recovery because there is no subscriber.
-        assert_eq!(
-            core.last_proposed_round(),
-            GENESIS_ROUND,
-            "No block should have been created other than genesis"
-        );
-
-        // There is no proposal even with forced proposing.
-        assert!(core.try_propose(true).unwrap().is_none());
-
-        // Let Core know subscriber exists.
-        core.set_subscriber_exists(true);
-
-        // Proposing now would succeed.
-        assert!(core.try_propose(true).unwrap().is_some());
-    }
-
-    #[tokio::test]
     async fn test_core_set_propagation_delay_per_authority() {
         // TODO: create helper to avoid the duplicated code here.
         telemetry_subscribers::init_for_testing();
@@ -3196,21 +3093,12 @@ mod test {
             transaction_consumer,
             transaction_certifier.clone(),
             block_manager,
-            // Set to no subscriber exists initially.
-            false,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,
             dag_state.clone(),
             false,
             round_tracker.clone(),
-        );
-
-        // There is no proposal during recovery because there is no subscriber.
-        assert_eq!(
-            core.last_proposed_round(),
-            GENESIS_ROUND,
-            "No block should have been created other than genesis"
         );
 
         // Use a large propagation delay to disable proposing.
@@ -3236,9 +3124,6 @@ mod test {
                 vec![0, 0, 0, 0],
             ],
         );
-
-        // Make propagation delay the only reason for not proposing.
-        core.set_subscriber_exists(true);
 
         // There is no proposal even with forced proposing.
         assert!(core.try_propose(true).unwrap().is_none());
@@ -3659,7 +3544,6 @@ mod test {
             transaction_consumer,
             transaction_certifier.clone(),
             block_manager,
-            true,
             commit_observer,
             signals,
             key_pairs.remove(context.own_index.value()).1,

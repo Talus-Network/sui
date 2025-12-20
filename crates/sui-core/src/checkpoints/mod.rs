@@ -22,6 +22,7 @@ use crate::execution_cache::TransactionCacheRead;
 use crate::execution_scheduler::balance_withdraw_scheduler::BalanceSettlement;
 use crate::global_state_hasher::GlobalStateHasher;
 use crate::stake_aggregator::{InsertResult, MultiStakeAggregator};
+use consensus_core::CommitRef;
 use diffy::create_patch;
 use itertools::Itertools;
 use mysten_common::random::get_rng;
@@ -61,7 +62,9 @@ use sui_protocol_config::ProtocolVersion;
 use sui_types::base_types::{AuthorityName, EpochId, TransactionDigest};
 use sui_types::committee::StakeUnit;
 use sui_types::crypto::AuthorityStrongQuorumSignInfo;
-use sui_types::digests::{CheckpointContentsDigest, CheckpointDigest, TransactionEffectsDigest};
+use sui_types::digests::{
+    CheckpointContentsDigest, CheckpointDigest, Digest, TransactionEffectsDigest,
+};
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::error::{SuiErrorKind, SuiResult};
 use sui_types::gas::GasCostSummary;
@@ -105,6 +108,9 @@ pub struct PendingCheckpointInfo {
     // Computed in calculate_pending_checkpoint_height() from consensus round,
     // there is no guarantee that this is increasing per checkpoint, because of checkpoint splitting.
     pub checkpoint_height: CheckpointHeight,
+    // Consensus commit ref and rejected transactions digest which corresponds to this checkpoint.
+    pub consensus_commit_ref: CommitRef,
+    pub rejected_transactions_digest: Digest,
 }
 
 #[derive(Clone, Debug)]
@@ -264,17 +270,7 @@ impl CheckpointStoreTables {
             ("epoch_last_checkpoint_map", config_u64.clone()),
             (
                 "watermarks",
-                ThConfig::new_with_config(
-                    4,
-                    1,
-                    KeyType::uniform(1),
-                    apply_relocation_filter(
-                        watermarks_config.clone(),
-                        pruner_watermarks.checkpoint_id.clone(),
-                        |(watermark, _): (CheckpointSequenceNumber, CheckpointDigest)| watermark,
-                        false,
-                    ),
-                ),
+                ThConfig::new_with_config(4, 1, KeyType::uniform(1), watermarks_config.clone()),
             ),
             (
                 "transaction_fork_detected",
@@ -363,25 +359,26 @@ impl CheckpointStore {
         );
 
         // Only insert the genesis checkpoint if the DB is empty and doesn't have it already
-        if self
-            .get_checkpoint_by_digest(checkpoint.digest())
-            .unwrap()
-            .is_none()
-        {
-            if epoch_store.epoch() == checkpoint.epoch {
-                epoch_store
-                    .put_genesis_checkpoint_in_builder(checkpoint.data(), &contents)
-                    .unwrap();
-            } else {
-                debug!(
-                    validator_epoch =% epoch_store.epoch(),
-                    genesis_epoch =% checkpoint.epoch(),
-                    "Not inserting checkpoint builder data for genesis checkpoint",
-                );
+        match self.get_checkpoint_by_sequence_number(0).unwrap() {
+            Some(existing_checkpoint) => {
+                assert_eq!(existing_checkpoint.digest(), checkpoint.digest())
             }
-            self.insert_checkpoint_contents(contents).unwrap();
-            self.insert_verified_checkpoint(&checkpoint).unwrap();
-            self.update_highest_synced_checkpoint(&checkpoint).unwrap();
+            None => {
+                if epoch_store.epoch() == checkpoint.epoch {
+                    epoch_store
+                        .put_genesis_checkpoint_in_builder(checkpoint.data(), &contents)
+                        .unwrap();
+                } else {
+                    debug!(
+                        validator_epoch =% epoch_store.epoch(),
+                        genesis_epoch =% checkpoint.epoch(),
+                        "Not inserting checkpoint builder data for genesis checkpoint",
+                    );
+                }
+                self.insert_checkpoint_contents(contents).unwrap();
+                self.insert_verified_checkpoint(&checkpoint).unwrap();
+                self.update_highest_synced_checkpoint(&checkpoint).unwrap();
+            }
         }
     }
 
@@ -1401,6 +1398,18 @@ impl CheckpointBuilder {
         pendings: Vec<PendingCheckpoint>,
     ) -> CheckpointBuilderResult<CheckpointSequenceNumber> {
         let _scope = monitored_scope("CheckpointBuilder::make_checkpoint");
+
+        let pending_ckpt_str = pendings
+            .iter()
+            .map(|p| {
+                format!(
+                    "height={}, commit={}",
+                    p.details().checkpoint_height,
+                    p.details().consensus_commit_ref
+                )
+            })
+            .join("; ");
+
         let last_details = pendings.last().unwrap().details().clone();
 
         // Stores the transactions that should be included in the checkpoint. Transactions will be recorded in the checkpoint
@@ -1428,8 +1437,18 @@ impl CheckpointBuilder {
             );
         }
 
+        let new_ckpt_str = new_checkpoints
+            .iter()
+            .map(|(ckpt, _)| format!("seq={}, digest={}", ckpt.sequence_number(), ckpt.digest()))
+            .join("; ");
+
         self.write_checkpoints(last_details.checkpoint_height, new_checkpoints)
             .await?;
+        info!(
+            "Made new checkpoint {} from pending checkpoint {}",
+            new_ckpt_str, pending_ckpt_str
+        );
+
         Ok(highest_sequence)
     }
 
@@ -1437,6 +1456,7 @@ impl CheckpointBuilder {
         &self,
         sorted_tx_effects_included_in_checkpoint: &[TransactionEffects],
         checkpoint_height: CheckpointHeight,
+        checkpoint_seq: CheckpointSequenceNumber,
         tx_index_offset: u64,
     ) -> (TransactionKey, Vec<TransactionEffects>) {
         let _scope =
@@ -1455,6 +1475,7 @@ impl CheckpointBuilder {
         let builder = AccumulatorSettlementTxBuilder::new(
             Some(self.effects_store.as_ref()),
             sorted_tx_effects_included_in_checkpoint,
+            checkpoint_seq,
             tx_index_offset,
         );
 
@@ -1465,6 +1486,7 @@ impl CheckpointBuilder {
             epoch,
             accumulator_root_obj_initial_shared_version,
             checkpoint_height,
+            checkpoint_seq,
         );
 
         let settlement_txns: Vec<_> = settlement_txns
@@ -1661,13 +1683,22 @@ impl CheckpointBuilder {
             sorted.extend(CausalOrder::causal_sort(unsorted));
 
             if let Some(settlement_root) = settlement_root {
-                // tx_effects.len() gives us the offset for this pending checkpoint's transactions
-                // in the final concatenated checkpoint
+                //TODO: this is an incorrect heuristic for checkpoint seq number
+                //      due to checkpoint splitting, to be fixed separately
+                let last_checkpoint =
+                    Self::load_last_built_checkpoint_summary(&self.epoch_store, &self.store)?;
+                let next_checkpoint_seq = last_checkpoint
+                    .as_ref()
+                    .map(|(seq, _)| *seq)
+                    .unwrap_or_default()
+                    + 1;
                 let tx_index_offset = tx_effects.len() as u64;
+
                 let (tx_key, settlement_effects) = self
                     .construct_and_execute_settlement_transactions(
                         &sorted,
                         pending.details.checkpoint_height,
+                        next_checkpoint_seq,
                         tx_index_offset,
                     )
                     .await;
@@ -3792,6 +3823,8 @@ mod tests {
                 timestamp_ms,
                 last_of_epoch: false,
                 checkpoint_height: i,
+                consensus_commit_ref: CommitRef::default(),
+                rejected_transactions_digest: Digest::default(),
             },
         }
     }
