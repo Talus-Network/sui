@@ -376,15 +376,17 @@ pub fn derive_dbmap_utils_general(input: TokenStream) -> TokenStream {
                             typed_store::tidehunter_util::add_key_space(
                                 &mut builder,
                                 stringify!(#cf_names),
-                                &cf_configs[stringify!(#cf_names)],
+                                cf_configs.get(stringify!(#cf_names))
+                                    .unwrap_or_else(|| panic!("Missing tidehunter configuration for table {} from database {}", stringify!(#cf_names), stringify!(#name))),
                             ),
                         )*
                     );
                     let key_shape = builder.build();
-                    let inner_db = typed_store::tidehunter_util::open(path.as_path(), key_shape, metric_conf.db_name.clone());
+                    let (inner_db, registry_id) = typed_store::tidehunter_util::open(path.as_path(), key_shape, metric_conf.db_name.clone());
                     let db = std::sync::Arc::new(typed_store::rocks::Database::new(
                         typed_store::rocks::Storage::TideHunter(inner_db),
-                        metric_conf));
+                        metric_conf,
+                        Some(registry_id)));
                     let (
                         #(
                             #field_names

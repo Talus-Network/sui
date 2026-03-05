@@ -38,13 +38,13 @@ itertools.workspace = true
 pin-project.workspace = true
 prometheus.workspace = true
 prost-types.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shared-crypto.workspace = true
 telemetry-subscribers.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 toml.workspace = true
 tonic.workspace = true
 tower-http.workspace = true
@@ -60,6 +60,7 @@ move-ir-types.workspace = true
 bin-version.workspace = true
 sui-default-config.workspace = true
 sui-display.workspace = true
+sui-futures.workspace = true
 sui-indexer-alt-metrics.workspace = true
 sui-indexer-alt-reader.workspace = true
 sui-indexer-alt-schema.workspace = true
@@ -75,6 +76,7 @@ sui-types.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+reqwest.workspace = true
 
 [features]
 staging = []

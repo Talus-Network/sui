@@ -1,21 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-import React, { useEffect } from "react";
 import Link from "@docusaurus/Link";
 import styles from "./index.module.css";
 
-import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
-import * as amplitude from "@amplitude/analytics-browser";
-
 export default function FooterLayout({ style, links, logo, copyright }) {
-  const { siteConfig } = useDocusaurusContext();
-
-  useEffect(() => {
-    amplitude.init(siteConfig.customFields.amplitudeKey, {
-      defaultTracking: true,
-    });
-  }, [siteConfig.customFields.amplitudeKey]);
-
   return (
     <footer className={styles.footer}>
       <div className={styles.footerWrap}>
@@ -80,6 +68,22 @@ export default function FooterLayout({ style, links, logo, copyright }) {
               >
                 <path
                   d="M16 0C7.16337 0 0 7.16339 0 16C0 24.8366 7.16337 32 16 32C24.8366 32 32 24.8366 32 16C31.9999 7.16339 24.8364 0 16 0ZM11.7311 23.7353H8.21819V12.3859H11.7311V23.7353ZM9.95793 10.8996C8.81063 10.8996 7.88055 9.96193 7.88055 8.80545C7.88055 7.64883 8.81076 6.71123 9.95793 6.71123C11.1051 6.71123 12.0352 7.64883 12.0352 8.80545C12.0352 9.962 11.1052 10.8996 9.95793 10.8996ZM24.8959 23.7353H21.4V17.7778C21.4 16.1438 20.7794 15.2317 19.4873 15.2317C18.0812 15.2317 17.3466 16.1817 17.3466 17.7778V23.7353H13.9773V12.3859H17.3466V13.9145C17.3466 13.9145 18.3601 12.0397 20.7666 12.0397C23.1732 12.0397 24.896 13.5091 24.896 16.549L24.8959 23.7353Z"
+                  fill="#F7F7F8"
+                />
+              </svg>
+            </Link>
+            <Link to="https://github.com/mystenLabs/sui/">
+              <svg
+                width="32"
+                height="32"
+                viewBox="0 0 32 32"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  fillRule="evenodd"
+                  clipRule="evenodd"
+                  d="M16 0C7.16 0 0 7.16 0 16C0 23.08 4.58 29.06 10.94 31.18C11.74 31.32 12.04 30.84 12.04 30.42C12.04 30.04 12.02 28.78 12.02 27.44C8 28.18 6.96 26.46 6.64 25.56C6.46 25.1 5.68 23.68 5 23.3C4.44 23 3.64 22.26 4.98 22.24C6.24 22.22 7.14 23.4 7.44 23.88C8.88 26.3 11.18 25.62 12.1 25.2C12.24 24.16 12.66 23.46 13.12 23.06C9.56 22.66 5.84 21.28 5.84 15.16C5.84 13.42 6.46 11.98 7.48 10.86C7.32 10.46 6.76 8.82 7.64 6.62C7.64 6.62 8.98 6.2 12.04 8.26C13.32 7.9 14.68 7.72 16.04 7.72C17.4 7.72 18.76 7.9 20.04 8.26C23.1 6.18 24.44 6.62 24.44 6.62C25.32 8.82 24.76 10.46 24.6 10.86C25.62 11.98 26.24 13.4 26.24 15.16C26.24 21.3 22.5 22.66 18.94 23.06C19.52 23.56 20.02 24.52 20.02 26.02C20.02 28.16 20 29.88 20 30.42C20 30.84 20.3 31.34 21.1 31.18C27.42 29.06 32 23.06 32 16C32 7.16 24.84 0 16 0Z"
                   fill="#F7F7F8"
                 />
               </svg>

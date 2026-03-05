@@ -1,19 +1,20 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use diesel_migrations::EmbeddedMigrations;
 use prometheus::Registry;
 use sui_indexer_alt_metrics::db::DbConnectionStatsCollector;
 use sui_pg_db::temp::TempDb;
 use tempfile::tempdir;
-use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{
-    Indexer, IndexerArgs,
-    ingestion::{ClientArgs, IngestionConfig, ingestion_client::IngestionClientArgs},
-};
+use crate::Indexer;
+use crate::IndexerArgs;
+use crate::ingestion::ClientArgs;
+use crate::ingestion::IngestionConfig;
+use crate::ingestion::ingestion_client::IngestionClientArgs;
 
 pub use sui_pg_db::*;
 
@@ -46,7 +47,6 @@ impl Indexer<Db> {
         migrations: Option<&'static EmbeddedMigrations>,
         metrics_prefix: Option<&str>,
         registry: &Registry,
-        cancel: CancellationToken,
     ) -> Result<Self> {
         let store = Db::for_write(database_url, db_args) // I guess our store needs a constructor fn
             .await
@@ -70,7 +70,6 @@ impl Indexer<Db> {
             ingestion_config,
             metrics_prefix,
             registry,
-            cancel,
         )
         .await
     }
@@ -98,7 +97,6 @@ impl Indexer<Db> {
             IngestionConfig::default(),
             None,
             &Registry::new(),
-            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -108,15 +106,17 @@ impl Indexer<Db> {
 
 #[cfg(test)]
 pub mod tests {
+    use std::sync::Arc;
 
     use async_trait::async_trait;
-    use std::sync::Arc;
-    use sui_indexer_alt_framework_store_traits::{CommitterWatermark, Connection as _};
+    use sui_indexer_alt_framework_store_traits::CommitterWatermark;
+    use sui_indexer_alt_framework_store_traits::Connection as _;
     use sui_types::full_checkpoint_content::Checkpoint;
 
-    use super::*;
+    use crate::ConcurrentConfig;
+    use crate::pipeline::Processor;
 
-    use crate::{ConcurrentConfig, pipeline::Processor};
+    use super::*;
 
     #[derive(FieldCount)]
     struct V {

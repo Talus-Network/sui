@@ -1,19 +1,25 @@
+// Copyright (c) The Move Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 pub mod legacy;
 pub mod legacy_lockfile;
 pub mod legacy_parser;
 
-use std::collections::{BTreeMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use crate::{
+    package::layout::SourcePackageLayout, package::paths::PackagePath, schema::PackageName,
+};
+
+use move_core_types::account_address::{AccountAddress, AccountAddressParseError};
 
 use anyhow::Result;
-use move_core_types::account_address::{AccountAddress, AccountAddressParseError};
 use regex::Regex;
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 use tracing::debug;
-
-use crate::package::layout::SourcePackageLayout;
-use crate::package::paths::PackagePath;
-use crate::schema::PackageName;
 
 pub type LegacyVersion = (u64, u64, u64);
 pub type LegacySubstitution = BTreeMap<String, LegacySubstOrRename>;
@@ -31,6 +37,24 @@ pub enum LegacySubstOrRename {
 
 /// The regex to detect `module <name>::<module_name>` on its different forms.
 const MODULE_REGEX: &str = r"\bmodule\s+([a-zA-Z_][\w]*)::([a-zA-Z_][\w]*)";
+
+// Compile regex once at program startup
+#[cfg(not(msim))]
+fn get_module_regex() -> &'static Regex {
+    static MODULE_REGEX_COMPILED: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(MODULE_REGEX).unwrap());
+    &MODULE_REGEX_COMPILED
+}
+
+// In simtests we need to use a thread local to avoid breaking determinism.
+#[cfg(msim)]
+fn get_module_regex() -> Regex {
+    thread_local! {
+        static MODULE_REGEX_COMPILED: LazyLock<Regex> = LazyLock::new(|| Regex::new(MODULE_REGEX).unwrap());
+    }
+
+    MODULE_REGEX_COMPILED.with(|val| (*val).clone())
+}
 
 /// This is a naive way to detect all module names that are part of the source code
 /// for a given package.
@@ -109,18 +133,15 @@ fn find_files(files: &mut Vec<PathBuf>, dir: &Path, extension: &str, max_depth: 
 // Consider supporting the legacy `address { module {} }` format.
 fn parse_module_names(contents: &str) -> Result<HashSet<String>> {
     let clean = strip_comments(contents);
-    let mut set = HashSet::new();
+
     // This matches `module a::b {}`, and `module a::b;` cases.
     // In both cases, the match is the 2nd group (so `match.get(1)`)
-    let regex = Regex::new(MODULE_REGEX).unwrap();
-
-    for cap in regex.captures_iter(&clean) {
-        set.insert(cap[1].to_string());
-    }
-
-    Ok(set
-        .into_iter()
-        .filter(|name| !is_address_like(name.as_str()))
+    Ok(get_module_regex()
+        .captures_iter(&clean)
+        .filter_map(|cap| {
+            let name = &cap[1];
+            (!is_address_like(name)).then(|| name.to_string())
+        })
         .collect())
 }
 

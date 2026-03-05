@@ -1,66 +1,71 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::HashMap,
-    fs,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::Path,
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::fs;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
 
-use anyhow::{Context, ensure};
-use diesel::{ExpressionMethods, OptionalExtension, QueryDsl};
+use anyhow::Context;
+use anyhow::ensure;
+use diesel::ExpressionMethods;
+use diesel::OptionalExtension;
+use diesel::QueryDsl;
 use diesel_async::RunQueryDsl;
+use prost::Message;
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use simulacrum::Simulacrum;
-use sui_indexer_alt::{BootstrapGenesis, config::IndexerConfig, setup_indexer};
-use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::{
-    AvailableRangeRequest, consistent_service_client::ConsistentServiceClient,
-};
-use sui_indexer_alt_consistent_store::{
-    args::RpcArgs as ConsistentArgs, args::TlsArgs as ConsistentTlsArgs,
-    config::ServiceConfig as ConsistentConfig, start_service as start_consistent_store,
-};
-use sui_indexer_alt_framework::{
-    IndexerArgs,
-    ingestion::{ClientArgs, ingestion_client::IngestionClientArgs},
-    postgres::schema::watermarks,
-};
-use sui_indexer_alt_graphql::{
-    RpcArgs as GraphQlArgs, args::KvArgs as GraphQlKvArgs, config::RpcConfig as GraphQlConfig,
-    start_rpc as start_graphql,
-};
-use sui_indexer_alt_jsonrpc::{
-    NodeArgs as JsonRpcNodeArgs, RpcArgs as JsonRpcArgs, config::RpcConfig as JsonRpcConfig,
-    start_rpc as start_jsonrpc,
-};
-use sui_indexer_alt_reader::{
-    bigtable_reader::BigtableArgs, consistent_reader::ConsistentReaderArgs,
-    fullnode_client::FullnodeArgs, system_package_task::SystemPackageTaskArgs,
-};
-use sui_pg_db::{
-    Db, DbArgs,
-    temp::{TempDb, get_available_port},
-};
-use sui_storage::blob::{Blob, BlobEncoding};
-use sui_types::full_checkpoint_content::{Checkpoint, CheckpointData};
-use sui_types::{
-    base_types::{ObjectRef, SuiAddress},
-    crypto::AccountKeyPair,
-    effects::TransactionEffects,
-    error::ExecutionError,
-    messages_checkpoint::VerifiedCheckpoint,
-    transaction::Transaction,
-};
+use sui_futures::service::Service;
+use sui_indexer_alt::BootstrapGenesis;
+use sui_indexer_alt::config::IndexerConfig;
+use sui_indexer_alt::setup_indexer;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::AvailableRangeRequest;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::consistent_service_client::ConsistentServiceClient;
+use sui_indexer_alt_consistent_store::args::RpcArgs as ConsistentArgs;
+use sui_indexer_alt_consistent_store::args::TlsArgs as ConsistentTlsArgs;
+use sui_indexer_alt_consistent_store::config::ServiceConfig as ConsistentConfig;
+use sui_indexer_alt_consistent_store::start_service as start_consistent_store;
+use sui_indexer_alt_framework::IndexerArgs;
+use sui_indexer_alt_framework::ingestion::ClientArgs;
+use sui_indexer_alt_framework::ingestion::ingestion_client::IngestionClientArgs;
+use sui_indexer_alt_framework::postgres::schema::watermarks;
+use sui_indexer_alt_graphql::RpcArgs as GraphQlArgs;
+use sui_indexer_alt_graphql::args::KvArgs as GraphQlKvArgs;
+use sui_indexer_alt_graphql::config::RpcConfig as GraphQlConfig;
+use sui_indexer_alt_graphql::start_rpc as start_graphql;
+use sui_indexer_alt_jsonrpc::NodeArgs as JsonRpcNodeArgs;
+use sui_indexer_alt_jsonrpc::RpcArgs as JsonRpcArgs;
+use sui_indexer_alt_jsonrpc::config::RpcConfig as JsonRpcConfig;
+use sui_indexer_alt_jsonrpc::start_rpc as start_jsonrpc;
+use sui_indexer_alt_reader::bigtable_reader::BigtableArgs;
+use sui_indexer_alt_reader::consistent_reader::ConsistentReaderArgs;
+use sui_indexer_alt_reader::fullnode_client::FullnodeArgs;
+use sui_indexer_alt_reader::system_package_task::SystemPackageTaskArgs;
+use sui_pg_db::Db;
+use sui_pg_db::DbArgs;
+use sui_pg_db::temp::TempDb;
+use sui_pg_db::temp::get_available_port;
+use sui_rpc::field::FieldMask;
+use sui_rpc::field::FieldMaskUtil;
+use sui_rpc::merge::Merge;
+use sui_rpc::proto::sui::rpc;
+use sui_types::base_types::ObjectRef;
+use sui_types::base_types::SuiAddress;
+use sui_types::crypto::AccountKeyPair;
+use sui_types::effects::TransactionEffects;
+use sui_types::error::ExecutionError;
+use sui_types::full_checkpoint_content::Checkpoint;
+use sui_types::messages_checkpoint::VerifiedCheckpoint;
+use sui_types::transaction::Transaction;
 use tempfile::TempDir;
-use tokio::{
-    task::JoinHandle,
-    time::{error::Elapsed, interval},
-    try_join,
-};
-use tokio_util::sync::CancellationToken;
+use tokio::time::error::Elapsed;
+use tokio::time::interval;
+use tokio::try_join;
 use url::Url;
 
 pub mod coin_registry;
@@ -104,21 +109,10 @@ pub struct OffchainCluster {
     /// The pipelines that the indexer is populating.
     pipelines: Vec<&'static str>,
 
-    /// A handle to the indexer task -- it will stop when the `cancel` token is triggered (or
-    /// earlier of its own accord).
-    indexer: JoinHandle<()>,
-
-    /// A handle to the consistent store task -- it will stop when the `cancel` token is triggered
-    /// (or earlier of its own accord).
-    consistent_store: JoinHandle<()>,
-
-    /// A handle to the JSON-RPC server task -- it will stop when the `cancel` token is triggered
-    /// (or earlier of its own accord).
-    jsonrpc: JoinHandle<()>,
-
-    /// A handle to the GraphQL server task -- it will stop when the `cancel` token is triggered
-    /// (or earlier of its own accord).
-    graphql: JoinHandle<()>,
+    /// Handles to all running services. Held on to so the services are not dropped (and therefore
+    /// aborted) until the cluster is stopped.
+    #[allow(unused)]
+    services: Service,
 
     /// Hold on to the database so it doesn't get dropped until the cluster is stopped.
     #[allow(unused)]
@@ -128,9 +122,6 @@ pub struct OffchainCluster {
     /// doesn't get cleaned up until the cluster is stopped.
     #[allow(unused)]
     dir: TempDir,
-
-    /// This token controls the clean up of the cluster.
-    cancel: CancellationToken,
 }
 
 pub struct OffchainClusterConfig {
@@ -152,7 +143,6 @@ impl FullCluster {
             Simulacrum::new(),
             OffchainClusterConfig::default(),
             &prometheus::Registry::new(),
-            CancellationToken::new(),
         )
         .await
     }
@@ -164,12 +154,11 @@ impl FullCluster {
         mut executor: Simulacrum,
         offchain_cluster_config: OffchainClusterConfig,
         registry: &prometheus::Registry,
-        cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
         let (client_args, temp_dir) = local_ingestion_client_args();
         executor.set_data_ingestion_path(temp_dir.path().to_owned());
 
-        let offchain = OffchainCluster::new(client_args, offchain_cluster_config, registry, cancel)
+        let offchain = OffchainCluster::new(client_args, offchain_cluster_config, registry)
             .await
             .context("Failed to create off-chain cluster")?;
 
@@ -224,13 +213,13 @@ impl FullCluster {
         let checkpoint = self.executor.create_checkpoint();
         let indexer = self
             .offchain
-            .wait_for_indexer(checkpoint.sequence_number, Duration::from_secs(10));
+            .wait_for_indexer(checkpoint.sequence_number, Duration::from_secs(100));
         let consistent_store = self
             .offchain
-            .wait_for_consistent_store(checkpoint.sequence_number, Duration::from_secs(10));
+            .wait_for_consistent_store(checkpoint.sequence_number, Duration::from_secs(100));
         let graphql = self
             .offchain
-            .wait_for_graphql(checkpoint.sequence_number, Duration::from_secs(10));
+            .wait_for_graphql(checkpoint.sequence_number, Duration::from_secs(100));
 
         try_join!(indexer, consistent_store, graphql)
             .expect("Timed out waiting for indexer and consistent store");
@@ -296,12 +285,6 @@ impl FullCluster {
     ) -> Result<(), Elapsed> {
         self.offchain.wait_for_graphql(checkpoint, timeout).await
     }
-
-    /// Triggers cancellation of all downstream services, waits for them to stop, cleans up the
-    /// temporary database, and the temporary directory used for ingestion.
-    pub async fn stopped(self) {
-        self.offchain.stopped().await;
-    }
 }
 
 impl OffchainCluster {
@@ -325,7 +308,6 @@ impl OffchainCluster {
             bootstrap_genesis,
         }: OffchainClusterConfig,
         registry: &prometheus::Registry,
-        cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
         let consistent_port = get_available_port();
         let consistent_listen_address =
@@ -370,7 +352,6 @@ impl OffchainCluster {
             indexer_config,
             bootstrap_genesis,
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to setup indexer")?;
@@ -386,25 +367,9 @@ impl OffchainCluster {
             "0.0.0",
             consistent_config,
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to start Consistent Store")?;
-
-        let jsonrpc = start_jsonrpc(
-            Some(database_url.clone()),
-            None,
-            DbArgs::default(),
-            BigtableArgs::default(),
-            jsonrpc_args,
-            JsonRpcNodeArgs::default(),
-            SystemPackageTaskArgs::default(),
-            jsonrpc_config,
-            registry,
-            cancel.child_token(),
-        )
-        .await
-        .context("Failed to start JSON-RPC server")?;
 
         let consistent_reader_args = ConsistentReaderArgs {
             consistent_store_url: Some(
@@ -412,6 +377,21 @@ impl OffchainCluster {
             ),
             consistent_store_statement_timeout_ms: None,
         };
+
+        let jsonrpc = start_jsonrpc(
+            Some(database_url.clone()),
+            None,
+            DbArgs::default(),
+            BigtableArgs::default(),
+            consistent_reader_args.clone(),
+            jsonrpc_args,
+            JsonRpcNodeArgs::default(),
+            SystemPackageTaskArgs::default(),
+            jsonrpc_config,
+            registry,
+        )
+        .await
+        .context("Failed to start JSON-RPC server")?;
 
         let graphql = start_graphql(
             Some(database_url.clone()),
@@ -425,10 +405,14 @@ impl OffchainCluster {
             graphql_config,
             pipelines.iter().map(|p| p.to_string()).collect(),
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to start GraphQL server")?;
+
+        let services = indexer
+            .merge(consistent_store)
+            .merge(jsonrpc)
+            .merge(graphql);
 
         Ok(Self {
             consistent_listen_address,
@@ -436,13 +420,9 @@ impl OffchainCluster {
             graphql_listen_address,
             db,
             pipelines,
-            indexer,
-            consistent_store,
-            jsonrpc,
-            graphql,
+            services,
             database,
             dir,
-            cancel,
         })
     }
 
@@ -664,16 +644,6 @@ impl OffchainCluster {
         })
         .await
     }
-
-    /// Triggers cancellation of all downstream services, waits for them to stop, and cleans up the
-    /// temporary database.
-    pub async fn stopped(self) {
-        self.cancel.cancel();
-        let _ = self.indexer.await;
-        let _ = self.consistent_store.await;
-        let _ = self.jsonrpc.await;
-        let _ = self.graphql.await;
-    }
 }
 
 impl Default for OffchainClusterConfig {
@@ -708,12 +678,46 @@ pub fn local_ingestion_client_args() -> (ClientArgs, TempDir) {
 
 /// Writes a checkpoint file to the given path.
 pub async fn write_checkpoint(path: &Path, checkpoint: Checkpoint) -> anyhow::Result<()> {
-    // Convert to CheckpointData for serialization
-    // TODO: Change to proto format once we merge pull/24066
-    let checkpoint_data: CheckpointData = checkpoint.into();
-    let file_name = format!("{}.chk", checkpoint_data.checkpoint_summary.sequence_number);
+    let sequence_number = checkpoint.summary.sequence_number;
+
+    let mask = FieldMask::from_paths([
+        rpc::v2::Checkpoint::path_builder().sequence_number(),
+        rpc::v2::Checkpoint::path_builder().summary().bcs().value(),
+        rpc::v2::Checkpoint::path_builder().signature().finish(),
+        rpc::v2::Checkpoint::path_builder().contents().bcs().value(),
+        rpc::v2::Checkpoint::path_builder()
+            .transactions()
+            .transaction()
+            .bcs()
+            .value(),
+        rpc::v2::Checkpoint::path_builder()
+            .transactions()
+            .effects()
+            .bcs()
+            .value(),
+        rpc::v2::Checkpoint::path_builder()
+            .transactions()
+            .effects()
+            .unchanged_loaded_runtime_objects()
+            .finish(),
+        rpc::v2::Checkpoint::path_builder()
+            .transactions()
+            .events()
+            .bcs()
+            .value(),
+        rpc::v2::Checkpoint::path_builder()
+            .objects()
+            .objects()
+            .bcs()
+            .value(),
+    ]);
+
+    let proto_checkpoint = rpc::v2::Checkpoint::merge_from(&checkpoint, &mask.into());
+    let proto_bytes = proto_checkpoint.encode_to_vec();
+    let compressed = zstd::encode_all(&proto_bytes[..], 3)?;
+
+    let file_name = format!("{}.binpb.zst", sequence_number);
     let file_path = path.join(file_name);
-    let blob = Blob::encode(&checkpoint_data, BlobEncoding::Bcs)?;
-    fs::write(file_path, blob.to_bytes())?;
+    fs::write(file_path, compressed)?;
     Ok(())
 }

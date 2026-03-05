@@ -19,6 +19,7 @@ use prometheus::{
     register_int_counter_with_registry,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sui_types::accumulator_event::AccumulatorEvent;
 use typed_store::TypedStoreError;
 use typed_store::rocksdb::compaction_filter::Decision;
 
@@ -118,6 +119,7 @@ const ENV_VAR_INVALIDATE_INSTEAD_OF_UPDATE: &str = "INVALIDATE_INSTEAD_OF_UPDATE
 pub struct TotalBalance {
     pub balance: i128,
     pub num_coins: i64,
+    pub address_balance: u64,
 }
 
 #[derive(Debug)]
@@ -239,6 +241,8 @@ pub struct IndexStoreTables {
     owner_index: DBMap<OwnerIndexKey, ObjectInfo>,
 
     coin_index_2: DBMap<CoinIndexKey2, CoinInfo>,
+    // Simple index that just tracks the existance of an address balance for an address.
+    address_balances: DBMap<(SuiAddress, TypeTag), ()>,
 
     /// This is an index of object references to currently existing dynamic field object, indexed by the
     /// composite key of the object ID of their parent and the object ID of the dynamic field object.
@@ -281,6 +285,23 @@ impl IndexStoreTables {
         self.meta.insert(&(), &metadata)?;
 
         Ok(())
+    }
+
+    pub fn get_dynamic_fields_iterator(
+        &self,
+        object: ObjectID,
+        cursor: Option<ObjectID>,
+    ) -> impl Iterator<Item = Result<(ObjectID, DynamicFieldInfo), TypedStoreError>> + '_ {
+        debug!(?object, "get_dynamic_fields");
+        // The object id 0 is the smallest possible
+        let iter_lower_bound = (object, cursor.unwrap_or(ObjectID::ZERO));
+        let iter_upper_bound = (object, ObjectID::MAX);
+        self.dynamic_field_index
+            .safe_iter_with_bounds(Some(iter_lower_bound), Some(iter_upper_bound))
+            // skip an extra b/c the cursor is exclusive
+            .skip(usize::from(cursor.is_some()))
+            .take_while(move |result| result.is_err() || (result.as_ref().unwrap().0.0 == object))
+            .map_ok(|((_, c), object_info)| (c, object_info))
     }
 }
 
@@ -617,6 +638,7 @@ impl IndexStore {
                 let entry = map.entry(coin_type).or_insert(TotalBalance {
                     num_coins: 0,
                     balance: 0,
+                    address_balance: 0,
                 });
                 entry.num_coins -= 1;
                 entry.balance -= coin.balance.value() as i128;
@@ -661,6 +683,7 @@ impl IndexStore {
                 let entry = map.entry(coin_type).or_insert(TotalBalance {
                     num_coins: 0,
                     balance: 0,
+                    address_balance: 0,
                 });
                 entry.num_coins += 1;
                 entry.balance += coin.balance.value() as i128;
@@ -716,6 +739,7 @@ impl IndexStore {
         digest: &TransactionDigest,
         timestamp_ms: u64,
         tx_coins: Option<TxCoins>,
+        accumulator_events: Vec<AccumulatorEvent>,
     ) -> SuiResult<u64> {
         let sequence = self.next_sequence_number.fetch_add(1, Ordering::SeqCst);
         let mut batch = self.tables.transactions_from_addr.batch();
@@ -768,6 +792,15 @@ impl IndexStore {
 
         // Coin Index
         let cache_updates = self.index_coin(digest, &mut batch, &object_index_changes, tx_coins)?;
+
+        // update address balances index
+        let address_balance_updates = accumulator_events.into_iter().filter_map(|event| {
+            let ty = &event.write.address.ty;
+            // Only process events with Balance<T> types
+            let coin_type = sui_types::balance::Balance::maybe_get_balance_type_param(ty)?;
+            Some(((event.write.address.address, coin_type), ()))
+        });
+        batch.insert_batch(&self.tables.address_balances, address_balance_updates)?;
 
         // Owner index
         batch.delete_batch(
@@ -1446,18 +1479,7 @@ impl IndexStore {
         cursor: Option<ObjectID>,
     ) -> SuiResult<impl Iterator<Item = Result<(ObjectID, DynamicFieldInfo), TypedStoreError>> + '_>
     {
-        debug!(?object, "get_dynamic_fields");
-        // The object id 0 is the smallest possible
-        let iter_lower_bound = (object, cursor.unwrap_or(ObjectID::ZERO));
-        let iter_upper_bound = (object, ObjectID::MAX);
-        Ok(self
-            .tables
-            .dynamic_field_index
-            .safe_iter_with_bounds(Some(iter_lower_bound), Some(iter_upper_bound))
-            // skip an extra b/c the cursor is exclusive
-            .skip(usize::from(cursor.is_some()))
-            .take_while(move |result| result.is_err() || (result.as_ref().unwrap().0.0 == object))
-            .map_ok(|((_, c), object_info)| (c, object_info)))
+        Ok(self.tables.get_dynamic_fields_iterator(object, cursor))
     }
 
     #[instrument(skip(self))]
@@ -1529,6 +1551,19 @@ impl IndexStore {
             .get_owner_objects_iterator(owner, cursor, filter)?
             .take(limit)
             .collect())
+    }
+
+    pub fn get_address_balance_coin_types_iter(
+        &self,
+        owner: SuiAddress,
+    ) -> impl Iterator<Item = TypeTag> {
+        let start_key = (owner, TypeTag::Bool);
+        self.tables()
+            .address_balances
+            .safe_iter_with_bounds(Some(start_key), None)
+            .map(|result| result.expect("iterator db error"))
+            .take_while(move |(key, _)| key.0 == owner)
+            .map(|(key, _)| key.1)
     }
 
     pub fn get_owned_coins_iterator(
@@ -1648,16 +1683,26 @@ impl IndexStore {
     /// cache miss, we go to the database (expensive) and update the cache. Notice that db read is
     /// done with `spawn_blocking` as that is expected to block
     #[instrument(skip(self))]
-    pub fn get_balance(&self, owner: SuiAddress, coin_type: TypeTag) -> SuiResult<TotalBalance> {
+    pub fn get_coin_object_balance(
+        &self,
+        owner: SuiAddress,
+        coin_type: TypeTag,
+    ) -> SuiResult<TotalBalance> {
         let force_disable_cache = read_size_from_env(ENV_VAR_DISABLE_INDEX_CACHE).unwrap_or(0) > 0;
         let cloned_coin_type = coin_type.clone();
         let metrics_cloned = self.metrics.clone();
         let coin_index_cloned = self.tables.coin_index_2.clone();
         if force_disable_cache {
-            Self::get_balance_from_db(metrics_cloned, coin_index_cloned, owner, cloned_coin_type)
-                .map_err(|e| {
+            return Self::get_balance_from_db(
+                metrics_cloned,
+                coin_index_cloned,
+                owner,
+                cloned_coin_type,
+            )
+            .map_err(|e| {
                 SuiErrorKind::ExecutionError(format!("Failed to read balance frm DB: {:?}", e))
-            })?;
+                    .into()
+            });
         }
 
         self.metrics.balance_lookup_from_total.inc();
@@ -1701,7 +1746,7 @@ impl IndexStore {
     /// `get_Balance()` queries. Notice that db read is performed with `spawn_blocking` as that is
     /// expected to block
     #[instrument(skip(self))]
-    pub fn get_all_balance(
+    pub fn get_all_coin_object_balances(
         &self,
         owner: SuiAddress,
     ) -> SuiResult<Arc<HashMap<TypeTag, TotalBalance>>> {
@@ -1709,14 +1754,14 @@ impl IndexStore {
         let metrics_cloned = self.metrics.clone();
         let coin_index_cloned = self.tables.coin_index_2.clone();
         if force_disable_cache {
-            Self::get_all_balances_from_db(metrics_cloned, coin_index_cloned, owner).map_err(
-                |e| {
+            return Self::get_all_balances_from_db(metrics_cloned, coin_index_cloned, owner)
+                .map_err(|e| {
                     SuiErrorKind::ExecutionError(format!(
                         "Failed to read all balance from DB: {:?}",
                         e
                     ))
-                },
-            )?;
+                    .into()
+                });
         }
 
         self.metrics.all_balance_lookup_from_total.inc();
@@ -1749,7 +1794,11 @@ impl IndexStore {
             balance += coin_info.balance as i128;
             num_coins += 1;
         }
-        Ok(TotalBalance { balance, num_coins })
+        Ok(TotalBalance {
+            balance,
+            num_coins,
+            address_balance: 0,
+        })
     }
 
     /// Read all balances for a `SuiAddress` from the backend database
@@ -1782,6 +1831,7 @@ impl IndexStore {
                 TotalBalance {
                     num_coins: coin_object_count,
                     balance: total_balance,
+                    address_balance: 0,
                 },
             );
         }
@@ -1823,6 +1873,7 @@ impl IndexStore {
                 Ok(TotalBalance {
                     balance: old_balance.balance + balance_delta.balance,
                     num_coins: old_balance.num_coins + balance_delta.num_coins,
+                    address_balance: old_balance.address_balance,
                 })
             } else {
                 balance_delta.clone()
@@ -1856,10 +1907,12 @@ impl IndexStore {
                     let old = new_balance.entry(key.clone()).or_insert(TotalBalance {
                         balance: 0,
                         num_coins: 0,
+                        address_balance: 0,
                     });
                     let new_total = TotalBalance {
                         balance: old.balance + delta.balance,
                         num_coins: old.num_coins + delta.num_coins,
+                        address_balance: old.address_balance,
                     };
                     new_balance.insert(key.clone(), new_total);
                 }
@@ -1939,6 +1992,7 @@ mod tests {
             &TransactionDigest::random(),
             1234,
             Some(tx_coins),
+            vec![],
         )?;
 
         let balance_from_db = IndexStore::get_balance_from_db(
@@ -1947,12 +2001,12 @@ mod tests {
             address,
             GAS::type_tag(),
         )?;
-        let balance = index_store.get_balance(address, GAS::type_tag())?;
+        let balance = index_store.get_coin_object_balance(address, GAS::type_tag())?;
         assert_eq!(balance, balance_from_db);
         assert_eq!(balance.balance, 1000);
         assert_eq!(balance.num_coins, 10);
 
-        let all_balance = index_store.get_all_balance(address)?;
+        let all_balance = index_store.get_all_coin_object_balances(address)?;
         let balance = all_balance.get(&GAS::type_tag()).unwrap();
         assert_eq!(*balance, balance_from_db);
         assert_eq!(balance.balance, 1000);
@@ -1981,6 +2035,7 @@ mod tests {
             &TransactionDigest::random(),
             1234,
             Some(tx_coins),
+            vec![],
         )?;
         let balance_from_db = IndexStore::get_balance_from_db(
             index_store.metrics.clone(),
@@ -1988,7 +2043,7 @@ mod tests {
             address,
             GAS::type_tag(),
         )?;
-        let balance = index_store.get_balance(address, GAS::type_tag())?;
+        let balance = index_store.get_coin_object_balance(address, GAS::type_tag())?;
         assert_eq!(balance, balance_from_db);
         assert_eq!(balance.balance, 700);
         assert_eq!(balance.num_coins, 7);
@@ -1998,10 +2053,10 @@ mod tests {
             .caches
             .per_coin_type_balance
             .invalidate(&(address, GAS::type_tag()));
-        let all_balance = index_store.get_all_balance(address)?;
+        let all_balance = index_store.get_all_coin_object_balances(address)?;
         assert_eq!(all_balance.get(&GAS::type_tag()).unwrap().balance, 700);
         assert_eq!(all_balance.get(&GAS::type_tag()).unwrap().num_coins, 7);
-        let balance = index_store.get_balance(address, GAS::type_tag())?;
+        let balance = index_store.get_coin_object_balance(address, GAS::type_tag())?;
         assert_eq!(balance, balance_from_db);
         assert_eq!(balance.balance, 700);
         assert_eq!(balance.num_coins, 7);

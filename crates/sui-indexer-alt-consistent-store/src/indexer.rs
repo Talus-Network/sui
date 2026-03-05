@@ -3,21 +3,22 @@
 
 use std::path::Path;
 
-use anyhow::{Context as _, ensure};
+use anyhow::Context as _;
+use anyhow::ensure;
 use prometheus::Registry;
-use sui_indexer_alt_framework::{
-    self as framework, IndexerArgs,
-    ingestion::{ClientArgs, IngestionConfig},
-    pipeline::sequential::{self, SequentialConfig},
-};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use sui_indexer_alt_framework::IndexerArgs;
+use sui_indexer_alt_framework::ingestion::ClientArgs;
+use sui_indexer_alt_framework::ingestion::IngestionConfig;
+use sui_indexer_alt_framework::pipeline::sequential::SequentialConfig;
+use sui_indexer_alt_framework::pipeline::sequential::{self};
+use sui_indexer_alt_framework::service::Service;
+use sui_indexer_alt_framework::{self as framework};
 
-use crate::{
-    config::ConsistencyConfig,
-    db::config::DbConfig,
-    store::{Schema, Store, synchronizer::Synchronizer},
-};
+use crate::config::ConsistencyConfig;
+use crate::db::config::DbConfig;
+use crate::store::Schema;
+use crate::store::Store;
+use crate::store::synchronizer::Synchronizer;
 
 /// An indexer specialised for writing to a RocksDB store via a schema, `S`, composed of three main
 /// components:
@@ -59,7 +60,6 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
         ingestion_config: IngestionConfig,
         db_config: DbConfig,
         registry: &Registry,
-        cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
         let store = Store::open(
             path,
@@ -74,7 +74,6 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
             consistency_config.stride,
             consistency_config.buffer_size,
             indexer_args.first_checkpoint,
-            cancel.child_token(),
         );
 
         let metrics_prefix = Some("consistent_indexer");
@@ -85,7 +84,6 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
             ingestion_config,
             metrics_prefix,
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to create indexer")?;
@@ -120,6 +118,7 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
             H::NAME
         );
 
+        // TODO: Refactor consistent store indexer to use `init_watermark` instead of wrapping `sequential_pipeline`.
         self.sync
             .register_pipeline(H::NAME)
             .with_context(|| format!("Failed to add pipeline {:?} to synchronizer", H::NAME))?;
@@ -135,16 +134,15 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
     /// Start ingesting checkpoints, consuming the indexer in the process.
     ///
     /// See [`framework::Indexer::run`] for details.
-    pub(crate) async fn run(self) -> anyhow::Result<JoinHandle<()>> {
+    pub(crate) async fn run(self) -> anyhow::Result<Service> {
         // Associate the indexer's store with the synchronizer. This spins up a separate task for
         // each pipeline that was registered, and installs the write queues that talk to those
         // tasks into the store, so that when a write arrives to the store for a particular
         // pipeline, it can make its way to the right task.
-        let h_sync = self.indexer.store().sync(self.sync)?;
-        let h_indexer = self.indexer.run();
-        Ok(tokio::spawn(async move {
-            let (_, _) = futures::join!(h_sync, h_indexer);
-        }))
+        let s_sync = self.indexer.store().sync(self.sync)?;
+        let s_indexer = self.indexer.run().await?;
+
+        Ok(s_indexer.attach(s_sync))
     }
 }
 
@@ -152,17 +150,16 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
 mod tests {
     use std::sync::Arc;
 
-    use sui_indexer_alt_framework::{
-        ingestion::ingestion_client::IngestionClientArgs,
-        pipeline::Processor,
-        types::{full_checkpoint_content::Checkpoint, object::Object},
-    };
+    use sui_indexer_alt_framework::ingestion::ingestion_client::IngestionClientArgs;
+    use sui_indexer_alt_framework::pipeline::Processor;
+    use sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint;
+    use sui_indexer_alt_framework::types::object::Object;
+    use tokio::fs;
 
-    use crate::{
-        db::{Db, tests::wm},
-        restore::Restore,
-        store::Connection,
-    };
+    use crate::db::Db;
+    use crate::db::tests::wm;
+    use crate::restore::Restore;
+    use crate::store::Connection;
 
     use super::*;
 
@@ -226,6 +223,9 @@ mod tests {
         }
 
         {
+            // Create a dummy ingestion directory.
+            fs::create_dir(d.path().join("checkpoints")).await.unwrap();
+
             // If the pipeline is being restored, then the indexer will not allow it to be added.
             let mut indexer = Indexer::<TestSchema>::new(
                 d.path().join("db"),
@@ -241,7 +241,6 @@ mod tests {
                 IngestionConfig::default(),
                 DbConfig::default(),
                 &prometheus::Registry::new(),
-                CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -274,7 +273,6 @@ mod tests {
                 IngestionConfig::default(),
                 DbConfig::default(),
                 &prometheus::Registry::new(),
-                CancellationToken::new(),
             )
             .await
             .unwrap();

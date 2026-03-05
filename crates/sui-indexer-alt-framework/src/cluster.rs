@@ -1,26 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::ops::Deref;
+use std::ops::DerefMut;
+use std::sync::Arc;
 
 use anyhow::Context;
 use diesel_migrations::EmbeddedMigrations;
 use prometheus::Registry;
-use sui_indexer_alt_metrics::{MetricsArgs, MetricsService};
-use tokio::{signal, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
-use tracing::info;
+use sui_futures::service::Service;
+use sui_indexer_alt_metrics::MetricsArgs;
+use sui_indexer_alt_metrics::MetricsService;
 use url::Url;
 
-use crate::{
-    Indexer, IndexerArgs, Result,
-    ingestion::{ClientArgs, IngestionConfig},
-    metrics::{IndexerMetrics, IngestionMetrics},
-    postgres::{Db, DbArgs},
-};
+use crate::Indexer;
+use crate::IndexerArgs;
+use crate::Result;
+use crate::ingestion::ClientArgs;
+use crate::ingestion::IngestionConfig;
+use crate::metrics::IndexerMetrics;
+use crate::metrics::IngestionMetrics;
+use crate::postgres::Db;
+use crate::postgres::DbArgs;
 
 /// Bundle of arguments for setting up an indexer cluster (an Indexer and its associated Metrics
 /// service). This struct is offered as a convenience for the common case of parsing command-line
@@ -33,7 +34,7 @@ pub struct Args {
 
     /// Where to get checkpoint data from.
     #[clap(flatten)]
-    pub client_args: Option<ClientArgs>,
+    pub client_args: ClientArgs,
 
     /// How to expose metrics.
     #[clap(flatten)]
@@ -46,9 +47,6 @@ pub struct Args {
 pub struct IndexerCluster {
     indexer: Indexer<Db>,
     metrics: MetricsService,
-
-    /// Cancelling this token signals cancellation to both the indexer and metrics service.
-    cancel: CancellationToken,
 }
 
 /// Builder for creating an IndexerCluster with a fluent API
@@ -109,7 +107,7 @@ impl IndexerClusterBuilder {
     /// Set client arguments (where to get checkpoint data from).
     /// This overwrites any previously set client args.
     pub fn with_client_args(mut self, args: ClientArgs) -> Self {
-        self.args.client_args = Some(args);
+        self.args.client_args = args;
         self
     }
 
@@ -152,10 +150,9 @@ impl IndexerClusterBuilder {
 
         tracing_subscriber::fmt::init();
 
-        let cancel = CancellationToken::new();
         let registry = Registry::new();
-        let metrics = MetricsService::new(self.args.metrics_args, registry, cancel.child_token());
-        let client_args = self.args.client_args.context("client_args is required")?;
+        let metrics = MetricsService::new(self.args.metrics_args, registry);
+        let client_args = self.args.client_args;
 
         let indexer = Indexer::new_from_pg(
             database_url,
@@ -166,15 +163,10 @@ impl IndexerClusterBuilder {
             self.migrations,
             self.metrics_prefix.as_deref(),
             metrics.registry(),
-            cancel.child_token(),
         )
         .await?;
 
-        Ok(IndexerCluster {
-            indexer,
-            metrics,
-            cancel,
-        })
+        Ok(IndexerCluster { indexer, metrics })
     }
 }
 
@@ -196,38 +188,14 @@ impl IndexerCluster {
         self.indexer.ingestion_metrics()
     }
 
-    /// This token controls stopping the indexer and metrics service. Clone it before calling
-    /// [Self::run] to retain the ability to stop the service after it has started.
-    pub fn cancel(&self) -> &CancellationToken {
-        &self.cancel
-    }
-
-    /// Starts the indexer and metrics service, returning a handle to `await` the service's exit.
+    /// Starts the indexer and metrics service, returning a handle over the service's tasks.
     /// The service will exit when the indexer has finished processing all the checkpoints it was
-    /// configured to process, or when it receives an interrupt signal.
-    pub async fn run(self) -> Result<JoinHandle<()>> {
-        let h_ctrl_c = tokio::spawn({
-            let cancel = self.cancel.clone();
-            async move {
-                tokio::select! {
-                    _ = cancel.cancelled() => {}
-                    _ = signal::ctrl_c() => {
-                        info!("Received Ctrl-C, shutting down...");
-                        cancel.cancel();
-                    }
-                }
-            }
-        });
+    /// configured to process, or when it is instructed to shut down.
+    pub async fn run(self) -> Result<Service> {
+        let s_indexer = self.indexer.run().await?;
+        let s_metrics = self.metrics.run().await?;
 
-        let h_metrics = self.metrics.run().await?;
-        let h_indexer = self.indexer.run().await?;
-
-        Ok(tokio::spawn(async move {
-            let _ = h_indexer.await;
-            self.cancel.cancel();
-            let _ = h_metrics.await;
-            let _ = h_ctrl_c.await;
-        }))
+        Ok(s_indexer.attach(s_metrics))
     }
 }
 
@@ -247,10 +215,14 @@ impl DerefMut for IndexerCluster {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::IpAddr;
+    use std::net::Ipv4Addr;
+    use std::net::SocketAddr;
 
     use async_trait::async_trait;
-    use diesel::{Insertable, QueryDsl, Queryable};
+    use diesel::Insertable;
+    use diesel::QueryDsl;
+    use diesel::Queryable;
     use diesel_async::RunQueryDsl;
     use sui_synthetic_ingestion::synthetic_ingestion;
     use tempfile::tempdir;
@@ -260,10 +232,11 @@ mod tests {
     use crate::ingestion::ingestion_client::IngestionClientArgs;
     use crate::pipeline::Processor;
     use crate::pipeline::concurrent::ConcurrentConfig;
-    use crate::postgres::{
-        Connection, Db, DbArgs,
-        temp::{TempDb, get_available_port},
-    };
+    use crate::postgres::Connection;
+    use crate::postgres::Db;
+    use crate::postgres::DbArgs;
+    use crate::postgres::temp::TempDb;
+    use crate::postgres::temp::get_available_port;
     use crate::types::full_checkpoint_content::Checkpoint;
 
     use super::*;
@@ -352,13 +325,13 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), get_available_port());
 
         let args = Args {
-            client_args: Some(ClientArgs {
+            client_args: ClientArgs {
                 ingestion: IngestionClientArgs {
                     local_ingestion_path: Some(checkpoint_dir.path().to_owned()),
                     ..Default::default()
                 },
                 ..Default::default()
-            }),
+            },
             indexer_args: IndexerArgs {
                 first_checkpoint: Some(0),
                 last_checkpoint: Some(9),
@@ -384,7 +357,7 @@ mod tests {
 
         // Run the indexer until it signals completion. We have configured it to stop after
         // ingesting 10 checkpoints, so it should shut itself down.
-        indexer.run().await.unwrap().await.unwrap();
+        indexer.run().await.unwrap().join().await.unwrap();
 
         // Check that the results were all written out.
         {
@@ -398,13 +371,14 @@ mod tests {
             assert_eq!(counts.len(), 10);
             for (i, count) in counts.iter().enumerate() {
                 assert_eq!(count.cp_sequence_number, i as i64);
-                assert_eq!(count.count, 2);
+                assert_eq!(count.count, 3); // 2 user transactions + 1 settlement transaction
             }
         }
 
         // Check that ingestion metrics were updated.
         assert_eq!(ingestion_metrics.total_ingested_checkpoints.get(), 10);
-        assert_eq!(ingestion_metrics.total_ingested_transactions.get(), 20);
+        // 10 checkpoints, 2 user transactions + 1 settlement transaction per checkpoint
+        assert_eq!(ingestion_metrics.total_ingested_transactions.get(), 30);
         assert_eq!(ingestion_metrics.latest_ingested_checkpoint.get(), 9);
 
         macro_rules! assert_pipeline_metric {
@@ -431,8 +405,9 @@ mod tests {
         // The watermark checkpoint is inclusive, but the transaction is exclusive
         assert_pipeline_metric!(watermark_checkpoint, 9);
         assert_pipeline_metric!(watermark_checkpoint_in_db, 9);
-        assert_pipeline_metric!(watermark_transaction, 20);
-        assert_pipeline_metric!(watermark_transaction_in_db, 20);
+        // 10 checkpoints, 2 user transactions + 1 settlement transaction per checkpoint
+        assert_pipeline_metric!(watermark_transaction, 30);
+        assert_pipeline_metric!(watermark_transaction_in_db, 30);
     }
 
     #[test]
@@ -443,13 +418,13 @@ mod tests {
                     first_checkpoint: Some(100),
                     ..Default::default()
                 },
-                client_args: Some(ClientArgs {
+                client_args: ClientArgs {
                     ingestion: IngestionClientArgs {
                         local_ingestion_path: Some("/bundled".into()),
                         ..Default::default()
                     },
                     ..Default::default()
-                }),
+                },
                 metrics_args: MetricsArgs {
                     metrics_address: "127.0.0.1:8080".parse().unwrap(),
                 },
@@ -474,9 +449,9 @@ mod tests {
             builder
                 .args
                 .client_args
-                .unwrap()
                 .ingestion
                 .local_ingestion_path
+                .as_ref()
                 .unwrap()
                 .to_string_lossy(),
             "/individual"
@@ -509,13 +484,13 @@ mod tests {
                     first_checkpoint: Some(100),
                     ..Default::default()
                 },
-                client_args: Some(ClientArgs {
+                client_args: ClientArgs {
                     ingestion: IngestionClientArgs {
                         local_ingestion_path: Some("/bundled".into()),
                         ..Default::default()
                     },
                     ..Default::default()
-                }),
+                },
                 metrics_args: MetricsArgs {
                     metrics_address: "127.0.0.1:8080".parse().unwrap(),
                 },
@@ -526,9 +501,9 @@ mod tests {
             builder
                 .args
                 .client_args
-                .unwrap()
                 .ingestion
                 .local_ingestion_path
+                .as_ref()
                 .unwrap()
                 .to_string_lossy(),
             "/bundled"

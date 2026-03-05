@@ -1,21 +1,20 @@
 // Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, io::BufRead, io::Write};
+use crate::build_plan::BuildPlan;
 
 use move_command_line_common::interactive::Terminal;
 use move_compiler::{diagnostics::Migration, editions::Edition};
-use once_cell::sync::Lazy;
+use move_package_alt::MoveFlavor;
 
-use crate::build_plan::BuildPlan;
-use move_package_alt::flavor::MoveFlavor;
+use std::{collections::BTreeMap, io::BufRead, io::Write, sync::LazyLock};
 
 pub const MIGRATION_MSG: &str = "Package toml does not specify an edition. As of 2024, Move requires all packages to define \
     a language edition.";
 
 pub const EDITION_SELECT_PROMPT: &str = "Please select one of the following editions:";
 
-pub static EDITION_OPTIONS: Lazy<BTreeMap<String, Edition>> = Lazy::new(|| {
+pub static EDITION_OPTIONS: LazyLock<BTreeMap<String, Edition>> = LazyLock::new(|| {
     let mut map = BTreeMap::new();
     map.insert("1".to_string(), Edition::E2024);
     map.insert("2".to_string(), Edition::LEGACY);
@@ -46,7 +45,7 @@ pub const NO_MIGRATION_NEEDED_MSG: &str = "No migration is required. Enjoy!";
 
 pub const BAR: &str = "============================================================";
 
-pub struct MigrationContext<'a, F: MoveFlavor, W: Write, R: BufRead> {
+pub struct MigrationContext<'a, F: MoveFlavor, W: Write + Send, R: BufRead> {
     build_plan: BuildPlan<'a, F>,
     terminal: Terminal<'a, W, R>,
 }
@@ -55,7 +54,7 @@ pub struct MigrationOptions {
     pub edition: Edition,
 }
 
-impl<F: MoveFlavor, W: Write, R: BufRead> MigrationContext<'_, F, W, R> {
+impl<F: MoveFlavor, W: Write + Send, R: BufRead> MigrationContext<'_, F, W, R> {
     pub fn new<'new>(
         build_plan: BuildPlan<'new, F>,
         writer: &'new mut W,
@@ -148,7 +147,7 @@ impl<F: MoveFlavor, W: Write, R: BufRead> MigrationContext<'_, F, W, R> {
 }
 
 /// Migrate a legacy package to Move 2024 edition, if possible.
-pub fn migrate<F: MoveFlavor, W: Write, R: BufRead>(
+pub fn migrate<F: MoveFlavor, W: Write + Send, R: BufRead>(
     build_plan: BuildPlan<F>,
     writer: &mut W,
     reader: &mut R,

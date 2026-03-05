@@ -14,6 +14,7 @@ use move_binary_format::{
     file_format_common::VERSION_1,
 };
 use move_vm_config::verifier::VerifierConfig;
+use mysten_common::in_integration_test;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use sui_protocol_config_macros::{
@@ -23,7 +24,7 @@ use tracing::{info, warn};
 
 /// The minimum and maximum protocol versions supported by this build.
 const MIN_PROTOCOL_VERSION: u64 = 1;
-const MAX_PROTOCOL_VERSION: u64 = 104;
+const MAX_PROTOCOL_VERSION: u64 = 111;
 
 // Record history of protocol version allocations here:
 //
@@ -278,6 +279,23 @@ const MAX_PROTOCOL_VERSION: u64 = 104;
 // Version 103: Framework update: internal Coin methods
 // Version 104: Framework update: CoinRegistry follow up for Coin methods
 //              Enable all non-zero PCRs parsing for nitro attestation native function in Devnet and Testnet.
+// Version 105: Framework update: address aliases
+//              Enable multi-epoch transaction expiration.
+//              Enable always include required PCRs (0-4 & 8) parsing even if they are zeros for
+//              nitro attestation native function in Devnet and Testnet.
+// Version 106: Framework update: accumulator storage fund calculations
+//              Enable address balances on devnet
+// Version 108: Enable new digit based gas rounding.
+//              Support TxContext in all parameter positions.
+//              Disable entry point signature check.
+//              Enable address aliases on testnet.
+//              Enable poseidon_bn254 on mainnet.
+// Version 109: Update where we set bounds for some binary tables to be a bit more idiomatic.
+// Version 110: Enable parsing on all nonzero custom pcrs in nitro attestation parsing native
+//              function on mainnet.
+//              split_checkpoints_in_consensus_handler in devnet
+//              Enable additional validation on zkLogin public identifier.
+// Version 111: Validator metadata
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -337,17 +355,14 @@ impl std::ops::Add<u64> for ProtocolVersion {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Copy, PartialOrd, Ord, Eq, ValueEnum)]
+#[derive(
+    Clone, Serialize, Deserialize, Debug, Default, PartialEq, Copy, PartialOrd, Ord, Eq, ValueEnum,
+)]
 pub enum Chain {
     Mainnet,
     Testnet,
+    #[default]
     Unknown,
-}
-
-impl Default for Chain {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl Chain {
@@ -518,6 +533,10 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     accept_passkey_in_multisig: bool,
 
+    // If true, additional zkLogin public identifier structure is validated.
+    #[serde(skip_serializing_if = "is_false")]
+    validate_zklogin_public_identifier: bool,
+
     // If true, consensus prologue transaction also includes the consensus output digest.
     // It can be used to detect consensus output folk.
     #[serde(skip_serializing_if = "is_false")]
@@ -558,6 +577,10 @@ struct FeatureFlags {
     // Enable upgraded parsing of nitro attestation containing all nonzero PCRs.
     #[serde(skip_serializing_if = "is_false")]
     enable_nitro_attestation_all_nonzero_pcrs_parsing: bool,
+
+    // Enable upgraded parsing of nitro attestation to always include required PCRs, even when all zeros.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_nitro_attestation_always_include_required_pcrs_parsing: bool,
 
     // Reject functions with mutable Random.
     #[serde(skip_serializing_if = "is_false")]
@@ -672,6 +695,12 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     mysticeti_fastpath: bool,
 
+    // If true, disable pre-consensus locking for owned objects.
+    // All transactions go through consensus, and owned object conflict detection
+    // happens post-consensus via lock acquisition.
+    #[serde(skip_serializing_if = "is_false")]
+    disable_preconsensus_locking: bool,
+
     // Makes the event's sending module version-aware.
     #[serde(skip_serializing_if = "is_false")]
     relocate_event_module: bool,
@@ -766,6 +795,10 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     enable_accumulators: bool,
 
+    // Enable coin reservation
+    #[serde(skip_serializing_if = "is_false")]
+    enable_coin_reservation_obj_refs: bool,
+
     // If true, create the root accumulator object in the change epoch transaction.
     // This must be enabled and shipped before `enable_accumulators` is set to true.
     #[serde(skip_serializing_if = "is_false")]
@@ -778,6 +811,10 @@ struct FeatureFlags {
     // Enable address balance gas payments
     #[serde(skip_serializing_if = "is_false")]
     enable_address_balance_gas_payments: bool,
+
+    // Enable multi-epoch transaction expiration (max 1 epoch difference)
+    #[serde(skip_serializing_if = "is_false")]
+    enable_multi_epoch_transaction_expiration: bool,
 
     // Enable statically type checked ptb execution
     #[serde(skip_serializing_if = "is_false")]
@@ -898,6 +935,55 @@ struct FeatureFlags {
     // If true, include cancelled randomness txns in the consensus commit prologue.
     #[serde(skip_serializing_if = "is_false")]
     include_cancelled_randomness_txns_in_prologue: bool,
+
+    // Enables address aliases.
+    #[serde(skip_serializing_if = "is_false")]
+    address_aliases: bool,
+
+    // Corrects signature-to-signer mapping in CheckpointContentsV2.
+    // TODO: remove old code and deprecate once in mainnet.
+    #[serde(skip_serializing_if = "is_false")]
+    fix_checkpoint_signature_mapping: bool,
+
+    // If true, enable object funds withdraw.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_object_funds_withdraw: bool,
+
+    // If true, skip GC'ed blocks in direct finalization.
+    #[serde(skip_serializing_if = "is_false")]
+    consensus_skip_gced_blocks_in_direct_finalization: bool,
+
+    // If true, uses a new rounding mechanism for gas calculations, replacing the step-based one
+    #[serde(skip_serializing_if = "is_false")]
+    gas_rounding_halve_digits: bool,
+
+    // If true, enable tx contexts in all argument positions
+    #[serde(skip_serializing_if = "is_false")]
+    flexible_tx_context_positions: bool,
+
+    // If true, disable entry point signature check.
+    #[serde(skip_serializing_if = "is_false")]
+    disable_entry_point_signature_check: bool,
+
+    // If true, convert withdrawal compatibility PTB arguments to coins at the start of the PTB.
+    #[serde(skip_serializing_if = "is_false")]
+    convert_withdrawal_compatibility_ptb_arguments: bool,
+
+    // If true, additional restrictions for hot or not entry functions are enforced.
+    #[serde(skip_serializing_if = "is_false")]
+    restrict_hot_or_not_entry_functions: bool,
+
+    // If true, split checkpoints in consensus handler.
+    #[serde(skip_serializing_if = "is_false")]
+    split_checkpoints_in_consensus_handler: bool,
+
+    // If true, always accept committed system transactions.
+    #[serde(skip_serializing_if = "is_false")]
+    consensus_always_accept_system_transactions: bool,
+
+    // If true perform consistent verification of metadata
+    #[serde(skip_serializing_if = "is_false")]
+    validator_metadata_verify_v2: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -971,10 +1057,10 @@ pub struct ExecutionTimeEstimateParams {
 #[derive(Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum PerObjectCongestionControlMode {
     #[default]
-    None, // No congestion control.
-    TotalGasBudget,        // Use txn gas budget as execution cost.
-    TotalTxCount,          // Use total txn count as execution cost.
-    TotalGasBudgetWithCap, // Use txn gas budget as execution cost with a cap.
+    None, // Deprecated.
+    TotalGasBudget,                                     // Deprecated.
+    TotalTxCount,                                       // Deprecated.
+    TotalGasBudgetWithCap,                              // Deprecated.
     ExecutionTimeEstimate(ExecutionTimeEstimateParams), // Use execution time estimate as execution cost.
 }
 
@@ -1320,6 +1406,9 @@ pub struct ProtocolConfig {
 
     /// Unit gas price, Mist per internal gas unit.
     storage_gas_price: Option<u64>,
+
+    /// Per-object storage cost for accumulator objects, used during end-of-epoch accounting.
+    accumulator_object_storage_cost: Option<u64>,
 
     // === Core Protocol ===
     /// Max number of transactions per checkpoint.
@@ -1667,14 +1756,10 @@ pub struct ProtocolConfig {
     /// Transactions will be cancelled after this many rounds.
     max_deferral_rounds_for_congestion_control: Option<u64>,
 
-    /// If >0, congestion control will allow the configured maximum accumulated cost per object
-    /// to be exceeded by at most the given amount. Only one limit-exceeding transaction per
-    /// object will be allowed, unless bursting is configured below.
+    /// DEPRECATED. Do not use.
     max_txn_cost_overage_per_object_in_commit: Option<u64>,
 
-    /// If >0, congestion control will allow transactions in total cost equaling the
-    /// configured amount to exceed the configured maximum accumulated cost per object.
-    /// As above, up to one transaction per object exceeding the burst limit will be allowed.
+    /// DEPRECATED. Do not use.
     allowed_txn_cost_overage_burst_per_object_in_commit: Option<u64>,
 
     /// Minimum interval of commit timestamps between consecutive checkpoints.
@@ -1706,13 +1791,10 @@ pub struct ProtocolConfig {
     /// is disabled.
     consensus_gc_depth: Option<u32>,
 
-    /// Used to calculate the max transaction cost when using TotalGasBudgetWithCap as shard
-    /// object congestion control strategy. Basically the max transaction cost is calculated as
-    /// (num of input object + num of commands) * this factor.
+    /// DEPRECATED. Do not use.
     gas_budget_based_txn_cost_cap_factor: Option<u64>,
 
-    /// Adds an absolute cap on the maximum transaction cost when using TotalGasBudgetWithCap at
-    /// the given multiple of the per-commit budget.
+    /// DEPRECATED. Do not use.
     gas_budget_based_txn_cost_absolute_cap_commit_count: Option<u64>,
 
     /// SIP-45: K in the formula `amplification_factor = max(0, gas_price / reference_gas_price - K)`.
@@ -1985,6 +2067,10 @@ impl ProtocolConfig {
         self.feature_flags.accept_passkey_in_multisig
     }
 
+    pub fn validate_zklogin_public_identifier(&self) -> bool {
+        self.feature_flags.validate_zklogin_public_identifier
+    }
+
     pub fn zklogin_max_epoch_upper_bound_delta(&self) -> Option<u64> {
         self.feature_flags.zklogin_max_epoch_upper_bound_delta
     }
@@ -2033,12 +2119,20 @@ impl ProtocolConfig {
         self.feature_flags.enable_accumulators
     }
 
+    pub fn enable_coin_reservation_obj_refs(&self) -> bool {
+        self.feature_flags.enable_coin_reservation_obj_refs
+    }
+
     pub fn create_root_accumulator_object(&self) -> bool {
         self.feature_flags.create_root_accumulator_object
     }
 
     pub fn enable_address_balance_gas_payments(&self) -> bool {
         self.feature_flags.enable_address_balance_gas_payments
+    }
+
+    pub fn enable_multi_epoch_transaction_expiration(&self) -> bool {
+        self.feature_flags.enable_multi_epoch_transaction_expiration
     }
 
     pub fn enable_authenticated_event_streams(&self) -> bool {
@@ -2190,6 +2284,10 @@ impl ProtocolConfig {
         self.feature_flags.consensus_smart_ancestor_selection
     }
 
+    pub fn disable_preconsensus_locking(&self) -> bool {
+        self.feature_flags.disable_preconsensus_locking
+    }
+
     pub fn consensus_round_prober_probe_accepted_rounds(&self) -> bool {
         self.feature_flags
             .consensus_round_prober_probe_accepted_rounds
@@ -2244,6 +2342,11 @@ impl ProtocolConfig {
     pub fn enable_nitro_attestation_all_nonzero_pcrs_parsing(&self) -> bool {
         self.feature_flags
             .enable_nitro_attestation_all_nonzero_pcrs_parsing
+    }
+
+    pub fn enable_nitro_attestation_always_include_required_pcrs_parsing(&self) -> bool {
+        self.feature_flags
+            .enable_nitro_attestation_always_include_required_pcrs_parsing
     }
 
     pub fn get_consensus_commit_rate_estimation_window_size(&self) -> u32 {
@@ -2416,6 +2519,68 @@ impl ProtocolConfig {
     pub fn include_cancelled_randomness_txns_in_prologue(&self) -> bool {
         self.feature_flags
             .include_cancelled_randomness_txns_in_prologue
+    }
+
+    pub fn address_aliases(&self) -> bool {
+        let address_aliases = self.feature_flags.address_aliases;
+        assert!(
+            !address_aliases || self.mysticeti_fastpath(),
+            "Address aliases requires Mysticeti fastpath to be enabled"
+        );
+        if address_aliases {
+            assert!(
+                self.feature_flags.disable_preconsensus_locking,
+                "Address aliases requires CertifiedTransaction to be disabled"
+            );
+        }
+        address_aliases
+    }
+
+    pub fn fix_checkpoint_signature_mapping(&self) -> bool {
+        self.feature_flags.fix_checkpoint_signature_mapping
+    }
+
+    pub fn enable_object_funds_withdraw(&self) -> bool {
+        self.feature_flags.enable_object_funds_withdraw
+    }
+
+    pub fn gas_rounding_halve_digits(&self) -> bool {
+        self.feature_flags.gas_rounding_halve_digits
+    }
+
+    pub fn flexible_tx_context_positions(&self) -> bool {
+        self.feature_flags.flexible_tx_context_positions
+    }
+
+    pub fn disable_entry_point_signature_check(&self) -> bool {
+        self.feature_flags.disable_entry_point_signature_check
+    }
+
+    pub fn consensus_skip_gced_blocks_in_direct_finalization(&self) -> bool {
+        self.feature_flags
+            .consensus_skip_gced_blocks_in_direct_finalization
+    }
+
+    pub fn convert_withdrawal_compatibility_ptb_arguments(&self) -> bool {
+        self.feature_flags
+            .convert_withdrawal_compatibility_ptb_arguments
+    }
+
+    pub fn restrict_hot_or_not_entry_functions(&self) -> bool {
+        self.feature_flags.restrict_hot_or_not_entry_functions
+    }
+
+    pub fn split_checkpoints_in_consensus_handler(&self) -> bool {
+        self.feature_flags.split_checkpoints_in_consensus_handler
+    }
+
+    pub fn consensus_always_accept_system_transactions(&self) -> bool {
+        self.feature_flags
+            .consensus_always_accept_system_transactions
+    }
+
+    pub fn validator_metadata_verify_v2(&self) -> bool {
+        self.feature_flags.validator_metadata_verify_v2
     }
 }
 
@@ -2639,6 +2804,7 @@ impl ProtocolConfig {
             storage_fund_reinvest_rate: Some(500),
             reward_slashing_rate: Some(5000),
             storage_gas_price: Some(1),
+            accumulator_object_storage_cost: None,
             max_transactions_per_checkpoint: Some(10_000),
             max_checkpoint_size_bytes: Some(30 * 1024 * 1024),
 
@@ -4213,7 +4379,7 @@ impl ProtocolConfig {
                 95 => {
                     cfg.type_name_id_base_cost = Some(52);
 
-                    // Reudce the frequency of checkpoint splitting under high TPS.
+                    // Reduce the frequency of checkpoint splitting under high TPS.
                     cfg.max_transactions_per_checkpoint = Some(20_000);
                 }
                 96 => {
@@ -4306,6 +4472,74 @@ impl ProtocolConfig {
                     cfg.feature_flags
                         .include_cancelled_randomness_txns_in_prologue = true;
                 }
+                105 => {
+                    cfg.feature_flags.enable_multi_epoch_transaction_expiration = true;
+                    cfg.feature_flags.disable_preconsensus_locking = true;
+
+                    if chain != Chain::Mainnet {
+                        cfg.feature_flags
+                            .enable_nitro_attestation_always_include_required_pcrs_parsing = true;
+                    }
+                }
+                106 => {
+                    // est. 100 bytes per object * 76 (storage_gas_price)
+                    cfg.accumulator_object_storage_cost = Some(7600);
+
+                    if chain != Chain::Mainnet && chain != Chain::Testnet {
+                        cfg.feature_flags.enable_accumulators = true;
+                        cfg.feature_flags.enable_address_balance_gas_payments = true;
+                        cfg.feature_flags.enable_authenticated_event_streams = true;
+                        cfg.feature_flags.enable_object_funds_withdraw = true;
+                    }
+                }
+                107 => {
+                    cfg.feature_flags
+                        .consensus_skip_gced_blocks_in_direct_finalization = true;
+
+                    // Trigger edge cases more often in integration tests.
+                    if in_integration_test() {
+                        cfg.consensus_gc_depth = Some(6);
+                        cfg.consensus_max_num_transactions_in_block = Some(8);
+                    }
+                }
+                108 => {
+                    cfg.feature_flags.gas_rounding_halve_digits = true;
+                    cfg.feature_flags.flexible_tx_context_positions = true;
+                    cfg.feature_flags.disable_entry_point_signature_check = true;
+
+                    if chain != Chain::Mainnet {
+                        cfg.feature_flags.address_aliases = true;
+
+                        cfg.feature_flags.enable_accumulators = true;
+                        cfg.feature_flags.enable_address_balance_gas_payments = true;
+                    }
+
+                    cfg.feature_flags.enable_poseidon = true;
+                }
+                109 => {
+                    cfg.binary_variant_handles = Some(1024);
+                    cfg.binary_variant_instantiation_handles = Some(1024);
+                    cfg.feature_flags.restrict_hot_or_not_entry_functions = true;
+                }
+                110 => {
+                    cfg.feature_flags
+                        .enable_nitro_attestation_all_nonzero_pcrs_parsing = true;
+                    cfg.feature_flags
+                        .enable_nitro_attestation_always_include_required_pcrs_parsing = true;
+                    if chain != Chain::Mainnet && chain != Chain::Testnet {
+                        cfg.feature_flags.split_checkpoints_in_consensus_handler = true;
+                    }
+                    cfg.feature_flags.validate_zklogin_public_identifier = true;
+                    cfg.feature_flags.fix_checkpoint_signature_mapping = true;
+                    cfg.feature_flags
+                        .consensus_always_accept_system_transactions = true;
+                    if chain != Chain::Mainnet {
+                        cfg.feature_flags.enable_object_funds_withdraw = true;
+                    }
+                }
+                111 => {
+                    cfg.feature_flags.validator_metadata_verify_v2 = true;
+                }
                 // Use this template when making changes:
                 //
                 //     // modify an existing constant.
@@ -4322,9 +4556,6 @@ impl ProtocolConfig {
 
         // Simtest specific overrides.
         if cfg!(msim) {
-            // Trigger GC more often.
-            cfg.consensus_gc_depth = Some(5);
-
             // Trigger checkpoint splitting more often.
             // cfg.max_transactions_per_checkpoint = Some(10);
             // FIXME: Re-introduce this once we resolve the checkpoint splitting issue
@@ -4401,6 +4632,8 @@ impl ProtocolConfig {
             sanity_check_with_regex_reference_safety: sanity_check_with_regex_reference_safety
                 .map(|limit| limit as u128),
             deprecate_global_storage_ops,
+            disable_entry_point_signature_check: self.disable_entry_point_signature_check(),
+            switch_to_regex_reference_safety: false,
         }
     }
 
@@ -4570,6 +4803,10 @@ impl ProtocolConfig {
         self.feature_flags.correct_gas_payment_limit_check = val;
     }
 
+    pub fn set_address_aliases_for_testing(&mut self, val: bool) {
+        self.feature_flags.address_aliases = val;
+    }
+
     pub fn set_consensus_round_prober_probe_accepted_rounds(&mut self, val: bool) {
         self.feature_flags
             .consensus_round_prober_probe_accepted_rounds = val;
@@ -4577,6 +4814,10 @@ impl ProtocolConfig {
 
     pub fn set_mysticeti_fastpath_for_testing(&mut self, val: bool) {
         self.feature_flags.mysticeti_fastpath = val;
+    }
+
+    pub fn set_disable_preconsensus_locking_for_testing(&mut self, val: bool) {
+        self.feature_flags.disable_preconsensus_locking = val;
     }
 
     pub fn set_accept_passkey_in_multisig_for_testing(&mut self, val: bool) {
@@ -4603,8 +4844,21 @@ impl ProtocolConfig {
         self.feature_flags.enable_accumulators = true;
     }
 
+    pub fn disable_accumulators_for_testing(&mut self) {
+        self.feature_flags.enable_accumulators = false;
+        self.feature_flags.enable_address_balance_gas_payments = false;
+    }
+
+    pub fn enable_coin_reservation_for_testing(&mut self) {
+        self.feature_flags.enable_coin_reservation_obj_refs = true;
+    }
+
     pub fn create_root_accumulator_object_for_testing(&mut self) {
         self.feature_flags.create_root_accumulator_object = true;
+    }
+
+    pub fn disable_create_root_accumulator_object_for_testing(&mut self) {
+        self.feature_flags.create_root_accumulator_object = false;
     }
 
     pub fn enable_address_balance_gas_payments_for_testing(&mut self) {
@@ -4613,11 +4867,23 @@ impl ProtocolConfig {
         self.feature_flags.enable_address_balance_gas_payments = true;
     }
 
+    pub fn disable_address_balance_gas_payments_for_testing(&mut self) {
+        self.feature_flags.enable_address_balance_gas_payments = false;
+    }
+
+    pub fn enable_multi_epoch_transaction_expiration_for_testing(&mut self) {
+        self.feature_flags.enable_multi_epoch_transaction_expiration = true;
+    }
+
     pub fn enable_authenticated_event_streams_for_testing(&mut self) {
         self.enable_accumulators_for_testing();
         self.feature_flags.enable_authenticated_event_streams = true;
         self.feature_flags
             .include_checkpoint_artifacts_digest_in_summary = true;
+    }
+
+    pub fn disable_authenticated_event_streams_for_testing(&mut self) {
+        self.feature_flags.enable_authenticated_event_streams = false;
     }
 
     pub fn enable_non_exclusive_writes_for_testing(&mut self) {
@@ -4658,6 +4924,14 @@ impl ProtocolConfig {
 
     pub fn set_consensus_skip_gced_accept_votes_for_testing(&mut self, val: bool) {
         self.feature_flags.consensus_skip_gced_accept_votes = val;
+    }
+
+    pub fn set_enable_object_funds_withdraw_for_testing(&mut self, val: bool) {
+        self.feature_flags.enable_object_funds_withdraw = val;
+    }
+
+    pub fn set_split_checkpoints_in_consensus_handler_for_testing(&mut self, val: bool) {
+        self.feature_flags.split_checkpoints_in_consensus_handler = val;
     }
 }
 

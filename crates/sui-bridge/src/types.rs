@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::abi::EthToSuiTokenBridgeV1;
+use crate::abi::{EthToSuiTokenBridgeV1, EthToSuiTokenBridgeV2};
 use crate::crypto::BridgeAuthorityPublicKeyBytes;
 use crate::crypto::{
     BridgeAuthorityPublicKey, BridgeAuthorityRecoverableSignature, BridgeAuthoritySignInfo,
@@ -9,11 +9,9 @@ use crate::crypto::{
 use crate::encoding::BridgeMessageEncoding;
 use crate::error::{BridgeError, BridgeResult};
 use crate::events::EmittedSuiToEthTokenBridgeV1;
+use alloy::primitives::{Address as EthAddress, B256, TxHash as EthTransactionHash};
+use alloy::rpc::types::eth::Log;
 use enum_dispatch::enum_dispatch;
-use ethers::types::Address as EthAddress;
-use ethers::types::H256;
-pub use ethers::types::H256 as EthTransactionHash;
-use ethers::types::Log;
 use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::hash::{HashFunction, Keccak256};
 use num_enum::TryFromPrimitive;
@@ -263,12 +261,34 @@ pub struct SuiToEthTokenTransfer {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SuiToEthTokenTransferV2 {
+    pub nonce: u64,
+    pub sui_chain_id: BridgeChainId,
+    pub eth_chain_id: BridgeChainId,
+    pub sui_address: SuiAddress,
+    pub eth_address: EthAddress,
+    pub token_id: u8,
+    // The amount of tokens deposited with decimal points on Sui side
+    pub amount_adjusted: u64,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct EthToSuiBridgeAction {
     // Digest of the transaction where the event was emitted
     pub eth_tx_hash: EthTransactionHash,
     // The index of the event in the transaction
     pub eth_event_index: u16,
     pub eth_bridge_event: EthToSuiTokenBridgeV1,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct EthToSuiTokenTransferV2 {
+    // Digest of the transaction where the event was emitted
+    pub eth_tx_hash: EthTransactionHash,
+    // The index of the event in the transaction
+    pub eth_event_index: u16,
+    pub eth_bridge_event: EthToSuiTokenBridgeV2,
 }
 
 #[derive(
@@ -391,6 +411,10 @@ pub enum BridgeAction {
     AddTokensOnEvmAction(AddTokensOnEvmAction),
     /// Sui to Eth bridge action
     SuiToEthTokenTransfer(SuiToEthTokenTransfer),
+    /// Sui to Eth bridge action V2
+    SuiToEthTokenTransferV2(SuiToEthTokenTransferV2),
+    // /// Eth to sui bridge action V2
+    EthToSuiTokenTransferV2(EthToSuiTokenTransferV2),
 }
 
 impl BridgeAction {
@@ -416,7 +440,9 @@ impl BridgeAction {
         match self {
             BridgeAction::SuiToEthBridgeAction(a) => a.sui_bridge_event.sui_chain_id,
             BridgeAction::SuiToEthTokenTransfer(a) => a.sui_chain_id,
+            BridgeAction::SuiToEthTokenTransferV2(a) => a.sui_chain_id,
             BridgeAction::EthToSuiBridgeAction(a) => a.eth_bridge_event.eth_chain_id,
+            BridgeAction::EthToSuiTokenTransferV2(a) => a.eth_bridge_event.eth_chain_id,
             BridgeAction::BlocklistCommitteeAction(a) => a.chain_id,
             BridgeAction::EmergencyAction(a) => a.chain_id,
             BridgeAction::LimitUpdateAction(a) => a.chain_id,
@@ -427,7 +453,7 @@ impl BridgeAction {
         }
     }
 
-    pub fn is_governace_action(&self) -> bool {
+    pub fn is_governance_action(&self) -> bool {
         match self.action_type() {
             BridgeActionType::TokenTransfer => false,
             BridgeActionType::UpdateCommitteeBlocklist => true,
@@ -445,7 +471,9 @@ impl BridgeAction {
         match self {
             BridgeAction::SuiToEthBridgeAction(_) => BridgeActionType::TokenTransfer,
             BridgeAction::SuiToEthTokenTransfer(_) => BridgeActionType::TokenTransfer,
+            BridgeAction::SuiToEthTokenTransferV2(_) => BridgeActionType::TokenTransfer,
             BridgeAction::EthToSuiBridgeAction(_) => BridgeActionType::TokenTransfer,
+            BridgeAction::EthToSuiTokenTransferV2(_) => BridgeActionType::TokenTransfer,
             BridgeAction::BlocklistCommitteeAction(_) => BridgeActionType::UpdateCommitteeBlocklist,
             BridgeAction::EmergencyAction(_) => BridgeActionType::EmergencyButton,
             BridgeAction::LimitUpdateAction(_) => BridgeActionType::LimitUpdate,
@@ -461,7 +489,9 @@ impl BridgeAction {
         match self {
             BridgeAction::SuiToEthBridgeAction(a) => a.sui_bridge_event.nonce,
             BridgeAction::SuiToEthTokenTransfer(a) => a.nonce,
+            BridgeAction::SuiToEthTokenTransferV2(a) => a.nonce,
             BridgeAction::EthToSuiBridgeAction(a) => a.eth_bridge_event.nonce,
+            BridgeAction::EthToSuiTokenTransferV2(a) => a.eth_bridge_event.nonce,
             BridgeAction::BlocklistCommitteeAction(a) => a.nonce,
             BridgeAction::EmergencyAction(a) => a.nonce,
             BridgeAction::LimitUpdateAction(a) => a.nonce,
@@ -476,7 +506,9 @@ impl BridgeAction {
         match self {
             BridgeAction::SuiToEthBridgeAction(_) => APPROVAL_THRESHOLD_TOKEN_TRANSFER,
             BridgeAction::SuiToEthTokenTransfer(_) => APPROVAL_THRESHOLD_TOKEN_TRANSFER,
+            BridgeAction::SuiToEthTokenTransferV2(_) => APPROVAL_THRESHOLD_TOKEN_TRANSFER,
             BridgeAction::EthToSuiBridgeAction(_) => APPROVAL_THRESHOLD_TOKEN_TRANSFER,
+            BridgeAction::EthToSuiTokenTransferV2(_) => APPROVAL_THRESHOLD_TOKEN_TRANSFER,
             BridgeAction::BlocklistCommitteeAction(_) => APPROVAL_THRESHOLD_COMMITTEE_BLOCKLIST,
             BridgeAction::EmergencyAction(a) => match a.action_type {
                 EmergencyActionType::Pause => APPROVAL_THRESHOLD_EMERGENCY_PAUSE,
@@ -505,6 +537,7 @@ impl BridgeAction {
                 })
             }
             BridgeAction::EthToSuiBridgeAction(_) => self,
+            BridgeAction::EthToSuiTokenTransferV2(_) => self,
             BridgeAction::BlocklistCommitteeAction(_) => self,
             BridgeAction::EmergencyAction(_) => self,
             BridgeAction::LimitUpdateAction(_) => self,
@@ -513,6 +546,7 @@ impl BridgeAction {
             BridgeAction::AddTokensOnSuiAction(_) => self,
             BridgeAction::AddTokensOnEvmAction(_) => self,
             BridgeAction::SuiToEthTokenTransfer(_) => self,
+            BridgeAction::SuiToEthTokenTransferV2(_) => self,
         }
     }
 
@@ -521,7 +555,7 @@ impl BridgeAction {
 
         let MoveTypeBridgeMessage {
             message_type: _,
-            message_version: _, // Switch on version when we introduce v2
+            message_version,
             seq_num,
             source_chain,
             payload,
@@ -536,17 +570,50 @@ impl BridgeAction {
             amount: [u8; 8], // u64 as Big Endian bytes
         }
 
-        let payload: SuiToEthOnChainBcsPayload = bcs::from_bytes(payload)?;
+        #[derive(Debug, Deserialize)]
+        struct SuiToEthOnChainBcsPayloadV2 {
+            sui_address: Vec<u8>,
+            target_chain: u8,
+            eth_address: Vec<u8>,
+            token_type: u8,
+            amount: [u8; 8],       // u64 as Big Endian bytes
+            timestamp_ms: [u8; 8], // u64 as Big Endian bytes
+        }
 
-        Ok(BridgeAction::SuiToEthTokenTransfer(SuiToEthTokenTransfer {
-            nonce: *seq_num,
-            sui_chain_id: BridgeChainId::try_from(*source_chain)?,
-            eth_chain_id: BridgeChainId::try_from(payload.target_chain)?,
-            sui_address: SuiAddress::from_bytes(payload.sui_address)?,
-            eth_address: EthAddress::from_str(&Hex::encode(&payload.eth_address))?,
-            token_id: payload.token_type,
-            amount_adjusted: u64::from_be_bytes(payload.amount),
-        }))
+        match *message_version {
+            crate::encoding::TOKEN_TRANSFER_MESSAGE_VERSION_V1 => {
+                let payload: SuiToEthOnChainBcsPayload = bcs::from_bytes(payload)?;
+
+                Ok(BridgeAction::SuiToEthTokenTransfer(SuiToEthTokenTransfer {
+                    nonce: *seq_num,
+                    sui_chain_id: BridgeChainId::try_from(*source_chain)?,
+                    eth_chain_id: BridgeChainId::try_from(payload.target_chain)?,
+                    sui_address: SuiAddress::from_bytes(payload.sui_address)?,
+                    eth_address: EthAddress::from_str(&Hex::encode(&payload.eth_address))?,
+                    token_id: payload.token_type,
+                    amount_adjusted: u64::from_be_bytes(payload.amount),
+                }))
+            }
+            crate::encoding::TOKEN_TRANSFER_MESSAGE_VERSION_V2 => {
+                let payload: SuiToEthOnChainBcsPayloadV2 = bcs::from_bytes(payload)?;
+
+                Ok(BridgeAction::SuiToEthTokenTransferV2(
+                    SuiToEthTokenTransferV2 {
+                        nonce: *seq_num,
+                        sui_chain_id: BridgeChainId::try_from(*source_chain)?,
+                        eth_chain_id: BridgeChainId::try_from(payload.target_chain)?,
+                        sui_address: SuiAddress::from_bytes(payload.sui_address)?,
+                        eth_address: EthAddress::from_str(&Hex::encode(&payload.eth_address))?,
+                        token_id: payload.token_type,
+                        amount_adjusted: u64::from_be_bytes(payload.amount),
+                        timestamp_ms: u64::from_be_bytes(payload.timestamp_ms),
+                    },
+                ))
+            }
+            v => Err(BridgeError::Generic(format!(
+                "unknown message version: {v}"
+            ))),
+        }
     }
 }
 
@@ -594,7 +661,7 @@ impl Message for BridgeAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EthLog {
     pub block_number: u64,
-    pub tx_hash: H256,
+    pub tx_hash: B256,
     pub log_index_in_tx: u16,
     pub log: Log,
 }
@@ -604,13 +671,13 @@ pub struct EthLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawEthLog {
     pub block_number: u64,
-    pub tx_hash: H256,
+    pub tx_hash: B256,
     pub log: Log,
 }
 
 pub trait EthEvent {
     fn block_number(&self) -> u64;
-    fn tx_hash(&self) -> H256;
+    fn tx_hash(&self) -> B256;
     fn log(&self) -> &Log;
 }
 
@@ -618,7 +685,7 @@ impl EthEvent for EthLog {
     fn block_number(&self) -> u64 {
         self.block_number
     }
-    fn tx_hash(&self) -> H256 {
+    fn tx_hash(&self) -> B256 {
         self.tx_hash
     }
     fn log(&self) -> &Log {
@@ -630,7 +697,7 @@ impl EthEvent for RawEthLog {
     fn block_number(&self) -> u64 {
         self.block_number
     }
-    fn tx_hash(&self) -> H256 {
+    fn tx_hash(&self) -> B256 {
         self.tx_hash
     }
     fn log(&self) -> &Log {
@@ -704,7 +771,7 @@ mod tests {
     use crate::test_utils::get_test_authority_and_key;
     use crate::test_utils::get_test_eth_to_sui_bridge_action;
     use crate::test_utils::get_test_sui_to_eth_bridge_action;
-    use ethers::types::Address as EthAddress;
+    use alloy::primitives::Address as EthAddress;
     use fastcrypto::traits::KeyPair;
     use std::collections::HashSet;
     use sui_types::bridge::TOKEN_ID_BTC;

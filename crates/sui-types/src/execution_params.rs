@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use mysten_common::assert_reachable;
 use once_cell::sync::Lazy;
 
 use crate::{
@@ -13,11 +14,16 @@ use crate::{
 pub type ExecutionOrEarlyError = Result<(), ExecutionErrorKind>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BalanceWithdrawStatus {
-    NoWithdraw,
-    SufficientBalance,
-    // TODO(address-balances): Add information on the address and type?
-    InsufficientBalance,
+pub enum FundsWithdrawStatus {
+    /// Either we don't know yet whether the funds withdrawals are sufficient or not,
+    /// or we know for sure that the funds withdrawals are sufficient.
+    /// The reason we don't need to distinguish between unknown and sufficient funds is that
+    /// in either case we would have to go ahead and execute the transaction anyway.
+    MaybeSufficient,
+    // TODO(address-funds): Add information on the address and type?
+    /// We know for sure that the funds withdrawals in this transaction do not all have enough funds.
+    /// This takes account of both address and object funds withdrawals.
+    Insufficient,
 }
 
 /// Determine if a transaction is predetermined to fail execution.
@@ -28,7 +34,7 @@ pub fn get_early_execution_error(
     transaction_digest: &TransactionDigest,
     input_objects: &CheckedInputObjects,
     config_certificate_deny_set: &HashSet<TransactionDigest>,
-    balance_withdraw_status: &BalanceWithdrawStatus,
+    funds_withdraw_status: &FundsWithdrawStatus,
 ) -> Option<ExecutionErrorKind> {
     if is_certificate_denied(transaction_digest, config_certificate_deny_set) {
         return Some(ExecutionErrorKind::CertificateDenied);
@@ -58,11 +64,9 @@ pub fn get_early_execution_error(
         }
     }
 
-    if matches!(
-        balance_withdraw_status,
-        BalanceWithdrawStatus::InsufficientBalance
-    ) {
-        return Some(ExecutionErrorKind::InsufficientBalanceForWithdraw);
+    if matches!(funds_withdraw_status, FundsWithdrawStatus::Insufficient) {
+        assert_reachable!("insufficient funds for withdraw");
+        return Some(ExecutionErrorKind::InsufficientFundsForWithdraw);
     }
 
     None
@@ -134,11 +138,11 @@ mod tests {
             &tx_digest,
             &input_objects,
             &deny_set,
-            &BalanceWithdrawStatus::InsufficientBalance,
+            &FundsWithdrawStatus::Insufficient,
         );
         assert_eq!(
             result,
-            Some(ExecutionErrorKind::InsufficientBalanceForWithdraw)
+            Some(ExecutionErrorKind::InsufficientFundsForWithdraw)
         );
 
         // Test with sufficient balance
@@ -146,7 +150,7 @@ mod tests {
             &tx_digest,
             &input_objects,
             &deny_set,
-            &BalanceWithdrawStatus::SufficientBalance,
+            &FundsWithdrawStatus::MaybeSufficient,
         );
         assert_eq!(result, None);
     }
@@ -163,7 +167,7 @@ mod tests {
             &tx_digest,
             &input_objects,
             &deny_set,
-            &BalanceWithdrawStatus::InsufficientBalance,
+            &FundsWithdrawStatus::Insufficient,
         );
         assert_eq!(result, Some(ExecutionErrorKind::CertificateDenied));
 
@@ -187,7 +191,7 @@ mod tests {
             &tx_digest,
             &CheckedInputObjects::new_for_replay(input_objects),
             &deny_set,
-            &BalanceWithdrawStatus::InsufficientBalance,
+            &FundsWithdrawStatus::Insufficient,
         );
         assert_eq!(result, Some(ExecutionErrorKind::InputObjectDeleted));
 
@@ -209,7 +213,7 @@ mod tests {
             &tx_digest,
             &CheckedInputObjects::new_for_replay(input_objects),
             &deny_set,
-            &BalanceWithdrawStatus::InsufficientBalance,
+            &FundsWithdrawStatus::Insufficient,
         );
         assert!(matches!(
             result,

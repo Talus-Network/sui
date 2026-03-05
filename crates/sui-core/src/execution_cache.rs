@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::accumulators::funds_read::AccountFundsRead;
 use crate::authority::AuthorityStore;
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store::{ExecutionLockWriteGuard, SuiLockResult};
@@ -71,6 +72,7 @@ pub struct ExecutionCacheTraitPointers {
     pub state_sync_store: Arc<dyn StateSyncAPI>,
     pub cache_commit: Arc<dyn ExecutionCacheCommit>,
     pub testing_api: Arc<dyn TestingAPI>,
+    pub account_funds_read: Arc<dyn AccountFundsRead>,
 }
 
 impl ExecutionCacheTraitPointers {
@@ -88,6 +90,7 @@ impl ExecutionCacheTraitPointers {
             + StateSyncAPI
             + ExecutionCacheCommit
             + TestingAPI
+            + AccountFundsRead
             + 'static,
     {
         Self {
@@ -104,6 +107,7 @@ impl ExecutionCacheTraitPointers {
             state_sync_store: cache.clone(),
             cache_commit: cache.clone(),
             testing_api: cache.clone(),
+            account_funds_read: cache.clone(),
         }
     }
 }
@@ -500,6 +504,12 @@ pub trait TransactionCacheRead: Send + Sync {
             .expect("multi-get must return correct number of items")
     }
 
+    fn transaction_executed_in_last_epoch(
+        &self,
+        digest: &TransactionDigest,
+        current_epoch: EpochId,
+    ) -> bool;
+
     fn multi_get_effects(
         &self,
         digests: &[TransactionEffectsDigest],
@@ -607,6 +617,11 @@ pub trait ExecutionCacheWrite: Send + Sync {
         signed_transaction: Option<VerifiedSignedTransaction>,
     ) -> SuiResult;
 
+    /// Validate owned object versions and digests without acquiring locks.
+    /// Used when preconsensus locking is disabled to validate objects without locking,
+    /// since locking happens post-consensus in that mode.
+    fn validate_owned_object_versions(&self, owned_input_objects: &[ObjectRef]) -> SuiResult;
+
     /// Write an object entry directly to the cache for testing.
     /// This allows us to write an object without constructing the entire
     /// transaction outputs.
@@ -689,6 +704,8 @@ pub trait StateSyncAPI: Send + Sync {
 
 pub trait TestingAPI: Send + Sync {
     fn database_for_testing(&self) -> Arc<AuthorityStore>;
+
+    fn cache_for_testing(&self) -> &WritebackCache;
 }
 
 macro_rules! implement_storage_traits {
@@ -881,6 +898,10 @@ macro_rules! implement_passthrough_traits {
         impl TestingAPI for $implementor {
             fn database_for_testing(&self) -> Arc<AuthorityStore> {
                 self.store.clone()
+            }
+
+            fn cache_for_testing(&self) -> &WritebackCache {
+                self
             }
         }
     };

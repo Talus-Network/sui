@@ -15,10 +15,10 @@ jobs:
       new_tag: ${{ steps.get-pr-list.outputs.new_tag }}
       sui_version: ${{ steps.get-pr-list.outputs.sui_version }}
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout sui repo main branch
-      uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # Pin v4.1.1
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
       with:
         fetch-depth: 0
         ref: main
@@ -26,28 +26,26 @@ jobs:
     - name: Get list of PRs
       id: get-pr-list
       working-directory: ./
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         export new_commit_hash=$(git rev-parse HEAD)
         export existing_commit_tag=$(git tag --points-at ${new_commit_hash} | grep -E 'sui_v(.*)_rel_notes' | head -n 1)
 
         export previous_tag=$(git tag -l 'sui_v1*_rel_notes' --sort=-version:refname | head -n1 || true)
-        export previous_commit_hash=$(git rev-list -n 1 ${previous_tag})
-        
-        export list_of_prs=$(git log --grep "\[x\]" --pretty=oneline \
-            --abbrev-commit ${previous_commit_hash}...${new_commit_hash} \
-            -- consensus crates dashboards doc docker external-crates \
-            kiosk nre sui-execution | grep -o '#[0-9]\+' | \
-            grep -o '[0-9]\+' | jq -R -s -c 'split("\n")[:-1]')
+
+        # Use the release_notes.py script to get the list of PRs with release notes
+        export list_of_prs=$(python3 ./scripts/release_notes.py list-prs "${previous_tag}" "${new_commit_hash}")
 
         echo "matrix=${list_of_prs}" >> $GITHUB_OUTPUT
         echo "new_commit_hash=${new_commit_hash}" >> $GITHUB_OUTPUT
         echo "existing_commit_tag=${existing_commit_tag}" >> $GITHUB_OUTPUT
-        
+
         export sui_crate_version=$(cat Cargo.toml | grep "^version =" | tr -d '"' | awk '{ print $3 }')
         export new_tag=$(echo "sui_v${sui_crate_version}_$(date +%s)_rel_notes")
         echo "new_tag=${new_tag}" >> $GITHUB_OUTPUT
         echo "sui_version=${sui_crate_version}" >> $GITHUB_OUTPUT
-        
+
   process-prs:
     name: Processing PR
     needs: [ get-list-of-prs ]
@@ -58,6 +56,15 @@ jobs:
          pr: ${{ fromJson(needs.get-list-of-prs.outputs.matrix) }}
 
     steps:
+    - name: Checkout sui repo main branch
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+      with:
+        ref: main
+
+    - name: Setup Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # pin@v6.2.0
+      with:
+        python-version: 3.10.10
 
     - name: Reading Release notes
       id: read-notes
@@ -66,16 +73,8 @@ jobs:
       run: |
         echo "Processing PR#${{ matrix.pr }}"
 
-        # Fetch PR body to temp file to prevent injection
-        temp_file=$(mktemp)
-        trap 'rm -f "$temp_file"' EXIT
-
-        gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/MystenLabs/sui/pulls/${{ matrix.pr }}" --jq ".body" > "$temp_file"
-
-        # Extract release notes - try old format first, then new format
-        rel_notes=$(awk '/### Release notes/{p=1; next} p' "$temp_file" | sed '/^[[:space:]]*$/d')
-        [[ -z "$rel_notes" ]] && rel_notes=$(awk '/^\- \[x\]/' "$temp_file")
+        # Use the release_notes.py script to get formatted release notes
+        rel_notes=$(python ./scripts/release_notes.py get-notes "${{ matrix.pr }}")
 
         # make text json payload friendly
         rel_notes=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\r//g' <<<"$rel_notes")
@@ -89,7 +88,7 @@ jobs:
         } >> "$GITHUB_OUTPUT"
 
     - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # pin v4.0.2
+      uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # pin@v5.1.1
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -111,16 +110,17 @@ jobs:
         echo "slack_id=$(echo ${slack_id} | tr -d '"')" >> $GITHUB_ENV
 
     - name: Post to a Slack channel
-      uses: slackapi/slack-github-action@34c3fd73326693ef04728f8611669d918a2d781d # pin@v1.19.0
-      env:
-        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # pin@v2.1.1
       with:
-        channel-id: '#ext-mysten-release-notes'
-        slack-message: |
-          <@U03LRLPR1QX> and <@U04A8V9E203>, please review release notes for upcoming `v${{ needs.get-list-of-prs.outputs.sui_version }}` release.
-          *PR* <https://github.com/MystenLabs/sui/pull/${{ matrix.pr }}|${{ matrix.pr }}> by <@${{ env.slack_id }}>
-          *Release Notes:*
-          ${{ steps.read-notes.outputs.release_notes }}
+        method: chat.postMessage
+        token: ${{ secrets.SLACK_BOT_TOKEN }}
+        payload: |
+          channel: "#ext-mysten-release-notes"
+          text: |
+            <@U03LRLPR1QX> and <@U097GDYSX24>, please review release notes for upcoming `v${{ needs.get-list-of-prs.outputs.sui_version }}` release.
+            *PR* <https://github.com/MystenLabs/sui/pull/${{ matrix.pr }}|${{ matrix.pr }}> by <@${{ env.slack_id }}>
+            *Release Notes:*
+            ${{ steps.read-notes.outputs.release_notes }}
 
   tag:
     name: Adding git tag to processed commit

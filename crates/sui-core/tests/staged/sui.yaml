@@ -144,6 +144,10 @@ CheckpointContents:
       V1:
         NEWTYPE:
           TYPENAME: CheckpointContentsV1
+    1:
+      V2:
+        NEWTYPE:
+          TYPENAME: CheckpointContentsV2
 CheckpointContentsDigest:
   NEWTYPESTRUCT:
     TYPENAME: Digest
@@ -156,6 +160,11 @@ CheckpointContentsV1:
         SEQ:
           SEQ:
             TYPENAME: GenericSignature
+CheckpointContentsV2:
+  STRUCT:
+    - transactions:
+        SEQ:
+          TYPENAME: CheckpointTransactionContents
 CheckpointData:
   STRUCT:
     - checkpoint_summary:
@@ -204,6 +213,16 @@ CheckpointTransaction:
     - output_objects:
         SEQ:
           TYPENAME: Object
+CheckpointTransactionContents:
+  STRUCT:
+    - digest:
+        TYPENAME: ExecutionDigests
+    - user_signatures:
+        SEQ:
+          TUPLE:
+            - TYPENAME: GenericSignature
+            - OPTION:
+                TYPENAME: SequenceNumber
 Command:
   ENUM:
     0:
@@ -476,6 +495,12 @@ EndOfEpochTransactionKind:
       CoinRegistryCreate: UNIT
     10:
       DisplayRegistryCreate: UNIT
+    11:
+      AddressAliasStateCreate: UNIT
+    12:
+      WriteAccumulatorStorageCost:
+        NEWTYPE:
+          TYPENAME: WriteAccumulatorStorageCost
 Event:
   STRUCT:
     - package_id:
@@ -632,7 +657,7 @@ ExecutionFailureStatus:
     39:
       InvalidLinkage: UNIT
     40:
-      InsufficientBalanceForWithdraw: UNIT
+      InsufficientFundsForWithdraw: UNIT
     41:
       NonExclusiveWriteInputObjectModified:
         STRUCT:
@@ -1031,8 +1056,6 @@ RandomnessStateUpdate:
 Reservation:
   ENUM:
     0:
-      EntireBalance: UNIT
-    1:
       MaxAmountU64:
         NEWTYPE: U64
 SenderSignedData:
@@ -1252,9 +1275,9 @@ TransactionExpiration:
               OPTION: U64
           - max_epoch:
               OPTION: U64
-          - min_timestamp_seconds:
+          - min_timestamp:
               OPTION: U64
-          - max_timestamp_seconds:
+          - max_timestamp:
               OPTION: U64
           - chain:
               TYPENAME: ChainIdentifier
@@ -1430,7 +1453,10 @@ WithdrawalTypeArg:
     0:
       Balance:
         NEWTYPE:
-          TYPENAME: TypeInput
+          TYPENAME: TypeTag
+WriteAccumulatorStorageCost:
+  STRUCT:
+    - storage_cost: U64
 ZkLoginAuthenticatorAsBytes:
   NEWTYPESTRUCT:
     SEQ: U8

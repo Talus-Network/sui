@@ -12,7 +12,7 @@
       "name": "Apache-2.0",
       "url": "https://raw.githubusercontent.com/MystenLabs/sui/main/LICENSE"
     },
-    "version": "1.62.1"
+    "version": "1.65.2"
   },
   "methods": [
     {
@@ -1264,7 +1264,7 @@
           "name": "Read API"
         }
       ],
-      "description": "Return the protocol config table for the given version number. If the version number is not specified, If none is specified, the node uses the version of the latest epoch it has processed.",
+      "description": "Return the protocol config table for the given version number. If none is specified, the node uses the version of the latest epoch it has processed.",
       "params": [
         {
           "name": "version",
@@ -1294,7 +1294,7 @@
             "name": "Result",
             "value": {
               "minSupportedProtocolVersion": "1",
-              "maxSupportedProtocolVersion": "104",
+              "maxSupportedProtocolVersion": "111",
               "protocolVersion": "6",
               "featureFlags": {
                 "abstract_size_in_object_runtime": false,
@@ -1303,6 +1303,7 @@
                 "additional_borrow_checks": false,
                 "additional_consensus_digest_indirect_state": false,
                 "additional_multisig_checks": false,
+                "address_aliases": false,
                 "advance_epoch_start_time_in_safe_mode": true,
                 "advance_to_highest_supported_protocol_version": false,
                 "allow_private_accumulator_entrypoints": false,
@@ -1317,6 +1318,7 @@
                 "cancel_for_failed_dkg_early": false,
                 "check_for_init_during_upgrade": false,
                 "commit_root_state_digest": false,
+                "consensus_always_accept_system_transactions": false,
                 "consensus_batched_block_sync": false,
                 "consensus_checkpoint_signature_key_includes_digest": false,
                 "consensus_distributed_vote_scoring_strategy": false,
@@ -1326,16 +1328,20 @@
                 "consensus_round_prober": false,
                 "consensus_round_prober_probe_accepted_rounds": false,
                 "consensus_skip_gced_accept_votes": false,
+                "consensus_skip_gced_blocks_in_direct_finalization": false,
                 "consensus_smart_ancestor_selection": false,
                 "consensus_zstd_compression": false,
                 "convert_type_argument_error": false,
+                "convert_withdrawal_compatibility_ptb_arguments": false,
                 "correct_gas_payment_limit_check": false,
                 "create_root_accumulator_object": false,
                 "debug_fatal_on_move_invariant_violation": false,
                 "dependency_linkage_error": false,
                 "deprecate_global_storage_ops": false,
                 "deprecate_global_storage_ops_during_deserialization": false,
+                "disable_entry_point_signature_check": false,
                 "disable_invariant_violation_check_in_swap_loc": false,
+                "disable_preconsensus_locking": false,
                 "disallow_adding_abilities_on_upgrade": false,
                 "disallow_change_struct_type_params_on_upgrade": false,
                 "disallow_new_modules_in_deps_only_packages": false,
@@ -1346,22 +1352,29 @@
                 "enable_coin_deny_list": false,
                 "enable_coin_deny_list_v2": false,
                 "enable_coin_registry": false,
+                "enable_coin_reservation_obj_refs": false,
                 "enable_display_registry": false,
                 "enable_effects_v2": false,
                 "enable_group_ops_native_function_msm": false,
                 "enable_group_ops_native_functions": false,
                 "enable_jwk_consensus_updates": false,
+                "enable_multi_epoch_transaction_expiration": false,
                 "enable_nitro_attestation": false,
                 "enable_nitro_attestation_all_nonzero_pcrs_parsing": false,
+                "enable_nitro_attestation_always_include_required_pcrs_parsing": false,
                 "enable_nitro_attestation_upgraded_parsing": false,
                 "enable_non_exclusive_writes": false,
+                "enable_object_funds_withdraw": false,
                 "enable_party_transfer": false,
                 "enable_poseidon": false,
                 "enable_ptb_execution_v2": false,
                 "enable_vdf": false,
                 "end_of_epoch_transaction_supported": false,
                 "enforce_checkpoint_timestamp_monotonicity": false,
+                "fix_checkpoint_signature_mapping": false,
+                "flexible_tx_context_positions": false,
                 "fresh_vm_on_framework_upgrade": false,
+                "gas_rounding_halve_digits": false,
                 "generate_df_type_layouts": false,
                 "hardened_otw_check": false,
                 "ignore_execution_time_observations_after_certs_closed": false,
@@ -1403,12 +1416,14 @@
                 "reshare_at_same_initial_version": false,
                 "resolve_abort_locations_to_package_id": false,
                 "resolve_type_input_ids_to_defining_id": false,
+                "restrict_hot_or_not_entry_functions": false,
                 "rethrow_serialization_type_layout_errors": false,
                 "scoring_decision_with_validity_cutoff": true,
                 "shared_object_deletion": false,
                 "simple_conservation_checks": false,
                 "simplified_unwrap_then_delete": false,
                 "soft_bundle": false,
+                "split_checkpoints_in_consensus_handler": false,
                 "throughput_aware_consensus_submission": false,
                 "txn_base_cost_as_multiplier": false,
                 "type_tags_in_object_runtime": false,
@@ -1417,11 +1432,14 @@
                 "use_mfp_txns_in_load_initial_object_debts": false,
                 "use_new_commit_handler": false,
                 "validate_identifier_inputs": false,
+                "validate_zklogin_public_identifier": false,
+                "validator_metadata_verify_v2": false,
                 "variant_nodes": false,
                 "verify_legacy_zklogin_address": false,
                 "zklogin_auth": false
               },
               "attributes": {
+                "accumulator_object_storage_cost": null,
                 "address_from_bytes_cost_base": {
                   "u64": "52"
                 },
@@ -3182,7 +3200,8 @@
                 "coinType": "0x2::sui::SUI",
                 "coinObjectCount": 15,
                 "totalBalance": "3000000000",
-                "lockedBalance": {}
+                "lockedBalance": {},
+                "fundsInAddressBalance": "42"
               }
             ]
           }
@@ -3334,7 +3353,8 @@
               "coinType": "0x168da5bf1f48dafc111b0a488fa454aca95e0b5e::usdc::USDC",
               "coinObjectCount": 15,
               "totalBalance": "15",
-              "lockedBalance": {}
+              "lockedBalance": {},
+              "fundsInAddressBalance": "42"
             }
           }
         }
@@ -4923,7 +4943,7 @@
           "name": "Transaction Builder API"
         }
       ],
-      "description": "Send SUI coins to a list of addresses, following a list of amounts. This is for SUI coin only and does not require a separate gas coin object. Specifically, what pay_sui does are: 1. debit each input_coin to create new coin following the order of amounts and assign it to the corresponding recipient. 2. accumulate all residual SUI from input coins left and deposit all SUI to the first input coin, then use the first input coin as the gas coin object. 3. the balance of the first input coin after tx is sum(input_coins) - sum(amounts) - actual_gas_cost 4. all other input coints other than the first one are deleted.",
+      "description": "Send SUI coins to a list of addresses, following a list of amounts. This is for SUI coin only and does not require a separate gas coin object. Specifically, what pay_sui does are: 1. debit each input_coin to create new coin following the order of amounts and assign it to the corresponding recipient. 2. accumulate all residual SUI from input coins left and deposit all SUI to the first input coin, then use the first input coin as the gas coin object. 3. the balance of the first input coin after tx is sum(input_coins) - sum(amounts) - actual_gas_cost 4. all other input coins other than the first one are deleted.",
       "params": [
         {
           "name": "signer",
@@ -5181,7 +5201,7 @@
         },
         {
           "name": "coin_object_id",
-          "description": "the coin object to be spilt",
+          "description": "the coin object to be split",
           "required": true,
           "schema": {
             "$ref": "#/components/schemas/ObjectID"
@@ -5241,7 +5261,7 @@
         },
         {
           "name": "coin_object_id",
-          "description": "the coin object to be spilt",
+          "description": "the coin object to be split",
           "required": true,
           "schema": {
             "$ref": "#/components/schemas/ObjectID"
@@ -5528,6 +5548,15 @@
           },
           "coinType": {
             "type": "string"
+          },
+          "fundsInAddressBalance": {
+            "description": "The portion of `total_balance` that resides in the address balance rather than in the coin objects. `total_balance` is the total amount of funds owned by the address. That is, do not add these two fields together.",
+            "default": "0",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BigInt_for_uint128"
+              }
+            ]
           },
           "lockedBalance": {
             "type": "object",
@@ -5896,7 +5925,6 @@
         "$ref": "#/components/schemas/Digest"
       },
       "ConsensusDeterminedVersionAssignments": {
-        "description": "Uses an enum to allow for future expansion of the ConsensusDeterminedVersionAssignments.",
         "oneOf": [
           {
             "type": "object",
@@ -9022,7 +9050,9 @@
               "StoreExecutionTimeObservations",
               "AccumulatorRootCreate",
               "CoinRegistryCreate",
-              "DisplayRegistryCreate"
+              "DisplayRegistryCreate",
+              "AddressAliasStateCreate",
+              "WriteAccumulatorStorageCost"
             ]
           },
           {
@@ -9762,12 +9792,6 @@
       },
       "SuiReservation": {
         "oneOf": [
-          {
-            "type": "string",
-            "enum": [
-              "entireBalance"
-            ]
-          },
           {
             "type": "object",
             "required": [

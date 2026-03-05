@@ -1,24 +1,31 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::{Context as _, ensure};
+use anyhow::Context as _;
+use anyhow::ensure;
 use move_core_types::ident_str;
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use simulacrum::Simulacrum;
-use sui_indexer_alt_e2e_tests::{FullCluster, OffchainClusterConfig, find};
 use sui_indexer_alt_graphql::config::RpcConfig;
 use sui_indexer_alt_jsonrpc::config::NameServiceConfig;
 use sui_move_build::BuildConfig;
-use sui_types::{
-    base_types::{ObjectID, SuiAddress},
-    effects::TransactionEffectsAPI,
-    programmable_transaction_builder::ProgrammableTransactionBuilder,
-    transaction::{ObjectArg, SharedObjectMutability, Transaction, TransactionData},
-};
-use tokio_util::sync::CancellationToken;
+use sui_types::base_types::ObjectID;
+use sui_types::base_types::SuiAddress;
+use sui_types::effects::TransactionEffectsAPI;
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::ObjectArg;
+use sui_types::transaction::SharedObjectMutability;
+use sui_types::transaction::Transaction;
+use sui_types::transaction::TransactionData;
+
+use sui_indexer_alt_e2e_tests::FullCluster;
+use sui_indexer_alt_e2e_tests::OffchainClusterConfig;
+use sui_indexer_alt_e2e_tests::find;
 
 /// 5 SUI gas budget
 const DEFAULT_GAS_BUDGET: u64 = 5_000_000_000;
@@ -27,7 +34,7 @@ const DEFAULT_GAS_BUDGET: u64 = 5_000_000_000;
 macro_rules! assert_resolved {
     ($target:expr, $resp:expr) => {
         let resp = $resp;
-        let address = resp["data"]["suinsName"]["address"]
+        let address = resp["data"]["nameRecord"]["target"]["address"]
             .as_str()
             .expect("result should be string");
 
@@ -44,7 +51,7 @@ macro_rules! assert_not_resolved {
     ($resp:expr) => {
         let resp = $resp;
         assert!(
-            resp["data"]["suinsName"].is_null(),
+            resp["data"]["nameRecord"].is_null(),
             "Expected null result for expired/invalid domain, got {resp:#?}"
         );
     };
@@ -54,9 +61,9 @@ macro_rules! assert_not_resolved {
 macro_rules! assert_reverse {
     ($target:expr, $resp:expr) => {
         let resp = $resp;
-        let name = resp["data"]["address"]["defaultSuinsName"]
+        let name = resp["data"]["address"]["defaultNameRecord"]["domain"]
             .as_str()
-            .expect("defaultSuinsName should be a string");
+            .expect("defaultNameRecord.domain should be a string");
 
         assert_eq!($target, name, "Expected name {}, got {resp:#?}", $target);
     };
@@ -67,8 +74,35 @@ macro_rules! assert_no_reverse {
     ($resp:expr) => {
         let resp = $resp;
         assert!(
-            resp["data"]["address"]["defaultSuinsName"].is_null(),
-            "Expected null for defaultSuinsName, got {resp:#?}",
+            resp["data"]["address"]["defaultNameRecord"].is_null(),
+            "Expected null for defaultNameRecord, got {resp:#?}",
+        );
+    };
+}
+
+/// Tests successful address resolution by name.
+macro_rules! assert_address_by_name {
+    ($target:expr, $resp:expr) => {
+        let resp = $resp;
+        let address = resp["data"]["address"]["address"]
+            .as_str()
+            .expect("address should be a string");
+
+        assert_eq!(
+            $target,
+            address.parse().expect("failed to parse result address"),
+            "Expected successful response from GraphQL, got {resp:#?}",
+        );
+    };
+}
+
+/// Tests that address resolution by name returns null (no match).
+macro_rules! assert_no_address_by_name {
+    ($resp:expr) => {
+        let resp = $resp;
+        assert!(
+            resp["data"]["address"].is_null(),
+            "Expected null for address, got {resp:#?}",
         );
     };
 }
@@ -86,11 +120,12 @@ async fn test_resolve_domain() {
 
     c.cluster.create_checkpoint().await;
 
-    assert_resolved!(target, c.resolve_address("foo.sui").await.unwrap());
+    let resp = c.resolve_address("foo.sui").await.unwrap();
+    assert_resolved!(target, &resp);
+    assert!(resp["data"]["nameRecord"]["parent"].is_null());
+
     assert_resolved!(target, c.resolve_address("@foo").await.unwrap());
     assert_reverse!("foo.sui", c.resolve_name(target).await.unwrap());
-
-    c.cluster.stopped().await;
 }
 
 /// If a domain name exists but has no target, we can't resolve it, but it's not an error.
@@ -106,10 +141,8 @@ async fn test_resolve_domain_no_target() {
     c.cluster.create_checkpoint().await;
 
     let resp = c.resolve_address("foo.sui").await.unwrap();
-    assert!(resp["data"]["suinsName"].is_null());
+    assert!(resp["data"]["nameRecord"]["target"]["address"].is_null());
     assert!(resp["errors"].is_null());
-
-    c.cluster.stopped().await;
 }
 
 /// Set-up a domain with an expiry, and confirm that it exists, then advance time on-chain until it
@@ -136,8 +169,6 @@ async fn test_resolve_domain_expiry() {
 
     assert_not_resolved!(c.resolve_address("foo.sui").await.unwrap());
     assert_no_reverse!(c.resolve_name(target).await.unwrap());
-
-    c.cluster.stopped().await;
 }
 
 #[tokio::test]
@@ -146,8 +177,6 @@ async fn test_resolve_nonexistent_domain() {
     c.cluster.create_checkpoint().await;
 
     assert_not_resolved!(c.resolve_address("foo.sui").await.unwrap());
-
-    c.cluster.stopped().await;
 }
 
 /// Test resolving a valid sub-domain (which requires both the sub-domain and its parent to exist
@@ -169,11 +198,13 @@ async fn test_resolve_subdomain() {
 
     c.cluster.create_checkpoint().await;
 
-    assert_resolved!(target, c.resolve_address("bar.foo.sui").await.unwrap());
+    let resp = c.resolve_address("bar.foo.sui").await.unwrap();
+    assert_resolved!(target, &resp);
+    assert!(resp["data"]["nameRecord"]["parent"].is_object());
+    assert!(resp["data"]["nameRecord"]["parent"]["target"].is_null());
+
     assert_resolved!(target, c.resolve_address("bar@foo").await.unwrap());
     assert_reverse!("bar.foo.sui", c.resolve_name(target).await.unwrap());
-
-    c.cluster.stopped().await;
 }
 
 /// Like the parent domain case, but a sub-domain's expiry is controlled by its parent's expiry
@@ -203,8 +234,6 @@ async fn test_resolve_subdomain_parent_expiry() {
 
     assert_not_resolved!(c.resolve_address("bar.foo.sui").await.unwrap());
     assert_no_reverse!(c.resolve_name(target).await.unwrap());
-
-    c.cluster.stopped().await;
 }
 
 /// A sub-domain that has its own expiry, in addition to (and before) the parent's expiry.
@@ -236,8 +265,6 @@ async fn test_resolve_subdomain_expiry() {
 
     assert_not_resolved!(c.resolve_address("bar.foo.sui").await.unwrap());
     assert_no_reverse!(c.resolve_name(target).await.unwrap());
-
-    c.cluster.stopped().await;
 }
 
 /// A sub-domain where the parent domain's NFT is different from the sub-domain's NFT, is
@@ -264,8 +291,6 @@ async fn test_resolve_subdomain_bad_parent() {
 
     assert_not_resolved!(c.resolve_address("bar.foo.sui").await.unwrap());
     assert_no_reverse!(c.resolve_name(target).await.unwrap());
-
-    c.cluster.stopped().await;
 }
 
 /// The parent domain record does not exist, so the sub-domain is considered expired.
@@ -284,8 +309,104 @@ async fn test_resolve_subdomain_no_parent() {
 
     assert_not_resolved!(c.resolve_address("bar.foo.sui").await.unwrap());
     assert_no_reverse!(c.resolve_name(target).await.unwrap());
+}
 
-    c.cluster.stopped().await;
+/// Test looking up an address by its SuiNS name via Query.address(name: ...).
+#[tokio::test]
+async fn test_address_by_name() {
+    let mut c = SuiNSCluster::new().await;
+
+    let nft = ObjectID::random();
+    let target = SuiAddress::random_for_testing_only();
+    c.add_domain(nft, &["sui", "foo"], Some(target), 1000)
+        .await
+        .expect("Failed to add domain");
+
+    c.cluster.create_checkpoint().await;
+
+    // Resolve using the domain name
+    assert_address_by_name!(target, c.address_by_name("foo.sui").await.unwrap());
+    assert_address_by_name!(target, c.address_by_name("@foo").await.unwrap());
+}
+
+/// If a domain name exists but has no target, Query.address returns null.
+#[tokio::test]
+async fn test_address_by_name_no_target() {
+    let mut c = SuiNSCluster::new().await;
+
+    let nft = ObjectID::random();
+    c.add_domain(nft, &["sui", "foo"], None, 1000)
+        .await
+        .expect("Failed to add domain");
+
+    c.cluster.create_checkpoint().await;
+
+    assert_no_address_by_name!(c.address_by_name("foo.sui").await.unwrap());
+}
+
+/// If the domain doesn't exist, Query.address returns null.
+#[tokio::test]
+async fn test_address_by_name_nonexistent() {
+    let mut c = SuiNSCluster::new().await;
+    c.cluster.create_checkpoint().await;
+
+    assert_no_address_by_name!(c.address_by_name("foo.sui").await.unwrap());
+}
+
+/// Test Query.address with neither address nor name returns an error.
+#[tokio::test]
+async fn test_address_no_identifier_error() {
+    let mut c = SuiNSCluster::new().await;
+    c.cluster.create_checkpoint().await;
+
+    let resp = c.query("{ address { address } }", json!({})).await.unwrap();
+
+    assert!(
+        resp["errors"].as_array().unwrap().iter().any(|e| {
+            e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("Exactly one of `address` or `name` must be specified"))
+        }),
+        "Expected error for missing identifier, got {resp:#?}"
+    );
+}
+
+/// Test Query.address with both address and name returns an error.
+#[tokio::test]
+async fn test_address_both_identifiers_error() {
+    let mut c = SuiNSCluster::new().await;
+
+    let nft = ObjectID::random();
+    let target = SuiAddress::random_for_testing_only();
+    c.add_domain(nft, &["sui", "foo"], Some(target), 1000)
+        .await
+        .expect("Failed to add domain");
+
+    c.cluster.create_checkpoint().await;
+
+    let resp = c
+        .query(
+            r#"
+            query($address: SuiAddress!, $name: String!) {
+                address(address: $address, name: $name) { address }
+            }
+            "#,
+            json!({
+                "address": target.to_string(),
+                "name": "foo.sui",
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        resp["errors"].as_array().unwrap().iter().any(|e| {
+            e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("Exactly one of `address` or `name` must be specified"))
+        }),
+        "Expected error for duplicate identifier, got {resp:#?}"
+    );
 }
 
 struct SuiNSCluster {
@@ -424,7 +545,6 @@ impl SuiNSCluster {
                 ..Default::default()
             },
             &prometheus::Registry::new(),
-            CancellationToken::new(),
         )
         .await
         .expect("Failed to set-up cluster");
@@ -497,20 +617,8 @@ impl SuiNSCluster {
         Ok(())
     }
 
-    /// Send a GraphQL request to the cluster to resolve the given SuiNS name.
-    async fn resolve_address(&self, name: &str) -> anyhow::Result<Value> {
-        let query = r#"
-            query($address: String!) {
-                suinsName(address: $address) {
-                    address
-                }
-            }
-        "#;
-
-        let variables = json!({
-            "address": name,
-        });
-
+    /// Send a GraphQL query to the cluster with the given variables.
+    async fn query(&self, query: &str, variables: Value) -> anyhow::Result<Value> {
         let response = self
             .client
             .post(self.cluster.graphql_url())
@@ -522,44 +630,58 @@ impl SuiNSCluster {
             .await
             .context("Request to GraphQL server failed")?;
 
-        let body: Value = response
+        response
             .json()
             .await
-            .context("Failed to parse GraphQL response")?;
+            .context("Failed to parse GraphQL response")
+    }
 
-        Ok(body)
+    /// Send a GraphQL request to the cluster to resolve the given SuiNS name.
+    async fn resolve_address(&self, name: &str) -> anyhow::Result<Value> {
+        self.query(
+            r#"
+            query($name: String!) {
+                nameRecord(name: $name) {
+                    target { address }
+                    parent {
+                        domain
+                        target { address }
+                    }
+                }
+            }
+            "#,
+            json!({ "name": name }),
+        )
+        .await
     }
 
     /// Send a GraphQL request to the cluster to resolve the SuiNS name for a given address.
     async fn resolve_name(&self, addr: SuiAddress) -> anyhow::Result<Value> {
-        let query = r#"
+        self.query(
+            r#"
             query($address: SuiAddress!) {
                 address(address: $address) {
-                    defaultSuinsName
+                    defaultNameRecord { domain }
                 }
             }
-        "#;
+            "#,
+            json!({ "address": addr.to_string() }),
+        )
+        .await
+    }
 
-        let variables = json!({
-            "address": addr.to_string(),
-        });
-
-        let response = self
-            .client
-            .post(self.cluster.graphql_url())
-            .json(&json!({
-                "query": query,
-                "variables": variables,
-            }))
-            .send()
-            .await
-            .context("Request to GraphQL server failed")?;
-
-        let body: Value = response
-            .json()
-            .await
-            .context("Failed to parse GraphQL response")?;
-
-        Ok(body)
+    /// Send a GraphQL request to resolve an address by its SuiNS name.
+    async fn address_by_name(&self, name: &str) -> anyhow::Result<Value> {
+        self.query(
+            r#"
+            query($name: String!) {
+                address(name: $name) {
+                    address
+                }
+            }
+            "#,
+            json!({ "name": name }),
+        )
+        .await
     }
 }

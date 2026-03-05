@@ -15,6 +15,7 @@ use crate::{
         runner::SymbolicatorRunner,
     },
 };
+
 use lsp_server::{Message, Request, Response};
 use lsp_types::{CompletionItem, CompletionItemKind, CompletionParams, Position};
 use move_command_line_common::files::FileHash;
@@ -26,15 +27,13 @@ use move_compiler::{
         lexer::{Lexer, Tok},
     },
 };
-use move_package::source_package::parsed_manifest::Dependencies;
+use move_package_alt::MoveFlavor;
 use move_symbol_pool::Symbol;
-
-use once_cell::sync::Lazy;
 
 use std::{
     collections::HashSet,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 use vfs::VfsPath;
 
@@ -49,7 +48,7 @@ pub mod utils;
 /// request's cursor position, but in the future it ought to. For example, this function returns
 /// all specification language keywords, but in the future it should be modified to only do so
 /// within a spec block.
-static KEYWORD_COMPLETIONS: Lazy<Vec<CompletionItem>> = Lazy::new(|| {
+static KEYWORD_COMPLETIONS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
     let mut keywords = KEYWORDS
         .iter()
         .chain(CONTEXTUAL_KEYWORDS.iter())
@@ -68,7 +67,7 @@ static KEYWORD_COMPLETIONS: Lazy<Vec<CompletionItem>> = Lazy::new(|| {
 });
 
 /// List of completion items corresponding to each one of Move's builtin functions.
-static BUILTIN_COMPLETIONS: Lazy<Vec<CompletionItem>> = Lazy::new(|| {
+static BUILTIN_COMPLETIONS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
     BUILTINS
         .iter()
         .map(|label| completion_item(label, CompletionItemKind::FUNCTION))
@@ -78,12 +77,11 @@ static BUILTIN_COMPLETIONS: Lazy<Vec<CompletionItem>> = Lazy::new(|| {
 /// Sends the given connection a response to a completion request.
 ///
 /// The completions returned depend upon where the user's cursor is positioned.
-pub fn on_completion_request(
+pub fn on_completion_request<F: MoveFlavor>(
     context: &Context,
     request: &Request,
     ide_files_root: VfsPath,
     pkg_dependencies: Arc<Mutex<CachedPackages>>,
-    implicit_deps: Dependencies,
     flavor: Option<Flavor>,
 ) {
     eprintln!("handling completion request");
@@ -103,13 +101,12 @@ pub fn on_completion_request(
         // it (unless we are at the very first column)
         pos = Position::new(pos.line, pos.character - 1);
     }
-    let completions = completions(
+    let completions = completions::<F>(
         context,
         ide_files_root,
         pkg_dependencies,
         &path,
         pos,
-        implicit_deps,
         flavor,
         context.auto_imports,
     )
@@ -127,13 +124,12 @@ pub fn on_completion_request(
 
 /// Computes a list of auto-completions for a given position in a file,
 /// given the current context.
-fn completions(
+fn completions<F: MoveFlavor>(
     context: &Context,
     ide_files_root: VfsPath,
     pkg_dependencies: Arc<Mutex<CachedPackages>>,
     path: &Path,
     pos: Position,
-    implicit_deps: Dependencies,
     flavor: Option<Flavor>,
     auto_import: bool,
 ) -> Option<Vec<CompletionItem>> {
@@ -143,13 +139,12 @@ fn completions(
     };
     let symbol_map = context.symbols.lock().unwrap();
     let current_symbols = symbol_map.get(&pkg_path)?;
-    Some(compute_completions(
+    Some(compute_completions::<F>(
         current_symbols,
         ide_files_root,
         pkg_dependencies,
         path,
         pos,
-        implicit_deps,
         flavor,
         auto_import,
     ))
@@ -165,22 +160,20 @@ fn file_source_from_symbols(symbols: &Symbols, path: &Path) -> Option<Arc<str>> 
 
 /// Computes a list of auto-completions for a given position in a file,
 /// based on the current symbols.
-pub fn compute_completions(
+pub fn compute_completions<F: MoveFlavor>(
     current_symbols: &Symbols,
     ide_files_root: VfsPath,
     pkg_dependencies: Arc<Mutex<CachedPackages>>,
     path: &Path,
     pos: Position,
-    implicit_deps: Dependencies,
     flavor: Option<Flavor>,
     auto_import: bool,
 ) -> Vec<CompletionItem> {
-    compute_completions_new_symbols(
+    compute_completions_new_symbols::<F>(
         ide_files_root,
         pkg_dependencies,
         path,
         pos,
-        implicit_deps,
         flavor,
         auto_import,
     )
@@ -196,12 +189,11 @@ pub fn compute_completions(
 /// Computes a list of auto-completions for a given position in a file,
 /// after attempting to re-compute the symbols to get the most up-to-date
 /// view of the code (returns `None` if the symbols could not be re-computed).
-fn compute_completions_new_symbols(
+fn compute_completions_new_symbols<F: MoveFlavor>(
     ide_files_root: VfsPath,
     pkg_dependencies: Arc<Mutex<CachedPackages>>,
     path: &Path,
     cursor_position: Position,
-    implicit_deps: Dependencies,
     flavor: Option<Flavor>,
     auto_import: bool,
 ) -> Option<Vec<CompletionItem>> {
@@ -211,13 +203,12 @@ fn compute_completions_new_symbols(
     };
     let cursor_path = path.to_path_buf();
     let cursor_info = Some((&cursor_path, cursor_position));
-    let (symbols, _) = symbols::get_symbols(
+    let (symbols, _) = symbols::get_symbols::<F>(
         pkg_dependencies,
         ide_files_root,
         &pkg_path,
         LintLevel::None,
         cursor_info,
-        implicit_deps,
         flavor,
     )
     .ok()?;

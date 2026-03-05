@@ -14,7 +14,7 @@ use sui_types::{
     messages_checkpoint::{
         CertifiedCheckpointSummary, CheckpointDigest, CheckpointSequenceNumber, CheckpointSummary,
         CheckpointVersionSpecificData, EndOfEpochData, FullCheckpointContents, VerifiedCheckpoint,
-        VerifiedCheckpointContents,
+        VerifiedCheckpointContents, VersionedFullCheckpointContents,
     },
 };
 
@@ -58,7 +58,7 @@ impl CommitteeFixture {
     }
 
     pub fn from_network_config(network_config: &NetworkConfig) -> Self {
-        let committee = network_config.genesis.committee().unwrap();
+        let committee = network_config.genesis.committee();
         Self {
             epoch: committee.epoch,
             validators: committee
@@ -247,11 +247,13 @@ impl CommitteeFixture {
 }
 
 pub fn empty_contents() -> VerifiedCheckpointContents {
-    VerifiedCheckpointContents::new_unchecked(
+    VerifiedCheckpointContents::new_unchecked(VersionedFullCheckpointContents::V1(
         FullCheckpointContents::new_with_causally_ordered_transactions(std::iter::empty()),
-    )
+    ))
 }
 
 pub fn random_contents() -> VerifiedCheckpointContents {
-    VerifiedCheckpointContents::new_unchecked(FullCheckpointContents::random_for_testing())
+    VerifiedCheckpointContents::new_unchecked(VersionedFullCheckpointContents::V1(
+        FullCheckpointContents::random_for_testing(),
+    ))
 }

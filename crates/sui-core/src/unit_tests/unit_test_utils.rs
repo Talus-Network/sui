@@ -33,7 +33,11 @@ async fn init_genesis(
     ObjectID,
 ) {
     // add object_basics package object to genesis
-    let modules: Vec<_> = compile_basics_package().get_modules().cloned().collect();
+    let modules: Vec<_> = compile_basics_package()
+        .await
+        .get_modules()
+        .cloned()
+        .collect();
     let genesis_move_packages: Vec<_> = BuiltInFramework::genesis_move_packages().collect();
     let config = ProtocolConfig::get_for_max_version_UNSAFE();
     let pkg = Object::new_package(
@@ -133,6 +137,7 @@ pub async fn init_local_authorities_with_genesis(
 ) -> AuthorityAggregator<LocalAuthorityClient> {
     telemetry_subscribers::init_for_testing();
     let mut clients = BTreeMap::new();
+    let genesis_committee = genesis.committee();
     for state in authorities {
         let name = state.name;
         let client = LocalAuthorityClient::new_from_authority(state);
@@ -144,5 +149,5 @@ pub async fn init_local_authorities_with_genesis(
     };
     AuthorityAggregatorBuilder::from_genesis(genesis)
         .with_timeouts_config(timeouts)
-        .build_custom_clients(clients)
+        .build_custom_clients(&genesis_committee, clients)
 }

@@ -384,7 +384,7 @@ impl ConsensusAdapter {
         epoch_store: &Arc<AuthorityPerEpochStore>,
         transactions: &[ConsensusTransaction],
     ) -> (impl Future<Output = ()>, usize, usize, usize, usize) {
-        if transactions.iter().any(|tx| tx.is_mfp_transaction()) {
+        if transactions.iter().any(|tx| tx.is_user_transaction()) {
             // UserTransactions are generally sent to just one validator and should
             // be submitted to consensus without delay.
             return (tokio::time::sleep(Duration::ZERO), 0, 0, 0, 0);
@@ -400,6 +400,10 @@ impl ConsensusAdapter {
                 ConsensusTransactionKind::UserTransaction(transaction) => Some((
                     transaction.digest(),
                     transaction.data().transaction_data().gas_price(),
+                )),
+                ConsensusTransactionKind::UserTransactionV2(transaction) => Some((
+                    transaction.tx().digest(),
+                    transaction.tx().data().transaction_data().gas_price(),
                 )),
                 _ => None,
             })
@@ -645,8 +649,11 @@ impl ConsensusAdapter {
             // (either all CertifiedTransaction or all UserTransaction).
             // This makes classifying the transactions easier in later steps.
             let first_kind = &transactions[0].kind;
-            let is_user_tx_batch =
-                matches!(first_kind, ConsensusTransactionKind::UserTransaction(_));
+            let is_user_tx_batch = matches!(
+                first_kind,
+                ConsensusTransactionKind::UserTransaction(_)
+                    | ConsensusTransactionKind::UserTransactionV2(_)
+            );
             let is_cert_batch = matches!(
                 first_kind,
                 ConsensusTransactionKind::CertifiedTransaction(_)
@@ -658,6 +665,7 @@ impl ConsensusAdapter {
                         matches!(
                             transaction.kind,
                             ConsensusTransactionKind::UserTransaction(_)
+                                | ConsensusTransactionKind::UserTransactionV2(_)
                         ),
                         SuiErrorKind::InvalidTxKindInSoftBundle.into()
                     );
@@ -785,7 +793,7 @@ impl ConsensusAdapter {
         // Record submitted transactions early for DoS protection
         if epoch_store.protocol_config().mysticeti_fastpath() {
             for transaction in &transactions {
-                if let ConsensusTransactionKind::UserTransaction(tx) = &transaction.kind {
+                if let Some(tx) = transaction.kind.as_user_transaction() {
                     let amplification_factor = (tx.data().transaction_data().gas_price()
                         / epoch_store.reference_gas_price().max(1))
                     .max(1);
@@ -996,7 +1004,7 @@ impl ConsensusAdapter {
         let consensus_keys: Vec<_> = transactions
             .iter()
             .filter_map(|t| {
-                if t.is_mfp_transaction() {
+                if t.is_user_transaction() {
                     // UserTransaction is not inserted into the pending consensus transactions table.
                     // Also UserTransaction shares the same key as CertifiedTransaction, so removing
                     // the key here can have unexpected effects.
@@ -1014,10 +1022,8 @@ impl ConsensusAdapter {
             || matches!(
                 transactions[0].kind,
                 ConsensusTransactionKind::CertifiedTransaction(_)
-            )
-            || matches!(
-                transactions[0].kind,
-                ConsensusTransactionKind::UserTransaction(_)
+                    | ConsensusTransactionKind::UserTransaction(_)
+                    | ConsensusTransactionKind::UserTransactionV2(_)
             );
         if is_user_tx && epoch_store.should_send_end_of_publish() {
             // sending message outside of any locks scope

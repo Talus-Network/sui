@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use sui_indexer_alt_e2e_tests::FullCluster;
 use sui_indexer_alt_graphql::extensions::logging::REQUEST_ID_HEADER;
 
@@ -36,8 +37,6 @@ async fn request_id(query: &str) -> Result<TestResult, anyhow::Error> {
     let query = json!({"query": query});
     let request = client.post(cluster.graphql_url()).json(&query);
     let response = request.send().await?;
-
-    cluster.stopped().await;
 
     let request_id = response
         .headers()

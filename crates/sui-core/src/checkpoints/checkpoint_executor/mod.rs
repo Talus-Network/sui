@@ -412,6 +412,11 @@ impl CheckpointExecutor {
 
         finish_stage!(pipeline_handle, BuildDbBatch);
 
+        let object_funds_checker = self.state.object_funds_checker.load();
+        if let Some(object_funds_checker) = object_funds_checker.as_ref() {
+            object_funds_checker.commit_effects(batch.0.iter().map(|o| &o.effects));
+        }
+
         let mut ckpt_state = tokio::task::spawn_blocking({
             let this = self.clone();
             move || {
@@ -775,8 +780,10 @@ impl CheckpointExecutor {
 
             let digests = checkpoint_contents.inner();
 
-            let (tx_digests, fx_digests): (Vec<_>, Vec<_>) =
-                digests.iter().map(|d| (d.transaction, d.effects)).unzip();
+            let (tx_digests, fx_digests): (Vec<_>, Vec<_>) = digests
+                .digests_iter()
+                .map(|d| (d.transaction, d.effects))
+                .unzip();
             let transactions = self
                 .transaction_cache_reader
                 .multi_get_transaction_blocks(&tx_digests)
@@ -876,12 +883,12 @@ impl CheckpointExecutor {
                             .with_barrier_dependencies(barrier_deps);
 
                         // Check if the expected effects indicate insufficient balance
-                        if let ExecutionStatus::Failure {
-                            error: ExecutionFailureStatus::InsufficientBalanceForWithdraw,
+                        if let &ExecutionStatus::Failure {
+                            error: ExecutionFailureStatus::InsufficientFundsForWithdraw,
                             ..
                         } = effects.status()
                         {
-                            env = env.with_insufficient_balance();
+                            env = env.with_insufficient_funds();
                         }
 
                         Some((tx_digest, (txn.clone(), env)))
@@ -1072,7 +1079,7 @@ impl CheckpointExecutor {
                     .min_checkpoint_interval_ms_as_option()
                     .unwrap_or_default(),
             );
-            if let Some(first_digest) = checkpoint_contents.inner().first() {
+            if let Some(first_digest) = checkpoint_contents.inner().first_digests() {
                 let maybe_randomness_tx = self.transaction_cache_reader.get_transaction_block(&first_digest.transaction)
                 .unwrap_or_else(||
                     fatal!(

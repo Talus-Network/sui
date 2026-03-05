@@ -5,7 +5,7 @@ use anyhow::Result;
 use object_store::aws::AmazonS3ConfigKey;
 use object_store::gcp::GoogleConfigKey;
 use object_store::path::Path;
-use object_store::{ClientOptions, ObjectStore, RetryConfig};
+use object_store::{ClientOptions, ObjectStore, ObjectStoreExt, RetryConfig};
 use std::str::FromStr;
 use std::time::Duration;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
@@ -17,7 +17,7 @@ pub fn create_remote_store_client(
     timeout_secs: u64,
 ) -> Result<Box<dyn ObjectStore>> {
     let retry_config = RetryConfig {
-        max_retries: 0,
+        max_retries: 10,
         retry_timeout: Duration::from_secs(timeout_secs + 1),
         ..Default::default()
     };

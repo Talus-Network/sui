@@ -9,16 +9,20 @@ use crate::types::BridgeAction;
 use crate::types::BridgeActionType;
 use crate::types::EmergencyAction;
 use crate::types::EthToSuiBridgeAction;
+use crate::types::EthToSuiTokenTransferV2;
 use crate::types::EvmContractUpgradeAction;
 use crate::types::LimitUpdateAction;
 use crate::types::SuiToEthBridgeAction;
 use crate::types::SuiToEthTokenTransfer;
+use crate::types::SuiToEthTokenTransferV2;
+use alloy::primitives::Address as EthAddress;
+use alloy::sol_types::SolValue;
 use anyhow::Result;
 use enum_dispatch::enum_dispatch;
-use ethers::types::Address as EthAddress;
 use sui_types::base_types::SUI_ADDRESS_LENGTH;
 
-pub const TOKEN_TRANSFER_MESSAGE_VERSION: u8 = 1;
+pub const TOKEN_TRANSFER_MESSAGE_VERSION_V1: u8 = 1;
+pub const TOKEN_TRANSFER_MESSAGE_VERSION_V2: u8 = 2;
 pub const COMMITTEE_BLOCKLIST_MESSAGE_VERSION: u8 = 1;
 pub const EMERGENCY_BUTTON_MESSAGE_VERSION: u8 = 1;
 pub const LIMIT_UPDATE_MESSAGE_VERSION: u8 = 1;
@@ -50,7 +54,7 @@ impl BridgeMessageEncoding for SuiToEthBridgeAction {
         // Add message type
         bytes.push(BridgeActionType::TokenTransfer as u8);
         // Add message version
-        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION);
+        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION_V1);
         // Add nonce
         bytes.extend_from_slice(&e.nonce.to_be_bytes());
         // Add source chain id
@@ -75,7 +79,7 @@ impl BridgeMessageEncoding for SuiToEthBridgeAction {
         // Add dest address length
         bytes.push(EthAddress::len_bytes() as u8);
         // Add dest address
-        bytes.extend_from_slice(e.eth_address.as_bytes());
+        bytes.extend_from_slice(e.eth_address.as_slice());
 
         // Add token id
         bytes.push(e.token_id);
@@ -93,7 +97,7 @@ impl BridgeMessageEncoding for SuiToEthTokenTransfer {
         // Add message type
         bytes.push(BridgeActionType::TokenTransfer as u8);
         // Add message version
-        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION);
+        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION_V1);
         // Add nonce
         bytes.extend_from_slice(&self.nonce.to_be_bytes());
         // Add source chain id
@@ -117,13 +121,58 @@ impl BridgeMessageEncoding for SuiToEthTokenTransfer {
         // Add dest address length
         bytes.push(EthAddress::len_bytes() as u8);
         // Add dest address
-        bytes.extend_from_slice(self.eth_address.as_bytes());
+        bytes.extend_from_slice(self.eth_address.as_slice());
 
         // Add token id
         bytes.push(self.token_id);
 
         // Add token amount
         bytes.extend_from_slice(&self.amount_adjusted.to_be_bytes());
+
+        Ok(bytes)
+    }
+}
+
+impl BridgeMessageEncoding for SuiToEthTokenTransferV2 {
+    fn as_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        // Add message type
+        bytes.push(BridgeActionType::TokenTransfer as u8);
+        // Add message version
+        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION_V2);
+        // Add nonce
+        bytes.extend_from_slice(&self.nonce.to_be_bytes());
+        // Add source chain id
+        bytes.push(self.sui_chain_id as u8);
+
+        // Add payload bytes
+        bytes.extend_from_slice(&self.as_payload_bytes()?);
+
+        Ok(bytes)
+    }
+
+    fn as_payload_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+
+        // Add source address length
+        bytes.push(SUI_ADDRESS_LENGTH as u8);
+        // Add source address
+        bytes.extend_from_slice(&self.sui_address.to_vec());
+        // Add dest chain id
+        bytes.push(self.eth_chain_id as u8);
+        // Add dest address length
+        bytes.push(EthAddress::len_bytes() as u8);
+        // Add dest address
+        bytes.extend_from_slice(self.eth_address.as_slice());
+
+        // Add token id
+        bytes.push(self.token_id);
+
+        // Add token amount
+        bytes.extend_from_slice(&self.amount_adjusted.to_be_bytes());
+
+        // Add timestamp
+        bytes.extend_from_slice(&self.timestamp_ms.to_be_bytes());
 
         Ok(bytes)
     }
@@ -136,7 +185,7 @@ impl BridgeMessageEncoding for EthToSuiBridgeAction {
         // Add message type
         bytes.push(BridgeActionType::TokenTransfer as u8);
         // Add message version
-        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION);
+        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION_V1);
         // Add nonce
         bytes.extend_from_slice(&e.nonce.to_be_bytes());
         // Add source chain id
@@ -155,7 +204,7 @@ impl BridgeMessageEncoding for EthToSuiBridgeAction {
         // Add source address length
         bytes.push(EthAddress::len_bytes() as u8);
         // Add source address
-        bytes.extend_from_slice(e.eth_address.as_bytes());
+        bytes.extend_from_slice(e.eth_address.as_slice());
         // Add dest chain id
         bytes.push(e.sui_chain_id as u8);
         // Add dest address length
@@ -168,6 +217,54 @@ impl BridgeMessageEncoding for EthToSuiBridgeAction {
 
         // Add token amount
         bytes.extend_from_slice(&e.sui_adjusted_amount.to_be_bytes());
+
+        Ok(bytes)
+    }
+}
+
+impl BridgeMessageEncoding for EthToSuiTokenTransferV2 {
+    fn as_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let e = &self.eth_bridge_event;
+        // Add message type
+        bytes.push(BridgeActionType::TokenTransfer as u8);
+        // Add message version
+        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION_V2);
+        // Add nonce
+        bytes.extend_from_slice(&e.nonce.to_be_bytes());
+        // Add source chain id
+        bytes.push(e.eth_chain_id as u8);
+
+        // Add payload bytes
+        bytes.extend_from_slice(&self.as_payload_bytes()?);
+
+        Ok(bytes)
+    }
+
+    fn as_payload_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let e = &self.eth_bridge_event;
+
+        // Add source address length
+        bytes.push(EthAddress::len_bytes() as u8);
+        // Add source address
+        bytes.extend_from_slice(e.eth_address.as_slice());
+        // Add dest chain id
+        bytes.push(e.sui_chain_id as u8);
+        // Add dest address length
+        bytes.push(SUI_ADDRESS_LENGTH as u8);
+        // Add dest address
+        bytes.extend_from_slice(&e.sui_address.to_vec());
+
+        // Add token id
+        bytes.push(e.token_id);
+
+        // Add token amount
+        bytes.extend_from_slice(&e.sui_adjusted_amount.to_be_bytes());
+
+        // Add timestamp (convert seconds to milliseconds for Sui)
+        let timestamp_ms = e.timestamp_seconds * 1000;
+        bytes.extend_from_slice(&timestamp_ms.to_be_bytes());
 
         Ok(bytes)
     }
@@ -205,7 +302,7 @@ impl BridgeMessageEncoding for BlocklistCommitteeAction {
         let members_bytes = self
             .members_to_update
             .iter()
-            .map(|m| m.to_eth_address().to_fixed_bytes().to_vec())
+            .map(|m| m.to_eth_address().to_vec())
             .collect::<Vec<_>>();
         for members_bytes in members_bytes {
             bytes.extend_from_slice(&members_bytes);
@@ -313,11 +410,7 @@ impl BridgeMessageEncoding for EvmContractUpgradeAction {
     }
 
     fn as_payload_bytes(&self) -> Result<Vec<u8>> {
-        Ok(ethers::abi::encode(&[
-            ethers::abi::Token::Address(self.proxy_address),
-            ethers::abi::Token::Address(self.new_impl_address),
-            ethers::abi::Token::Bytes(self.call_data.clone()),
-        ]))
+        Ok((self.proxy_address, self.new_impl_address, &self.call_data).abi_encode_params())
     }
 }
 
@@ -393,7 +486,7 @@ impl BridgeMessageEncoding for AddTokensOnEvmAction {
         // Add token addresses
         bytes.push(u8::try_from(self.token_addresses.len())?);
         for token_address in &self.token_addresses {
-            bytes.extend_from_slice(&token_address.to_fixed_bytes());
+            bytes.extend_from_slice(token_address.as_slice());
         }
 
         // Add token sui decimals
@@ -433,8 +526,7 @@ mod tests {
     use crate::types::BlocklistType;
     use crate::types::EmergencyActionType;
     use crate::types::USD_MULTIPLIER;
-    use ethers::abi::ParamType;
-    use ethers::types::{Address as EthAddress, TxHash};
+    use alloy::primitives::{Address as EthAddress, TxHash};
     use fastcrypto::encoding::Encoding;
     use fastcrypto::encoding::Hex;
     use fastcrypto::hash::HashFunction;
@@ -485,7 +577,7 @@ mod tests {
         // Construct the expected bytes
         let prefix_bytes = BRIDGE_MESSAGE_PREFIX.to_vec(); // len: 18
         let message_type = vec![BridgeActionType::TokenTransfer as u8]; // len: 1
-        let message_version = vec![TOKEN_TRANSFER_MESSAGE_VERSION]; // len: 1
+        let message_version = vec![TOKEN_TRANSFER_MESSAGE_VERSION_V1]; // len: 1
         let nonce_bytes = nonce.to_be_bytes().to_vec(); // len: 8
         let source_chain_id_bytes = vec![sui_chain_id as u8]; // len: 1
 
@@ -493,7 +585,7 @@ mod tests {
         let sui_address_bytes = sui_address.to_vec(); // len: 32
         let dest_chain_id_bytes = vec![eth_chain_id as u8]; // len: 1
         let eth_address_length_bytes = vec![EthAddress::len_bytes() as u8]; // len: 1
-        let eth_address_bytes = eth_address.as_bytes().to_vec(); // len: 20
+        let eth_address_bytes = eth_address.to_vec(); // len: 20
 
         let token_id_bytes = vec![token_id]; // len: 1
         let token_amount_bytes = amount_sui_adjusted.to_be_bytes().to_vec(); // len: 8
@@ -809,7 +901,7 @@ mod tests {
         let function_signature = "newMockFunction(bool)";
         let selector = &Keccak256::digest(function_signature).digest[0..4];
         let mut call_data = selector.to_vec();
-        call_data.extend(ethers::abi::encode(&[ethers::abi::Token::Bool(true)]));
+        call_data.extend(true.abi_encode());
         assert_eq!(
             Hex::encode(call_data.clone()),
             "417795ef0000000000000000000000000000000000000000000000000000000000000001"
@@ -844,10 +936,7 @@ mod tests {
         let function_signature = "newMockFunction(bool,uint8)";
         let selector = &Keccak256::digest(function_signature).digest[0..4];
         let mut call_data = selector.to_vec();
-        call_data.extend(ethers::abi::encode(&[
-            ethers::abi::Token::Bool(true),
-            ethers::abi::Token::Uint(42u8.into()),
-        ]));
+        call_data.extend((true, alloy::primitives::U256::from(42)).abi_encode());
         assert_eq!(
             Hex::encode(call_data.clone()),
             "be8fc25d0000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002a"
@@ -904,9 +993,10 @@ mod tests {
             Hex::encode(data.clone()),
             "5355495f4252494447455f4d4553534147450501000000000000007b0c0000000000000000000000000606060606060606060606060606060606060606000000000000000000000000090909090909090909090909090909090909090900000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000"
         );
-        let types = vec![ParamType::Address, ParamType::Address, ParamType::Bytes];
         // Ensure that the call data (start from bytes 29) can be decoded
-        ethers::abi::decode(&types, &data[29..]).unwrap();
+        let _decoded =
+            <(EthAddress, EthAddress, alloy::primitives::Bytes)>::abi_decode_params(&data[29..])
+                .unwrap();
     }
 
     #[test]

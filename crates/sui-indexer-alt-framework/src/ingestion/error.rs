@@ -15,13 +15,10 @@ pub enum Error {
     FetchError(u64, #[source] anyhow::Error),
 
     #[error(transparent)]
-    ReqwestError(#[from] reqwest::Error),
+    ObjectStoreError(#[from] object_store::Error),
 
     #[error("No subscribers for ingestion service")]
     NoSubscribers,
-
-    #[error("Shutdown signal received, stopping ingestion service")]
-    Cancelled,
 
     #[error(transparent)]
     RpcClientError(#[from] tonic::Status),

@@ -4,21 +4,27 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use move_core_types::{ident_str, language_storage::StructTag};
+use move_core_types::ident_str;
+use move_core_types::language_storage::StructTag;
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use simulacrum::Simulacrum;
-use sui_indexer_alt::config::{IndexerConfig, PipelineLayer};
-use sui_indexer_alt_e2e_tests::{FullCluster, OffchainClusterConfig, find};
-use sui_indexer_alt_jsonrpc::config::{PackageResolverLayer, RpcConfig as JsonRpcConfig};
+use sui_indexer_alt::config::IndexerConfig;
+use sui_indexer_alt::config::PipelineLayer;
+use sui_indexer_alt_jsonrpc::config::PackageResolverLayer;
+use sui_indexer_alt_jsonrpc::config::RpcConfig as JsonRpcConfig;
 use sui_move_build::BuildConfig;
-use sui_types::{
-    Identifier, TypeTag,
-    base_types::ObjectID,
-    programmable_transaction_builder::ProgrammableTransactionBuilder,
-    transaction::{Transaction, TransactionData},
-};
-use tokio_util::sync::CancellationToken;
+use sui_types::Identifier;
+use sui_types::TypeTag;
+use sui_types::base_types::ObjectID;
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::Transaction;
+use sui_types::transaction::TransactionData;
+
+use sui_indexer_alt_e2e_tests::FullCluster;
+use sui_indexer_alt_e2e_tests::OffchainClusterConfig;
+use sui_indexer_alt_e2e_tests::find;
 
 /// 5 SUI gas budget
 const DEFAULT_GAS_BUDGET: u64 = 5_000_000_000;
@@ -36,8 +42,6 @@ async fn test_within_limits() {
         result["result"]["data"]["content"].is_object(),
         "Result: {result:#?}"
     );
-
-    c.cluster.stopped().await;
 }
 
 /// If we set a limit on how deeply nested some type arguments can be, then trying to fetch an
@@ -59,7 +63,6 @@ async fn test_type_argument_depth() {
     };
 
     assert!(err.contains("Type parameter nesting exceeded"), "{err}");
-    c.cluster.stopped().await;
 }
 
 /// There is also a limit on how many type parameters a single type can have.
@@ -80,7 +83,6 @@ async fn test_type_argument_width() {
     };
 
     assert!(err.contains("Expected at most 3 type parameters"), "{err}");
-    c.cluster.stopped().await;
 }
 
 /// This limit controls the number of types that need to be loaded to resolve the layout of a type.
@@ -104,8 +106,6 @@ async fn test_type_nodes() {
         err.contains("More than 3 struct definitions required to resolve type"),
         "{err}"
     );
-
-    c.cluster.stopped().await;
 }
 
 /// This limit controls the depth of the resulting value layout.
@@ -129,8 +129,6 @@ async fn test_value_depth() {
         err.contains("Type layout nesting exceeded limit of 3"),
         "{err}"
     );
-
-    c.cluster.stopped().await;
 }
 
 struct TypeLimitCluster {
@@ -165,7 +163,6 @@ impl TypeLimitCluster {
                 ..Default::default()
             },
             &prometheus::Registry::new(),
-            CancellationToken::new(),
         )
         .await
         .expect("Failed to set-up cluster");

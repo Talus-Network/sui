@@ -23,6 +23,7 @@ custom coins with <code><a href="../sui/balance.md#sui_balance_Supply">Supply</a
 -  [Function `send_funds`](#sui_balance_send_funds)
 -  [Function `redeem_funds`](#sui_balance_redeem_funds)
 -  [Function `withdraw_funds_from_object`](#sui_balance_withdraw_funds_from_object)
+-  [Function `settled_funds_value`](#sui_balance_settled_funds_value)
 -  [Function `create_supply_internal`](#sui_balance_create_supply_internal)
 -  [Function `create_staking_rewards`](#sui_balance_create_staking_rewards)
 -  [Function `destroy_storage_rebates`](#sui_balance_destroy_storage_rebates)
@@ -32,9 +33,11 @@ custom coins with <code><a href="../sui/balance.md#sui_balance_Supply">Supply</a
 <pre><code><b>use</b> <a href="../std/address.md#std_address">std::address</a>;
 <b>use</b> <a href="../std/ascii.md#std_ascii">std::ascii</a>;
 <b>use</b> <a href="../std/bcs.md#std_bcs">std::bcs</a>;
+<b>use</b> <a href="../std/internal.md#std_internal">std::internal</a>;
 <b>use</b> <a href="../std/option.md#std_option">std::option</a>;
 <b>use</b> <a href="../std/string.md#std_string">std::string</a>;
 <b>use</b> <a href="../std/type_name.md#std_type_name">std::type_name</a>;
+<b>use</b> <a href="../std/u128.md#std_u128">std::u128</a>;
 <b>use</b> <a href="../std/vector.md#std_vector">std::vector</a>;
 <b>use</b> <a href="../sui/accumulator.md#sui_accumulator">sui::accumulator</a>;
 <b>use</b> <a href="../sui/address.md#sui_address">sui::address</a>;
@@ -43,6 +46,7 @@ custom coins with <code><a href="../sui/balance.md#sui_balance_Supply">Supply</a
 <b>use</b> <a href="../sui/hex.md#sui_hex">sui::hex</a>;
 <b>use</b> <a href="../sui/object.md#sui_object">sui::object</a>;
 <b>use</b> <a href="../sui/party.md#sui_party">sui::party</a>;
+<b>use</b> <a href="../sui/protocol_config.md#sui_protocol_config">sui::protocol_config</a>;
 <b>use</b> <a href="../sui/transfer.md#sui_transfer">sui::transfer</a>;
 <b>use</b> <a href="../sui/tx_context.md#sui_tx_context">sui::tx_context</a>;
 <b>use</b> <a href="../sui/vec_map.md#sui_vec_map">sui::vec_map</a>;
@@ -262,7 +266,7 @@ Increase supply by <code><a href="../sui/balance.md#sui_balance_value">value</a>
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/balance.md#sui_balance_increase_supply">increase_supply</a>&lt;T&gt;(self: &<b>mut</b> <a href="../sui/balance.md#sui_balance_Supply">Supply</a>&lt;T&gt;, <a href="../sui/balance.md#sui_balance_value">value</a>: u64): <a href="../sui/balance.md#sui_balance_Balance">Balance</a>&lt;T&gt; {
-    <b>assert</b>!(<a href="../sui/balance.md#sui_balance_value">value</a> &lt; (18446744073709551615u64 - self.<a href="../sui/balance.md#sui_balance_value">value</a>), <a href="../sui/balance.md#sui_balance_EOverflow">EOverflow</a>);
+    <b>assert</b>!(<a href="../sui/balance.md#sui_balance_value">value</a> &lt;= (<a href="../std/u64.md#std_u64_max_value">std::u64::max_value</a>!() - self.<a href="../sui/balance.md#sui_balance_value">value</a>), <a href="../sui/balance.md#sui_balance_EOverflow">EOverflow</a>);
     self.<a href="../sui/balance.md#sui_balance_value">value</a> = self.<a href="../sui/balance.md#sui_balance_value">value</a> + <a href="../sui/balance.md#sui_balance_value">value</a>;
     <a href="../sui/balance.md#sui_balance_Balance">Balance</a> { <a href="../sui/balance.md#sui_balance_value">value</a> }
 }
@@ -474,7 +478,7 @@ accumulator.
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="../sui/balance.md#sui_balance_redeem_funds">redeem_funds</a>&lt;T&gt;(withdrawal: <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">sui::funds_accumulator::Withdrawal</a>&lt;<a href="../sui/balance.md#sui_balance_Balance">Balance</a>&lt;T&gt;&gt;): <a href="../sui/balance.md#sui_balance_Balance">Balance</a>&lt;T&gt; {
-    withdrawal.redeem()
+    withdrawal.redeem(internal::permit())
 }
 </code></pre>
 
@@ -489,7 +493,7 @@ accumulator.
 Create a <code>Withdrawal&lt;<a href="../sui/balance.md#sui_balance_Balance">Balance</a>&lt;T&gt;&gt;</code> from an object to withdraw funds from it.
 
 
-<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/balance.md#sui_balance_withdraw_funds_from_object">withdraw_funds_from_object</a>&lt;T&gt;(obj: &<b>mut</b> <a href="../sui/object.md#sui_object_UID">sui::object::UID</a>, <a href="../sui/balance.md#sui_balance_value">value</a>: u64): <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">sui::funds_accumulator::Withdrawal</a>&lt;<a href="../sui/balance.md#sui_balance_Balance">sui::balance::Balance</a>&lt;T&gt;&gt;
+<pre><code><b>public</b> <b>fun</b> <a href="../sui/balance.md#sui_balance_withdraw_funds_from_object">withdraw_funds_from_object</a>&lt;T&gt;(obj: &<b>mut</b> <a href="../sui/object.md#sui_object_UID">sui::object::UID</a>, <a href="../sui/balance.md#sui_balance_value">value</a>: u64): <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">sui::funds_accumulator::Withdrawal</a>&lt;<a href="../sui/balance.md#sui_balance_Balance">sui::balance::Balance</a>&lt;T&gt;&gt;
 </code></pre>
 
 
@@ -498,11 +502,39 @@ Create a <code>Withdrawal&lt;<a href="../sui/balance.md#sui_balance_Balance">Bal
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/balance.md#sui_balance_withdraw_funds_from_object">withdraw_funds_from_object</a>&lt;T&gt;(
-    obj: &<b>mut</b> UID,
-    <a href="../sui/balance.md#sui_balance_value">value</a>: u64,
-): Withdrawal&lt;<a href="../sui/balance.md#sui_balance_Balance">Balance</a>&lt;T&gt;&gt; {
+<pre><code><b>public</b> <b>fun</b> <a href="../sui/balance.md#sui_balance_withdraw_funds_from_object">withdraw_funds_from_object</a>&lt;T&gt;(obj: &<b>mut</b> UID, <a href="../sui/balance.md#sui_balance_value">value</a>: u64): Withdrawal&lt;<a href="../sui/balance.md#sui_balance_Balance">Balance</a>&lt;T&gt;&gt; {
     <a href="../sui/funds_accumulator.md#sui_funds_accumulator_withdraw_from_object">sui::funds_accumulator::withdraw_from_object</a>(obj, <a href="../sui/balance.md#sui_balance_value">value</a> <b>as</b> u256)
+}
+</code></pre>
+
+
+
+</details>
+
+<a name="sui_balance_settled_funds_value"></a>
+
+## Function `settled_funds_value`
+
+Read the value of the funds of type T owned by <code><b>address</b></code> as of the beginning of
+the current consensus commit. Can read either address-owned or object-owned balances.
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="../sui/balance.md#sui_balance_settled_funds_value">settled_funds_value</a>&lt;T&gt;(root: &<a href="../sui/accumulator.md#sui_accumulator_AccumulatorRoot">sui::accumulator::AccumulatorRoot</a>, <b>address</b>: <b>address</b>): u64
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="../sui/balance.md#sui_balance_settled_funds_value">settled_funds_value</a>&lt;T&gt;(root: &<a href="../sui/accumulator.md#sui_accumulator_AccumulatorRoot">sui::accumulator::AccumulatorRoot</a>, <b>address</b>: <b>address</b>): u64 {
+    <b>if</b> (!root.u128_exists&lt;<a href="../sui/balance.md#sui_balance_Balance">Balance</a>&lt;T&gt;&gt;(<b>address</b>)) {
+        <b>return</b> 0
+    };
+    <b>let</b> val: u128 = root.u128_read&lt;<a href="../sui/balance.md#sui_balance_Balance">Balance</a>&lt;T&gt;&gt;(<b>address</b>);
+    <b>let</b> val = <a href="../std/u128.md#std_u128_min">std::u128::min</a>(<a href="../std/u64.md#std_u64_max_value">std::u64::max_value</a>!() <b>as</b> u128, val);
+    val <b>as</b> u64
 }
 </code></pre>
 

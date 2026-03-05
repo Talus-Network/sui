@@ -17,6 +17,7 @@ use sui_types::committee::EpochId;
 use sui_types::crypto::RandomnessRound;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::executable_transaction::VerifiedExecutableTransaction;
+use sui_types::executable_transaction::VerifiedExecutableTransactionWithAliases;
 use sui_types::storage::{
     ObjectKey, transaction_non_shared_input_object_keys, transaction_receiving_object_keys,
 };
@@ -90,6 +91,25 @@ impl From<VerifiedExecutableTransaction> for Schedulable<VerifiedExecutableTrans
     }
 }
 
+impl From<Schedulable<VerifiedExecutableTransactionWithAliases>>
+    for Schedulable<VerifiedExecutableTransaction>
+{
+    fn from(schedulable: Schedulable<VerifiedExecutableTransactionWithAliases>) -> Self {
+        match schedulable {
+            Schedulable::Transaction(tx) => Schedulable::Transaction(tx.into_tx()),
+            Schedulable::RandomnessStateUpdate(epoch, round) => {
+                Schedulable::RandomnessStateUpdate(epoch, round)
+            }
+            Schedulable::AccumulatorSettlement(epoch, checkpoint_height) => {
+                Schedulable::AccumulatorSettlement(epoch, checkpoint_height)
+            }
+            Schedulable::ConsensusCommitPrologue(epoch, round, sub_dag_index) => {
+                Schedulable::ConsensusCommitPrologue(epoch, round, sub_dag_index)
+            }
+        }
+    }
+}
+
 // AsTx is like Deref, in that it allows us to use either refs or values in Schedulable.
 // Deref does not work because it conflicts with the impl of Deref for VerifiedExecutableTransaction.
 pub trait AsTx {
@@ -105,6 +125,18 @@ impl AsTx for VerifiedExecutableTransaction {
 impl AsTx for &'_ VerifiedExecutableTransaction {
     fn as_tx(&self) -> &VerifiedExecutableTransaction {
         self
+    }
+}
+
+impl AsTx for VerifiedExecutableTransactionWithAliases {
+    fn as_tx(&self) -> &VerifiedExecutableTransaction {
+        self.tx()
+    }
+}
+
+impl AsTx for &'_ VerifiedExecutableTransactionWithAliases {
+    fn as_tx(&self) -> &VerifiedExecutableTransaction {
+        self.tx()
     }
 }
 
@@ -483,22 +515,14 @@ fn get_or_init_versions<'a>(
         .map(|so| so.into_id_and_version())
         .collect();
 
-    #[cfg(debug_assertions)]
-    {
-        // In tests, we often call assign_versions_from_consensus without going through consensus.
-        // When that happens, there is no settlement transaction to update the accumulator root object version.
-        // And hence the list of shared input objects does not contain the accumulator root object.
-        // We have to manually add it here to make sure we can access the version when needed
-        // when assigning versions for certificates.
-        if epoch_store.accumulators_enabled() {
-            shared_input_objects.push((
-                SUI_ACCUMULATOR_ROOT_OBJECT_ID,
-                epoch_store
-                    .epoch_start_config()
-                    .accumulator_root_obj_initial_shared_version()
-                    .expect("accumulator root obj initial shared version should be set"),
-            ));
-        }
+    if epoch_store.accumulators_enabled() {
+        shared_input_objects.push((
+            SUI_ACCUMULATOR_ROOT_OBJECT_ID,
+            epoch_store
+                .epoch_start_config()
+                .accumulator_root_obj_initial_shared_version()
+                .expect("accumulator root obj initial shared version should be set"),
+        ));
     }
 
     shared_input_objects.sort();
@@ -534,7 +558,6 @@ mod tests {
 
     use sui_types::gas_coin::GAS;
     use sui_types::transaction::FundsWithdrawalArg;
-    use sui_types::type_input::TypeInput;
     use sui_types::{SUI_ACCUMULATOR_ROOT_OBJECT_ID, SUI_RANDOMNESS_STATE_OBJECT_ID};
 
     #[tokio::test]
@@ -546,7 +569,7 @@ mod tests {
             .with_starting_objects(std::slice::from_ref(&shared_object))
             .build()
             .await;
-        let certs = vec![
+        let certs = [
             generate_shared_objs_tx_with_gas_version(&[(id, init_shared_version, true)], 3),
             generate_shared_objs_tx_with_gas_version(&[(id, init_shared_version, false)], 5),
             generate_shared_objs_tx_with_gas_version(&[(id, init_shared_version, true)], 9),
@@ -577,13 +600,16 @@ mod tests {
         // Check that the final version of the shared object is the lamport version of the last
         // transaction.
         assert_eq!(
-            shared_input_next_versions,
-            HashMap::from([((id, init_shared_version), SequenceNumber::from_u64(12))])
+            *shared_input_next_versions
+                .get(&(id, init_shared_version))
+                .unwrap(),
+            SequenceNumber::from_u64(12)
         );
         // Check that the version assignment for each transaction is correct.
         // For a transaction that uses the shared object with mutable=false, it won't update the version
         // using lamport version, hence the next transaction will use the same version number.
         // In the following case, certs[2] has the same assignment as certs[1] for this reason.
+        let expected_accumulator_version = SequenceNumber::from_u64(1);
         assert_eq!(
             assigned_versions.0,
             vec![
@@ -591,28 +617,28 @@ mod tests {
                     certs[0].key(),
                     AssignedVersions::new(
                         vec![((id, init_shared_version), init_shared_version)],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
                     certs[1].key(),
                     AssignedVersions::new(
                         vec![((id, init_shared_version), SequenceNumber::from_u64(4))],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
                     certs[2].key(),
                     AssignedVersions::new(
                         vec![((id, init_shared_version), SequenceNumber::from_u64(4))],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
                     certs[3].key(),
                     AssignedVersions::new(
                         vec![((id, init_shared_version), SequenceNumber::from_u64(10))],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
             ]
@@ -627,7 +653,7 @@ mod tests {
             .epoch_start_config()
             .randomness_obj_initial_shared_version()
             .unwrap();
-        let certs = vec![
+        let certs = [
             VerifiedExecutableTransaction::new_system(
                 VerifiedTransaction::new_randomness_state_update(
                     epoch_store.epoch(),
@@ -678,13 +704,13 @@ mod tests {
         );
         let next_randomness_obj_version = randomness_obj_version.next();
         assert_eq!(
-            shared_input_next_versions,
+            *shared_input_next_versions
+                .get(&(SUI_RANDOMNESS_STATE_OBJECT_ID, randomness_obj_version))
+                .unwrap(),
             // Randomness object's version is only incremented by 1 regardless of lamport version.
-            HashMap::from([(
-                (SUI_RANDOMNESS_STATE_OBJECT_ID, randomness_obj_version),
-                next_randomness_obj_version
-            )])
+            next_randomness_obj_version
         );
+        let expected_accumulator_version = SequenceNumber::from_u64(1);
         assert_eq!(
             assigned_versions.0,
             vec![
@@ -695,7 +721,7 @@ mod tests {
                             (SUI_RANDOMNESS_STATE_OBJECT_ID, randomness_obj_version),
                             randomness_obj_version
                         )],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
@@ -706,7 +732,7 @@ mod tests {
                             (SUI_RANDOMNESS_STATE_OBJECT_ID, randomness_obj_version),
                             next_randomness_obj_version
                         )],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
@@ -717,7 +743,7 @@ mod tests {
                             (SUI_RANDOMNESS_STATE_OBJECT_ID, randomness_obj_version),
                             next_randomness_obj_version
                         )],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
             ]
@@ -757,7 +783,7 @@ mod tests {
         //   tx3: shared object 1 assign version 4, lamport version = 5
         //   tx4: shared objects assign cancelled version, lamport version = 10 due to gas object version = 9
         //   tx5: shared objects assign cancelled version, lamport version = 12 due to gas object version = 11
-        let certs = vec![
+        let certs = [
             generate_shared_objs_tx_with_gas_version(
                 &[
                     (id1, init_shared_version_1, true),
@@ -819,7 +845,7 @@ mod tests {
 
         // Run version assignment logic.
         let ConsensusSharedObjVerAssignment {
-            shared_input_next_versions,
+            mut shared_input_next_versions,
             assigned_versions,
         } = SharedObjVerManager::assign_versions_from_consensus(
             &epoch_store,
@@ -831,6 +857,8 @@ mod tests {
 
         // Check that the final version of the shared object is the lamport version of the last
         // transaction.
+        shared_input_next_versions
+            .remove(&(SUI_ACCUMULATOR_ROOT_OBJECT_ID, SequenceNumber::from_u64(1)));
         assert_eq!(
             shared_input_next_versions,
             HashMap::from([
@@ -844,6 +872,7 @@ mod tests {
         );
 
         // Check that the version assignment for each transaction is correct.
+        let expected_accumulator_version = SequenceNumber::from_u64(1);
         assert_eq!(
             assigned_versions.0,
             vec![
@@ -854,7 +883,7 @@ mod tests {
                             ((id1, init_shared_version_1), init_shared_version_1),
                             ((id2, init_shared_version_2), init_shared_version_2)
                         ],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
@@ -864,14 +893,14 @@ mod tests {
                             ((id1, init_shared_version_1), SequenceNumber::CONGESTED),
                             ((id2, init_shared_version_2), SequenceNumber::CANCELLED_READ),
                         ],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
                     certs[2].key(),
                     AssignedVersions::new(
                         vec![((id1, init_shared_version_1), SequenceNumber::from_u64(4))],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
@@ -881,7 +910,7 @@ mod tests {
                             ((id1, init_shared_version_1), SequenceNumber::CANCELLED_READ),
                             ((id2, init_shared_version_2), SequenceNumber::CONGESTED)
                         ],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
                 (
@@ -894,7 +923,7 @@ mod tests {
                             ),
                             ((id2, init_shared_version_2), SequenceNumber::CANCELLED_READ)
                         ],
-                        None
+                        Some(expected_accumulator_version)
                     )
                 ),
             ]
@@ -910,13 +939,13 @@ mod tests {
             .with_starting_objects(std::slice::from_ref(&shared_object))
             .build()
             .await;
-        let certs = vec![
+        let certs = [
             generate_shared_objs_tx_with_gas_version(&[(id, init_shared_version, true)], 3),
             generate_shared_objs_tx_with_gas_version(&[(id, init_shared_version, false)], 5),
             generate_shared_objs_tx_with_gas_version(&[(id, init_shared_version, true)], 9),
             generate_shared_objs_tx_with_gas_version(&[(id, init_shared_version, true)], 11),
         ];
-        let effects = vec![
+        let effects = [
             TestEffectsBuilder::new(certs[0].data()).build(),
             TestEffectsBuilder::new(certs[1].data())
                 .with_shared_input_versions(BTreeMap::from([(id, SequenceNumber::from_u64(4))]))
@@ -1060,7 +1089,7 @@ mod tests {
                 ptb_builder
                     .funds_withdrawal(FundsWithdrawalArg::balance_from_sender(
                         200,
-                        TypeInput::from(GAS::type_tag()),
+                        GAS::type_tag(),
                     ))
                     .unwrap();
                 tx_builder.build()
@@ -1105,7 +1134,7 @@ mod tests {
                 ptb_builder
                     .funds_withdrawal(FundsWithdrawalArg::balance_from_sender(
                         200,
-                        TypeInput::from(GAS::type_tag()),
+                        GAS::type_tag(),
                     ))
                     .unwrap();
                 tx_builder.build()

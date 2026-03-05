@@ -1,10 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-
 use crate::error::{BridgeError, BridgeResult};
 use crate::types::{BridgeAction, BridgeActionDigest};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct GovernanceVerifier {
@@ -16,8 +15,8 @@ impl GovernanceVerifier {
         // TOOD(audit-blocking): verify chain ids
         let mut approved_goverance_actions = HashMap::new();
         for action in approved_actions {
-            if !action.is_governace_action() {
-                return Err(BridgeError::ActionIsNotGovernanceAction(action));
+            if !action.is_governance_action() {
+                return Err(BridgeError::ActionIsNotGovernanceAction(Box::new(action)));
             }
             approved_goverance_actions.insert(action.digest(), action);
         }
@@ -28,8 +27,8 @@ impl GovernanceVerifier {
 
     pub async fn verify(&self, key: BridgeAction) -> BridgeResult<BridgeAction> {
         // TODO: an optimization would be to check the current nonce on chain and err for older ones
-        if !key.is_governace_action() {
-            return Err(BridgeError::ActionIsNotGovernanceAction(key));
+        if !key.is_governance_action() {
+            return Err(BridgeError::ActionIsNotGovernanceAction(Box::new(key)));
         }
         if let Some(approved_action) = self.approved_goverance_actions.get(&key.digest()) {
             assert_eq!(

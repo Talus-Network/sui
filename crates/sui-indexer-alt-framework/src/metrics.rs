@@ -1,17 +1,26 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
-use prometheus::{
-    Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry,
-    register_histogram_vec_with_registry, register_histogram_with_registry,
-    register_int_counter_vec_with_registry, register_int_counter_with_registry,
-    register_int_gauge_vec_with_registry, register_int_gauge_with_registry,
-};
+use prometheus::Histogram;
+use prometheus::HistogramVec;
+use prometheus::IntCounter;
+use prometheus::IntCounterVec;
+use prometheus::IntGauge;
+use prometheus::IntGaugeVec;
+use prometheus::Registry;
+use prometheus::register_histogram_vec_with_registry;
+use prometheus::register_histogram_with_registry;
+use prometheus::register_int_counter_vec_with_registry;
+use prometheus::register_int_counter_with_registry;
+use prometheus::register_int_gauge_vec_with_registry;
+use prometheus::register_int_gauge_with_registry;
 use tracing::warn;
 
-use crate::{ingestion::error::Error, pipeline::Processor};
+use crate::ingestion::error::Error;
+use crate::pipeline::Processor;
 
 /// Histogram buckets for the distribution of checkpoint fetching latencies.
 const INGESTION_LATENCY_SEC_BUCKETS: &[f64] = &[
@@ -117,6 +126,7 @@ pub struct IndexerMetrics {
     pub collector_gather_latency: HistogramVec,
     pub collector_batch_size: HistogramVec,
     pub total_collector_skipped_checkpoints: IntCounterVec,
+    pub collector_reader_lo: IntGaugeVec,
     pub committer_commit_latency: HistogramVec,
     pub committer_tx_rows: HistogramVec,
     pub watermark_gather_latency: HistogramVec,
@@ -514,6 +524,13 @@ impl IndexerMetrics {
                 &["pipeline"],
                 registry,
             ).unwrap(),
+            collector_reader_lo: register_int_gauge_vec_with_registry!(
+                name("collector_reader_lo"),
+                "Reader low watermark as observed by the collector",
+                &["pipeline"],
+                registry,
+            )
+            .unwrap(),
             committer_commit_latency: register_histogram_vec_with_registry!(
                 name("committer_commit_latency"),
                 "Time taken to write a batch of rows to the database by this committer",
@@ -706,7 +723,7 @@ pub(crate) mod tests {
 
     use prometheus::Registry;
 
-    use super::{IndexerMetrics, IngestionMetrics};
+    use super::*;
 
     /// Construct IndexerMetrics for test purposes.
     pub fn test_metrics() -> Arc<IndexerMetrics> {

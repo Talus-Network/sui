@@ -8,8 +8,7 @@ use crate::MoveTypeTagTraitGeneric;
 use crate::SUI_CLOCK_OBJECT_ID;
 use crate::SUI_FRAMEWORK_ADDRESS;
 use crate::SUI_SYSTEM_ADDRESS;
-use crate::accumulator_root::extract_balance_type_from_field;
-use crate::accumulator_root::is_balance_accumulator_field;
+use crate::accumulator_root::accumulator_value_balance_type_maybe;
 use crate::balance::Balance;
 use crate::coin::COIN_MODULE_NAME;
 use crate::coin::COIN_STRUCT_NAME;
@@ -504,9 +503,7 @@ impl MoveObjectType {
                 false
             }
             MoveObjectType_::SuiBalanceAccumulatorField
-            | MoveObjectType_::BalanceAccumulatorField(_) => {
-                true // These are dynamic fields
-            }
+            | MoveObjectType_::BalanceAccumulatorField(_) => true, // These are dynamic fields
             MoveObjectType_::Other(s) => DynamicFieldInfo::is_dynamic_field(s),
         }
     }
@@ -554,17 +551,13 @@ impl MoveObjectType {
             MoveObjectType_::Coin(inner) => {
                 Coin::is_coin(s) && s.type_params.len() == 1 && inner == &s.type_params[0]
             }
-            MoveObjectType_::SuiBalanceAccumulatorField => {
-                is_balance_accumulator_field(s)
-                    && extract_balance_type_from_field(s)
-                        .map(|t| GAS::is_gas_type(&t))
-                        .unwrap_or(false)
-            }
+            MoveObjectType_::SuiBalanceAccumulatorField => accumulator_value_balance_type_maybe(s)
+                .map(|t| GAS::is_gas_type(&t))
+                .unwrap_or(false),
             MoveObjectType_::BalanceAccumulatorField(inner) => {
-                is_balance_accumulator_field(s)
-                    && extract_balance_type_from_field(s)
-                        .map(|t| &t == inner)
-                        .unwrap_or(false)
+                accumulator_value_balance_type_maybe(s)
+                    .map(|t| &t == inner)
+                    .unwrap_or(false)
             }
             MoveObjectType_::Other(o) => s == o,
         }
@@ -612,15 +605,11 @@ impl From<StructTag> for MoveObjectType {
             MoveObjectType_::Coin(s.type_params.pop().unwrap())
         } else if StakedSui::is_staked_sui(&s) {
             MoveObjectType_::StakedSui
-        } else if is_balance_accumulator_field(&s) {
-            if let Some(balance_type) = extract_balance_type_from_field(&s) {
-                if GAS::is_gas_type(&balance_type) {
-                    MoveObjectType_::SuiBalanceAccumulatorField
-                } else {
-                    MoveObjectType_::BalanceAccumulatorField(balance_type)
-                }
+        } else if let Some(balance_type) = accumulator_value_balance_type_maybe(&s) {
+            if GAS::is_gas_type(&balance_type) {
+                MoveObjectType_::SuiBalanceAccumulatorField
             } else {
-                MoveObjectType_::Other(s)
+                MoveObjectType_::BalanceAccumulatorField(balance_type)
             }
         } else {
             MoveObjectType_::Other(s)
@@ -1226,7 +1215,7 @@ impl From<&TxContext> for MoveLegacyTxContext {
 // This struct is not related to Move and can evolve as needed/required.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TxContext {
-    /// Signer/sender of the transaction
+    /// Sender of the transaction
     sender: AccountAddress,
     /// Digest of the current transaction
     digest: Vec<u8>,

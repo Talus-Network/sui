@@ -7,23 +7,31 @@ use std::time::Duration;
 use insta::assert_json_snapshot;
 use move_core_types::ident_str;
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use simulacrum::Simulacrum;
-use tokio_util::sync::CancellationToken;
-
-use sui_indexer_alt::config::{ConcurrentLayer, IndexerConfig, PipelineLayer, PrunerLayer};
-use sui_indexer_alt_e2e_tests::{FullCluster, OffchainClusterConfig, find::address_owned};
-use sui_indexer_alt_graphql::config::{RpcConfig as GraphQlConfig, WatermarkConfig};
+use sui_indexer_alt::config::ConcurrentLayer;
+use sui_indexer_alt::config::IndexerConfig;
+use sui_indexer_alt::config::PipelineLayer;
+use sui_indexer_alt::config::PrunerLayer;
+use sui_indexer_alt_graphql::config::RpcConfig as GraphQlConfig;
+use sui_indexer_alt_graphql::config::WatermarkConfig;
 use sui_test_transaction_builder::TestTransactionBuilder;
-use sui_types::{
-    base_types::{ObjectID, SuiAddress},
-    crypto::{Signature, Signer, get_account_key_pair},
-    digests::TransactionDigest,
-    effects::TransactionEffectsAPI,
-    object::Owner,
-    programmable_transaction_builder::ProgrammableTransactionBuilder,
-    transaction::{Transaction, TransactionData},
-};
+use sui_types::base_types::ObjectID;
+use sui_types::base_types::SuiAddress;
+use sui_types::crypto::Signature;
+use sui_types::crypto::Signer;
+use sui_types::crypto::get_account_key_pair;
+use sui_types::digests::TransactionDigest;
+use sui_types::effects::TransactionEffectsAPI;
+use sui_types::object::Owner;
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::Transaction;
+use sui_types::transaction::TransactionData;
+
+use sui_indexer_alt_e2e_tests::FullCluster;
+use sui_indexer_alt_e2e_tests::OffchainClusterConfig;
+use sui_indexer_alt_e2e_tests::find::address_owned;
 
 /// 5 SUI gas budget
 const DEFAULT_GAS_BUDGET: u64 = 5_000_000_000;
@@ -138,8 +146,6 @@ async fn test_available_range_with_pipelines() {
     let (first, last) = collect_sequence_numbers(&transasction_available_range);
     assert_eq!(first, 1);
     assert_eq!(last, 10);
-
-    cluster.stopped().await;
 }
 
 /// Test that querying available range for a pipeline that is not enabled returns an error
@@ -171,7 +177,6 @@ async fn test_available_range_pipeline_unavailable() {
         }
       }
     ]"###);
-    cluster.stopped().await;
 }
 
 /// Test available range queries with retention configurations
@@ -236,8 +241,6 @@ async fn test_transaction_pagination_pruning() {
     let transactions_in_range = query_transactions(&cluster, b).await;
     let actual = collect_digests(&transactions_in_range);
     assert_eq!(&a_txs[6..], &actual);
-
-    cluster.stopped().await;
 }
 
 #[tokio::test]
@@ -276,8 +279,6 @@ async fn test_events_pagination_pruning() {
     let events_in_range = query_events(&cluster, json!({ "type": pkg.to_string() })).await;
     let actual = collect_digests(&events_in_range);
     assert_eq!(&tx_digests, &actual);
-
-    cluster.stopped().await;
 }
 
 #[tokio::test]
@@ -314,8 +315,6 @@ async fn test_checkpoint_pagination_pruning() {
         checkpoints[3]["sequenceNumber"].as_u64().unwrap(),
         cp_sequence_numbers[7]
     );
-
-    cluster.stopped().await;
 }
 
 /// Set-up a cluster with a custom configuration for pipelines.
@@ -336,7 +335,6 @@ async fn cluster_with_pipelines(pipeline: PipelineLayer) -> FullCluster {
             ..Default::default()
         },
         &prometheus::Registry::new(),
-        CancellationToken::new(),
     )
     .await
     .expect("Failed to create cluster")

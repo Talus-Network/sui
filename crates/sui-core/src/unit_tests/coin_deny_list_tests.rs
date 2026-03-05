@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::authority::AuthorityState;
-use crate::authority::authority_tests::send_and_confirm_transaction_;
+use crate::authority::authority_tests::submit_and_execute_with_options;
 use crate::authority::move_integration_tests::build_and_try_publish_test_package;
 use crate::authority::test_authority_builder::TestAuthorityBuilder;
 use move_core_types::ident_str;
 use move_core_types::identifier::Identifier;
 use move_core_types::language_storage::{StructTag, TypeTag};
 use std::sync::Arc;
-use sui_protocol_config::{Chain, PerObjectCongestionControlMode, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_test_transaction_builder::{FundSource, TestTransactionBuilder};
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress, dbg_addr};
 use sui_types::crypto::{AccountKeyPair, get_account_key_pair};
@@ -25,7 +25,6 @@ use sui_types::transaction::{
     CallArg, FundsWithdrawalArg, ObjectArg, SharedObjectMutability, TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
     Transaction, TransactionData,
 };
-use sui_types::type_input::TypeInput;
 use sui_types::{SUI_DENY_LIST_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID};
 
 // Test that a regulated coin can be created and all the necessary objects are created with the right types.
@@ -114,7 +113,7 @@ async fn test_regulated_coin_v2_types() {
         ],
     )
     .build_and_sign(&env.keypair);
-    let (_, effects) = send_and_confirm_transaction_(&env.authority, None, tx, true)
+    let (_, effects) = submit_and_execute_with_options(&env.authority, None, tx, true)
         .await
         .unwrap();
     if effects.status().is_err() {
@@ -187,7 +186,7 @@ async fn test_regulated_coin_v2_types() {
         ],
     )
     .build_and_sign(&env.keypair);
-    let (_, effects) = send_and_confirm_transaction_(&env.authority, None, tx, true)
+    let (_, effects) = submit_and_execute_with_options(&env.authority, None, tx, true)
         .await
         .unwrap();
     if effects.status().is_err() {
@@ -228,7 +227,7 @@ async fn test_regulated_coin_v2_funds_withdraw_deny() {
     let (denied_address, denied_keypair) = get_account_key_pair();
 
     env.authority
-        .settle_transactions_for_testing(0, std::slice::from_ref(&env.publish_effects))
+        .settle_accumulator_for_testing(std::slice::from_ref(&env.publish_effects))
         .await;
 
     {
@@ -244,7 +243,7 @@ async fn test_regulated_coin_v2_funds_withdraw_deny() {
             regulated_coin_type.clone(),
         )
         .build_and_sign(&env.keypair);
-        let effects = send_and_confirm_transaction_(&env.authority, None, tx, true)
+        let effects = submit_and_execute_with_options(&env.authority, None, tx, true)
             .await
             .unwrap()
             .1;
@@ -252,7 +251,7 @@ async fn test_regulated_coin_v2_funds_withdraw_deny() {
         env_gas_ref = effects.gas_object().0;
 
         env.authority
-            .settle_transactions_for_testing(1, std::slice::from_ref(&effects))
+            .settle_accumulator_for_testing(std::slice::from_ref(&effects))
             .await;
     }
 
@@ -278,14 +277,13 @@ async fn test_regulated_coin_v2_funds_withdraw_deny() {
         ],
     )
     .build_and_sign(&env.keypair);
-    send_and_confirm_transaction_(&env.authority, None, add_tx, true)
+    submit_and_execute_with_options(&env.authority, None, add_tx, true)
         .await
         .unwrap();
 
     // Build the programmable transaction with a funds withdrawal argument for the denied coin.
     let mut builder = ProgrammableTransactionBuilder::new();
-    let withdraw_arg =
-        FundsWithdrawalArg::balance_from_sender(1, TypeInput::from(regulated_coin_type.clone()));
+    let withdraw_arg = FundsWithdrawalArg::balance_from_sender(1, regulated_coin_type.clone());
     builder.funds_withdrawal(withdraw_arg).unwrap();
     let amount = builder.pure(1u64).unwrap();
     builder.programmable_move_call(
@@ -308,13 +306,15 @@ async fn test_regulated_coin_v2_funds_withdraw_deny() {
     );
     let tx = Transaction::from_data_and_signer(tx_data, vec![&denied_keypair, &env.keypair]);
     let epoch_store = env.authority.load_epoch_store_one_call_per_task();
-    let verified = epoch_store.verify_transaction(tx).unwrap();
+    let verified = epoch_store
+        .verify_transaction_require_no_aliases(tx)
+        .unwrap()
+        .into_tx();
 
     let err = env
         .authority
-        .handle_sign_transaction(&epoch_store, verified)
-        .await
-        .expect_err("signing should fail for denied address");
+        .handle_vote_transaction(&epoch_store, verified)
+        .expect_err("validation should fail for denied address");
 
     match err.into_inner() {
         SuiErrorKind::UserInputError {
@@ -423,8 +423,6 @@ async fn new_authority_and_publish(path: &str) -> TestEnv {
     let mut protocol_config =
         ProtocolConfig::get_for_version(ProtocolVersion::max(), Chain::Unknown);
     protocol_config.enable_accumulators_for_testing();
-    protocol_config
-        .set_per_object_congestion_control_mode_for_testing(PerObjectCongestionControlMode::None);
 
     let authority = TestAuthorityBuilder::new()
         .with_starting_objects(&[gas_object])

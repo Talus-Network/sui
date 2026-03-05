@@ -81,7 +81,7 @@ pub(super) fn resolve_syntax_attributes(
         return None;
     }
 
-    let method_entry = syntax_methods.entry(type_name).or_default();
+    let method_entry = syntax_methods.entry(type_name.clone()).or_default();
 
     let Some(kind) = determine_valid_kind(context, prekind, &param_ty) else {
         assert!(context.env.has_errors());
@@ -101,7 +101,7 @@ pub(super) fn resolve_syntax_attributes(
         loc: function_name.0.loc,
         visibility: function.visibility,
         kind,
-        tname: type_name,
+        tname: type_name.clone(),
         target_function: (*module_name, *function_name),
     };
     let method_opt: &mut Option<Box<SyntaxMethod>> = method_entry.lookup_kind_entry(&kind);
@@ -221,8 +221,8 @@ fn determine_subject_type_name(
     ann_loc: &Loc,
     sp!(loc, ty_): &N::Type,
 ) -> Option<TypeName> {
-    match ty_ {
-        N::Type_::Apply(_, type_name, _) => {
+    match ty_.inner() {
+        N::TypeInner::Apply(_, type_name, _) => {
             let defining_module = match &type_name.value {
                 N::TypeName_::Multiple(_) => {
                     let msg = "Invalid type for syntax method definition";
@@ -232,10 +232,10 @@ fn determine_subject_type_name(
                     return None;
                 }
                 N::TypeName_::Builtin(sp!(_, bt_)) => context.env.primitive_definer(*bt_),
-                N::TypeName_::ModuleType(m, _) => Some(m),
+                N::TypeName_::ModuleType(m, _) => Some(&**m),
             };
             if Some(cur_module) == defining_module {
-                Some(*type_name)
+                Some(type_name.clone())
             } else {
                 context.add_diag(diag!(
                     Declarations::InvalidSyntaxMethod,
@@ -245,8 +245,10 @@ fn determine_subject_type_name(
                 None
             }
         }
-        N::Type_::Ref(_, inner) => determine_subject_type_name(context, cur_module, ann_loc, inner),
-        N::Type_::Param(param) => {
+        N::TypeInner::Ref(_, inner) => {
+            determine_subject_type_name(context, cur_module, ann_loc, inner)
+        }
+        N::TypeInner::Param(param) => {
             let msg = format!(
                 "Invalid {} annotation. Cannot associate a syntax method with a type parameter",
                 SyntaxAttribute::SYNTAX
@@ -262,11 +264,11 @@ fn determine_subject_type_name(
             ));
             None
         }
-        N::Type_::Var(_) | N::Type_::Anything | N::Type_::UnresolvedError => {
+        N::TypeInner::Var(_) | N::TypeInner::Anything | N::TypeInner::UnresolvedError => {
             assert!(context.env.has_errors());
             None
         }
-        N::Type_::Unit | N::Type_::Fun(_, _) | N::Type_::Void => {
+        N::TypeInner::Unit | N::TypeInner::Fun(_, _) | N::TypeInner::Void => {
             let msg = "Invalid type for syntax method definition";
             let mut diag = diag!(Declarations::InvalidSyntaxMethod, (*loc, msg));
             diag.add_note("Syntax methods may only be defined for single base types");
@@ -357,10 +359,10 @@ fn valid_index_return_type(
     kind_loc: &Loc,
     sp!(tloc, type_): &N::Type,
 ) -> bool {
-    match type_ {
-        N::Type_::Apply(_, _, _) | N::Type_::Param(_) => true,
-        N::Type_::Ref(_, inner) => valid_index_return_type(context, kind_loc, inner),
-        N::Type_::Unit => {
+    match type_.inner() {
+        N::TypeInner::Apply(_, _, _) | N::TypeInner::Param(_) => true,
+        N::TypeInner::Ref(_, inner) => valid_index_return_type(context, kind_loc, inner),
+        N::TypeInner::Unit => {
             let msg = format!(
                 "Invalid {} annotation. This syntax method cannot return a unit type",
                 SyntaxAttribute::SYNTAX
@@ -373,7 +375,7 @@ fn valid_index_return_type(
             ));
             false
         }
-        N::Type_::Fun(_, _) => {
+        N::TypeInner::Fun(_, _) => {
             let msg = format!(
                 "Invalid {} annotation. A syntax method cannot return a function",
                 SyntaxAttribute::SYNTAX
@@ -386,7 +388,10 @@ fn valid_index_return_type(
             ));
             false
         }
-        N::Type_::Var(_) | N::Type_::Anything | N::Type_::Void | N::Type_::UnresolvedError => {
+        N::TypeInner::Var(_)
+        | N::TypeInner::Anything
+        | N::TypeInner::Void
+        | N::TypeInner::UnresolvedError => {
             // Already an error state, so pass
             assert!(context.env.has_errors());
             false

@@ -1,56 +1,71 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{any::Any, net::SocketAddr, sync::Arc};
+use std::any::Any;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use anyhow::{self, Context};
-use api::types::{
-    address::IAddressable, move_datatype::IMoveDatatype, move_object::IMoveObject, object::IObject,
-};
-use async_graphql::{
-    EmptySubscription, ObjectType, Schema, SchemaBuilder, SubscriptionType,
-    extensions::ExtensionFactory, http::GraphiQLSource,
-};
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{
-    Extension, Router,
-    extract::{ConnectInfo, MatchedPath},
-    http::Method,
-    response::Html,
-    routing::{MethodRouter, get, post},
-};
+use anyhow::Context as _;
+use api::types::address::IAddressable;
+use api::types::move_datatype::IMoveDatatype;
+use api::types::move_object::IMoveObject;
+use api::types::object::IObject;
+use async_graphql::EmptySubscription;
+use async_graphql::ObjectType;
+use async_graphql::Schema;
+use async_graphql::SchemaBuilder;
+use async_graphql::SubscriptionType;
+use async_graphql::extensions::ExtensionFactory;
+use async_graphql::http::GraphiQLSource;
+use async_graphql_axum::GraphQLRequest;
+use async_graphql_axum::GraphQLResponse;
+use axum::Extension;
+use axum::Router;
+use axum::extract::ConnectInfo;
+use axum::extract::MatchedPath;
+use axum::http::Method;
+use axum::response::Html;
+use axum::routing::MethodRouter;
+use axum::routing::get;
+use axum::routing::post;
 use axum_extra::TypedHeader;
 use config::RpcConfig;
-use extensions::{
-    query_limits::{QueryLimitsChecker, show_usage::ShowUsage},
-    timeout::Timeout,
-};
+use extensions::query_limits::QueryLimitsChecker;
+use extensions::query_limits::rich;
+use extensions::query_limits::show_usage::ShowUsage;
+use extensions::timeout::Timeout;
 use headers::ContentLength;
 use health::DbProbe;
 use prometheus::Registry;
+use sui_futures::service::Service;
+use sui_indexer_alt_reader::bigtable_reader::BigtableReader;
+use sui_indexer_alt_reader::consistent_reader::ConsistentReader;
+use sui_indexer_alt_reader::consistent_reader::ConsistentReaderArgs;
+use sui_indexer_alt_reader::fullnode_client::FullnodeArgs;
+use sui_indexer_alt_reader::fullnode_client::FullnodeClient;
+use sui_indexer_alt_reader::kv_loader::KvLoader;
+use sui_indexer_alt_reader::ledger_grpc_reader::LedgerGrpcReader;
+use sui_indexer_alt_reader::package_resolver::DbPackageStore;
+use sui_indexer_alt_reader::package_resolver::PackageCache;
+use sui_indexer_alt_reader::pg_reader::PgReader;
 use sui_indexer_alt_reader::pg_reader::db::DbArgs;
-use sui_indexer_alt_reader::system_package_task::{SystemPackageTask, SystemPackageTaskArgs};
-use sui_indexer_alt_reader::{
-    bigtable_reader::BigtableReader,
-    consistent_reader::{ConsistentReader, ConsistentReaderArgs},
-    fullnode_client::{FullnodeArgs, FullnodeClient},
-    kv_loader::KvLoader,
-    ledger_grpc_reader::LedgerGrpcReader,
-    package_resolver::{DbPackageStore, PackageCache},
-    pg_reader::PgReader,
-};
-use task::{
-    chain_identifier,
-    watermark::{WatermarkTask, WatermarksLock},
-};
-use tokio::{net::TcpListener, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
+use sui_indexer_alt_reader::system_package_task::SystemPackageTask;
+use sui_indexer_alt_reader::system_package_task::SystemPackageTaskArgs;
+use task::chain_identifier;
+use task::watermark::WatermarkTask;
+use task::watermark::WatermarksLock;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tower_http::catch_panic;
 use tower_http::cors;
-use tracing::{error, info};
+use tracing::info;
 use url::Url;
 
-use crate::api::{mutation::Mutation, query::Query};
-use crate::extensions::logging::{Logging, Session};
+use crate::api::mutation::Mutation;
+use crate::api::query::Query;
+use crate::error::PanicHandler;
+use crate::extensions::logging::Logging;
+use crate::extensions::logging::Session;
 use crate::metrics::RpcMetrics;
 use crate::middleware::version::Version;
 
@@ -99,9 +114,6 @@ pub struct RpcService<Q, M, S> {
 
     /// Metrics for the RPC service.
     metrics: Arc<RpcMetrics>,
-
-    /// Cancellation token controls lifecycle of all RPC-related services.
-    cancel: CancellationToken,
 }
 
 impl<Q, M, S> RpcService<Q, M, S>
@@ -115,7 +127,6 @@ where
         version: &'static str,
         schema: SchemaBuilder<Q, M, S>,
         registry: &Registry,
-        cancel: CancellationToken,
     ) -> Self {
         let RpcArgs {
             rpc_listen_address,
@@ -135,7 +146,6 @@ where
             router,
             schema,
             metrics,
-            cancel,
         }
     }
 
@@ -173,7 +183,7 @@ where
 
     /// Run the RPC service. This binds the listener and exposes handlers for the RPC service and IDE
     /// (if enabled).
-    pub async fn run(self) -> anyhow::Result<JoinHandle<()>>
+    pub async fn run(self) -> anyhow::Result<Service>
     where
         Q: ObjectType + 'static,
         M: ObjectType + 'static,
@@ -185,8 +195,7 @@ where
             version,
             mut router,
             schema,
-            metrics: _,
-            cancel,
+            metrics,
         } = self;
 
         if with_ide {
@@ -207,31 +216,33 @@ where
                     .allow_methods([Method::POST])
                     .allow_origin(cors::Any)
                     .allow_headers(cors::Any),
-            );
+            )
+            .layer(catch_panic::CatchPanicLayer::custom(PanicHandler::new(
+                metrics,
+            )));
 
         info!("Starting GraphQL service on {rpc_listen_address}");
         let listener = TcpListener::bind(rpc_listen_address)
             .await
             .context("Failed to bind GraphQL to listen address")?;
 
-        let service = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown({
-            let cancel = cancel.clone();
-            async move {
-                cancel.cancelled().await;
-                info!("Shutdown received, shutting down GraphQL service");
-            }
-        });
-
-        Ok(tokio::spawn(async move {
-            if let Err(e) = service.await.context("Failed to start GraphQL service") {
-                error!("Failed to start GraphQL service: {e:?}");
-                cancel.cancel();
-            }
-        }))
+        let (stx, srx) = oneshot::channel::<()>();
+        Ok(Service::new()
+            .with_shutdown_signal(async move {
+                let _ = stx.send(());
+            })
+            .spawn(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let _ = srx.await;
+                    info!("Shutdown received, shutting down GraphQL service");
+                })
+                .await
+                .context("Failed to start GraphQL service")
+            }))
     }
 }
 
@@ -254,8 +265,7 @@ pub fn schema() -> SchemaBuilder<Query, Mutation, EmptySubscription> {
 }
 
 /// Set-up and run the RPC service, using the provided arguments (expected to be extracted from the
-/// command-line). The service will continue to run until the cancellation token is triggered, and
-/// will signal cancellation on the token when it is shutting down.
+/// command-line).
 ///
 /// Access to most reads is controlled by the `database_url` -- if it is `None`, those reads will
 /// not work. KV queries can optionally be served by a Bigtable instance or Ledger gRPC service
@@ -279,28 +289,16 @@ pub async fn start_rpc(
     config: RpcConfig,
     pg_pipelines: Vec<String>,
     registry: &Registry,
-    cancel: CancellationToken,
-) -> anyhow::Result<JoinHandle<()>> {
-    let rpc = RpcService::new(args, version, schema(), registry, cancel.child_token());
+) -> anyhow::Result<Service> {
+    let rpc = RpcService::new(args, version, schema(), registry);
     let metrics = rpc.metrics();
 
     // Create gRPC full node client wrapper
-    let fullnode_client = FullnodeClient::new(
-        Some("graphql_fullnode"),
-        fullnode_args,
-        registry,
-        cancel.child_token(),
-    )
-    .await?;
+    let fullnode_client =
+        FullnodeClient::new(Some("graphql_fullnode"), fullnode_args, registry).await?;
 
-    let pg_reader = PgReader::new(
-        Some("graphql_db"),
-        database_url.clone(),
-        db_args,
-        registry,
-        cancel.child_token(),
-    )
-    .await?;
+    let pg_reader =
+        PgReader::new(Some("graphql_db"), database_url.clone(), db_args, registry).await?;
 
     let bigtable_reader = if let Some(instance_id) = kv_args.bigtable_instance.as_ref() {
         let reader = BigtableReader::new(
@@ -317,21 +315,21 @@ pub async fn start_rpc(
     };
 
     let ledger_grpc_reader = if let Some(ledger_grpc_url) = kv_args.ledger_grpc_url.as_ref() {
-        let reader = LedgerGrpcReader::new(ledger_grpc_url.clone(), kv_args.ledger_grpc_args())
-            .await
-            .context("Failed to create Ledger gRPC reader")?;
+        let reader = LedgerGrpcReader::new(
+            ledger_grpc_url.clone(),
+            kv_args.ledger_grpc_args(),
+            Some("graphql_ledger_grpc"),
+            registry,
+        )
+        .await
+        .context("Failed to create Ledger gRPC reader")?;
         Some(reader)
     } else {
         None
     };
 
-    let consistent_reader = ConsistentReader::new(
-        Some("graphql_consistent"),
-        consistent_reader_args,
-        registry,
-        cancel.child_token(),
-    )
-    .await?;
+    let consistent_reader =
+        ConsistentReader::new(Some("graphql_consistent"), consistent_reader_args, registry).await?;
 
     let pg_loader = Arc::new(pg_reader.as_data_loader());
     let kv_loader = if let Some(reader) = bigtable_reader.as_ref() {
@@ -348,16 +346,13 @@ pub async fn start_rpc(
         system_package_task_args,
         pg_reader.clone(),
         package_store.clone(),
-        cancel.child_token(),
     );
 
     // Fetch and cache the chain identifier from the database.
-    let chain_identifier = chain_identifier::task(
-        &pg_reader,
+    let (chain_identifier, s_chain_id) = chain_identifier::task(
+        pg_reader.clone(),
         config.watermark.watermark_polling_interval,
-        cancel.child_token(),
-    )
-    .await?;
+    );
 
     let watermark_task = WatermarkTask::new(
         config.watermark,
@@ -367,7 +362,6 @@ pub async fn start_rpc(
         ledger_grpc_reader,
         consistent_reader.clone(),
         metrics.clone(),
-        cancel.child_token(),
     );
 
     let rpc = rpc
@@ -393,16 +387,14 @@ pub async fn start_rpc(
         .data(package_store)
         .data(fullnode_client);
 
-    let h_rpc = rpc.run().await?;
-    let h_system_package_task = system_package_task.run();
-    let h_watermark = watermark_task.run();
+    let s_rpc = rpc.run().await?;
+    let s_system_package_task = system_package_task.run();
+    let s_watermark = watermark_task.run();
 
-    Ok(tokio::spawn(async move {
-        let _ = h_rpc.await;
-        cancel.cancel();
-        let _ = h_system_package_task.await;
-        let _ = h_watermark.await;
-    }))
+    Ok(s_rpc
+        .attach(s_chain_id)
+        .attach(s_system_package_task)
+        .attach(s_watermark))
 }
 
 /// Handler for RPC requests (POST requests making GraphQL queries).
@@ -418,7 +410,8 @@ async fn graphql(
         .into_inner()
         .data(content_length)
         .data(Session::new(addr))
-        .data(watermark.read().await.clone());
+        .data(watermark.read().await.clone())
+        .data(rich::Meter::default());
 
     if let Some(TypedHeader(show_usage)) = show_usage {
         request = request.data(show_usage);
@@ -435,10 +428,27 @@ async fn graphiql(path: MatchedPath) -> Html<String> {
 
 #[cfg(test)]
 mod tests {
-    use async_graphql::SDLExportOptions;
-    use insta::assert_snapshot;
     use std::fs;
+    use std::net::IpAddr;
+    use std::net::Ipv4Addr;
     use std::path::PathBuf;
+
+    use async_graphql::EmptyMutation;
+    use async_graphql::EmptySubscription;
+    use async_graphql::Object;
+    use async_graphql::SDLExportOptions;
+    use async_graphql::Schema;
+    use async_graphql_axum::GraphQLRequest;
+    use async_graphql_axum::GraphQLResponse;
+    use axum::routing::post;
+    use insta::assert_snapshot;
+    use reqwest::Client;
+    use serde_json::Value;
+    use serde_json::json;
+    use sui_pg_db::temp::get_available_port;
+
+    use crate::error::code;
+    use crate::extensions::logging::Session;
 
     use super::*;
 
@@ -459,5 +469,84 @@ mod tests {
         fs::write(path, &sdl).unwrap();
 
         assert_snapshot!(file, sdl);
+    }
+
+    #[tokio::test]
+    async fn test_panic_handling() {
+        struct Query;
+
+        #[Object]
+        impl Query {
+            async fn panic(&self) -> bool {
+                assert_eq!(1, 2, "Boom!");
+                true
+            }
+        }
+
+        async fn graphql(
+            Extension(schema): Extension<Schema<Query, EmptyMutation, EmptySubscription>>,
+            request: GraphQLRequest,
+        ) -> GraphQLResponse {
+            let request = request
+                .into_inner()
+                .data(Session::new("0.0.0.0:0".parse().unwrap()));
+            schema.execute(request).await.into()
+        }
+
+        let registry = Registry::new();
+        let rpc_listen_address =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), get_available_port());
+
+        let rpc = RpcService::new(
+            RpcArgs {
+                rpc_listen_address,
+                no_ide: true,
+            },
+            "test",
+            Schema::build(Query, EmptyMutation, EmptySubscription),
+            &registry,
+        )
+        .route("/graphql", post(graphql));
+
+        let metrics = rpc.metrics();
+        let _svc = rpc.run().await.unwrap();
+
+        let url = format!("http://{rpc_listen_address}/graphql");
+        let client = Client::new();
+
+        let resp = client
+            .post(&url)
+            .json(&json!({
+                "query": "{ panic }"
+            }))
+            .send()
+            .await
+            .expect("Request should succeed");
+
+        assert_eq!(resp.status(), 500);
+
+        let body: Value = resp.json().await.expect("Response should be JSON");
+
+        // Verify the response is a GraphQL error
+        let error = &body["errors"].as_array().unwrap()[0];
+
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("Request panicked")
+        );
+
+        assert_eq!(
+            error["extensions"]["code"].as_str(),
+            Some(code::INTERNAL_SERVER_ERROR)
+        );
+
+        // The panic message is in the chain
+        let chain = error["extensions"]["chain"].as_array().unwrap();
+        assert!(chain.iter().any(|c| c.as_str().unwrap().contains("Boom!")));
+
+        // Verify the panic is recorded in metrics
+        assert_eq!(metrics.queries_panicked.get(), 1);
     }
 }

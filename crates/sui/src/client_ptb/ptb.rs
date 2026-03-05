@@ -22,12 +22,13 @@ use clap::{Args, ValueHint, arg};
 use move_core_types::account_address::AccountAddress;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use sui_json_rpc_types::{SuiExecutionStatus, SuiTransactionBlockEffectsAPI};
 use sui_keys::keystore::AccountKeystore;
-use sui_sdk::{SuiClient, wallet_context::WalletContext};
+use sui_sdk::{apis::ReadApi, wallet_context::WalletContext};
 use sui_types::{
     base_types::ObjectID,
     digests::TransactionDigest,
+    effects::TransactionEffectsAPI,
+    execution_status::ExecutionStatus,
     gas::GasCostSummary,
     move_package::MovePackage,
     transaction::{ProgrammableTransaction, TransactionKind},
@@ -48,7 +49,7 @@ pub struct PTBPreview<'a> {
 #[derive(Serialize)]
 pub struct Summary {
     pub digest: TransactionDigest,
-    pub status: SuiExecutionStatus,
+    pub status: ExecutionStatus,
     pub gas_cost: GasCostSummary,
 }
 
@@ -159,7 +160,8 @@ impl PTB {
             starting_addresses.extend(mvr_data);
         }
 
-        let (res, warnings) = Self::build_ptb(program, starting_addresses, client.clone()).await;
+        let (res, warnings) =
+            Self::build_ptb(program, starting_addresses, client.read_api(), context).await;
 
         // Render warnings
         if !warnings.is_empty() {
@@ -248,22 +250,18 @@ impl PTB {
             _ => anyhow::bail!("Internal error, unexpected response from PTB execution."),
         };
 
-        if let Some(effects) = transaction_response.effects.as_ref()
-            && effects.status().is_err()
-        {
+        if transaction_response.effects.status().is_err() {
             return Err(anyhow!(
-                "PTB execution {}. Transaction digest is: {}",
-                Pretty(effects.status()),
-                effects.transaction_digest()
+                "PTB execution {:?}. Transaction digest is: {}",
+                transaction_response.effects.status(),
+                transaction_response.effects.transaction_digest()
             ));
         }
 
         let summary = {
-            let effects = transaction_response.effects.as_ref().ok_or_else(|| {
-                anyhow!("Internal error: no transaction effects after PTB was executed.")
-            })?;
+            let effects = &transaction_response.effects;
             Summary {
-                digest: transaction_response.digest,
+                digest: transaction_response.transaction.digest(),
                 status: effects.status().clone(),
                 gas_cost: effects.gas_cost_summary().clone(),
             }
@@ -281,7 +279,7 @@ impl PTB {
         } else if program_metadata.summary_set {
             println!("{}", Pretty(&summary));
         } else {
-            println!("{}", transaction_response);
+            println!("{}", serde_json::to_string_pretty(&transaction_response)?);
         }
 
         Ok(())
@@ -291,12 +289,13 @@ impl PTB {
     pub async fn build_ptb(
         program: Program,
         starting_addresses: BTreeMap<String, AddressData>,
-        client: SuiClient,
+        reader: &ReadApi,
+        wallet: &WalletContext,
     ) -> (
         Result<ProgrammableTransaction, Vec<PTBError>>,
         Vec<PTBError>,
     ) {
-        let builder = PTBBuilder::new(starting_addresses, client.read_api());
+        let builder = PTBBuilder::new(starting_addresses, reader, wallet);
         builder.build(program).await
     }
 
@@ -458,7 +457,7 @@ pub fn ptb_description() -> clap::Command {
             \n --assign sender\
             \n --publish \".\"\
             \n --assign upgrade_cap\
-            \n --transfer-objects sender \"[upgrade_cap]\""
+            \n --transfer-objects \"[upgrade_cap]\" sender"
         ).value_hint(ValueHint::DirPath))
         .arg(arg!(
             --"upgrade" <MOVE_PACKAGE_PATH>

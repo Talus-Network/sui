@@ -16,12 +16,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use fastcrypto::traits::Signer;
+use prost::Message;
 use rand::rngs::OsRng;
 use sui_config::verifier_signing_config::VerifierSigningConfig;
 use sui_config::{genesis, transaction_deny_config::TransactionDenyConfig};
 use sui_framework_snapshot::load_bytecode_snapshot;
 use sui_protocol_config::ProtocolVersion;
-use sui_storage::blob::{Blob, BlobEncoding};
+use sui_rpc::field::{FieldMask, FieldMaskUtil};
+use sui_rpc::merge::Merge;
+use sui_rpc::proto::sui::rpc;
 use sui_swarm_config::genesis_config::AccountConfig;
 use sui_swarm_config::network_config::NetworkConfig;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
@@ -263,19 +266,29 @@ impl<R, S: store::SimulatorStore> Simulacrum<R, S> {
     /// created.
     pub fn create_checkpoint(&mut self) -> VerifiedCheckpoint {
         if self.epoch_state.protocol_config().enable_accumulators() {
-            let settlement_txns = self
+            let (settlement_txns, checkpoint_height) = self
                 .checkpoint_builder
                 .get_settlement_txns(self.epoch_state.protocol_config());
 
-            // The final transaction (the barrier transaction) must be executed after
-            // all the settlement transactions.
+            // Execute settlement transactions and collect their effects
+            let mut settlement_effects = Vec::with_capacity(settlement_txns.len());
             for txn in settlement_txns {
-                self.execute_system_transaction(txn)
-                    .expect("settlement txn cannot fail")
-                    .0
-                    .status()
-                    .unwrap();
+                let (effects, _) = self
+                    .execute_system_transaction(txn)
+                    .expect("settlement txn cannot fail");
+                effects.status().unwrap();
+                settlement_effects.push(effects);
             }
+
+            // Build and execute the barrier transaction using settlement effects
+            let barrier_tx = self
+                .checkpoint_builder
+                .get_barrier_tx(checkpoint_height, &settlement_effects);
+            self.execute_system_transaction(barrier_tx)
+                .expect("barrier txn cannot fail")
+                .0
+                .status()
+                .unwrap();
         }
 
         let committee = CommitteeWithKeys::new(&self.keystore, self.epoch_state.committee());
@@ -556,13 +569,48 @@ impl<R, S: store::SimulatorStore> Simulacrum<R, S> {
         checkpoint_contents: CheckpointContents,
     ) -> anyhow::Result<()> {
         if let Some(path) = &self.data_ingestion_path {
-            let file_name = format!("{}.chk", checkpoint.sequence_number);
-            let checkpoint_data: sui_types::full_checkpoint_content::CheckpointData = self
-                .get_checkpoint_data(checkpoint, checkpoint_contents)?
-                .into();
+            let sequence_number = checkpoint.sequence_number;
+            let checkpoint_data = self.get_checkpoint_data(checkpoint, checkpoint_contents)?;
+
+            let mask = FieldMask::from_paths([
+                rpc::v2::Checkpoint::path_builder().sequence_number(),
+                rpc::v2::Checkpoint::path_builder().summary().bcs().value(),
+                rpc::v2::Checkpoint::path_builder().signature().finish(),
+                rpc::v2::Checkpoint::path_builder().contents().bcs().value(),
+                rpc::v2::Checkpoint::path_builder()
+                    .transactions()
+                    .transaction()
+                    .bcs()
+                    .value(),
+                rpc::v2::Checkpoint::path_builder()
+                    .transactions()
+                    .effects()
+                    .bcs()
+                    .value(),
+                rpc::v2::Checkpoint::path_builder()
+                    .transactions()
+                    .effects()
+                    .unchanged_loaded_runtime_objects()
+                    .finish(),
+                rpc::v2::Checkpoint::path_builder()
+                    .transactions()
+                    .events()
+                    .bcs()
+                    .value(),
+                rpc::v2::Checkpoint::path_builder()
+                    .objects()
+                    .objects()
+                    .bcs()
+                    .value(),
+            ]);
+
+            let proto_checkpoint = rpc::v2::Checkpoint::merge_from(&checkpoint_data, &mask.into());
+            let proto_bytes = proto_checkpoint.encode_to_vec();
+            let compressed = zstd::encode_all(&proto_bytes[..], 3)?;
+
+            let file_name = format!("{}.binpb.zst", sequence_number);
             std::fs::create_dir_all(path)?;
-            let blob = Blob::encode(&checkpoint_data, BlobEncoding::Bcs)?;
-            std::fs::write(path.join(file_name), blob.to_bytes())?;
+            std::fs::write(path.join(file_name), compressed)?;
         }
         Ok(())
     }
@@ -697,7 +745,7 @@ impl<T, V: store::SimulatorStore> ReadStore for Simulacrum<T, V> {
         &self,
         _sequence_number: Option<sui_types::messages_checkpoint::CheckpointSequenceNumber>,
         _digest: &sui_types::messages_checkpoint::CheckpointContentsDigest,
-    ) -> Option<sui_types::messages_checkpoint::FullCheckpointContents> {
+    ) -> Option<sui_types::messages_checkpoint::VersionedFullCheckpointContents> {
         todo!()
     }
 

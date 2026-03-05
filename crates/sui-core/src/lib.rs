@@ -33,7 +33,6 @@ pub mod mysticeti_adapter;
 pub mod overload_monitor;
 mod par_index_live_object_set;
 pub(crate) mod post_consensus_tx_reorder;
-pub mod quorum_driver;
 pub mod rpc_index;
 pub mod runtime;
 pub mod safe_client;
@@ -52,7 +51,6 @@ pub mod transaction_orchestrator;
 mod transaction_outputs;
 mod transaction_signing_filter;
 pub mod validator_client_monitor;
-pub mod validator_tx_finalizer;
 pub mod verify_indexes;
 
 #[cfg(test)]
@@ -60,9 +58,6 @@ pub mod verify_indexes;
 mod congestion_control_tests;
 #[path = "unit_tests/consensus_test_utils.rs"]
 pub mod consensus_test_utils;
-#[cfg(test)]
-#[path = "unit_tests/move_package_management_tests.rs"]
-mod move_package_management_tests;
 #[cfg(test)]
 #[path = "unit_tests/move_package_publish_tests.rs"]
 mod move_package_publish_tests;

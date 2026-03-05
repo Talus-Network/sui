@@ -3,24 +3,26 @@
 
 use std::time::Duration;
 
-use crate::Indexer;
-use anyhow::{Context, Result, bail};
-use diesel::{OptionalExtension, QueryDsl, SelectableHelper};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use diesel::OptionalExtension;
+use diesel::QueryDsl;
+use diesel::SelectableHelper;
 use diesel_async::RunQueryDsl;
 use sui_indexer_alt_framework::postgres::Db;
-use sui_indexer_alt_framework::types::{
-    full_checkpoint_content::Checkpoint,
-    sui_system_state::{SuiSystemStateTrait, get_sui_system_state},
-    transaction::TransactionKind,
-};
-use sui_indexer_alt_schema::{
-    checkpoints::StoredGenesis,
-    epochs::StoredEpochStart,
-    schema::{kv_epoch_starts, kv_genesis},
-};
+use sui_indexer_alt_framework::types::full_checkpoint_content::Checkpoint;
+use sui_indexer_alt_framework::types::sui_system_state::SuiSystemStateTrait;
+use sui_indexer_alt_framework::types::sui_system_state::get_sui_system_state;
+use sui_indexer_alt_framework::types::transaction::TransactionKind;
+use sui_indexer_alt_schema::checkpoints::StoredGenesis;
+use sui_indexer_alt_schema::epochs::StoredEpochStart;
+use sui_indexer_alt_schema::schema::kv_epoch_starts;
+use sui_indexer_alt_schema::schema::kv_genesis;
 use sui_types::transaction::TransactionDataAPI;
-use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+use crate::Indexer;
 
 pub struct BootstrapGenesis {
     pub stored_genesis: StoredGenesis,
@@ -31,13 +33,9 @@ pub struct BootstrapGenesis {
 /// the information stored there. If the database has been bootstrapped before, this function will
 /// simply read the previously bootstrapped information. Otherwise, it will wait until the first
 /// checkpoint is available and extract the necessary information from there.
-///
-/// Can be cancelled via the `cancel` token, or through an interrupt signal (which will also cancel
-/// the token).
 pub async fn bootstrap(
     indexer: &Indexer<Db>,
     retry_interval: Duration,
-    cancel: CancellationToken,
     bootstrap_genesis: Option<BootstrapGenesis>,
 ) -> Result<StoredGenesis> {
     info!("Bootstrapping indexer with genesis information");
@@ -73,13 +71,11 @@ pub async fn bootstrap(
         // - Get the Genesis system transaction from the genesis checkpoint.
         // - Get the system state object that was written out by the system transaction.
         None => {
-            let genesis_checkpoint = tokio::select! {
-                cp = indexer.ingestion_client().wait_for(0, retry_interval) =>
-                    cp.context("Failed to fetch genesis checkpoint")?,
-                _ = cancel.cancelled() => {
-                    bail!("Cancelled before genesis checkpoint was available");
-                }
-            };
+            let genesis_checkpoint = indexer
+                .ingestion_client()
+                .wait_for(0, retry_interval)
+                .await
+                .context("Failed to fetch genesis checkpoint")?;
 
             let Checkpoint {
                 summary: checkpoint_summary,

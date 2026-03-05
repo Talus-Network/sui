@@ -13,7 +13,7 @@ use crate::{
     ice,
     naming::ast::{
         BlockLabel, EnumDefinition, FunctionSignature, Neighbor, StructDefinition, SyntaxMethods,
-        Type, Type_, UseFuns, Var,
+        Type, Type_, UNIT_TYPE, UseFuns, Var,
     },
     parser::ast::{
         BinOp, ConstantName, DatatypeName, DocComment, ENTRY_MODIFIER, Field, FunctionName,
@@ -382,7 +382,7 @@ pub fn explist(loc: Loc, mut es: Vec<Exp>) -> Exp {
     match es.len() {
         0 => {
             let e__ = UnannotatedExp_::Unit { trailing: false };
-            let ty = sp(loc, Type_::Unit);
+            let ty = sp(loc, UNIT_TYPE.clone());
             exp(ty, sp(loc, e__))
         }
         1 => es.pop().unwrap(),
@@ -1180,4 +1180,18 @@ impl AstDebug for LValue_ {
             }
         }
     }
+}
+
+// *************************************************************************************************
+// Size Tests
+// *************************************************************************************************
+
+#[test]
+fn typing_ast_sizes() {
+    assert_eq!(
+        std::mem::size_of::<UnannotatedExp>(),
+        240,
+        "UnannotatedExp size changed"
+    );
+    assert_eq!(std::mem::size_of::<Exp>(), 272, "Exp size changed");
 }

@@ -5,7 +5,7 @@
 use super::*;
 use crate::authority::authority_tests::{
     TestCallArg, call_move, call_move_, execute_programmable_transaction, init_state_with_ids,
-    send_and_confirm_transaction,
+    submit_and_execute,
 };
 use move_core_types::{
     account_address::AccountAddress,
@@ -24,10 +24,11 @@ use sui_types::{
 
 use move_core_types::language_storage::TypeTag;
 
-use sui_move_build::{BuildConfig, SuiPackageHooks};
+use sui_move_build::BuildConfig;
 use sui_types::{
     crypto::{AccountKeyPair, get_key_pair},
     error::SuiError,
+    executable_transaction::VerifiedExecutableTransaction,
 };
 
 use std::{collections::HashSet, path::PathBuf};
@@ -2777,23 +2778,6 @@ fn ascii_tag() -> TypeTag {
     resolved_struct(RESOLVED_ASCII_STR, vec![])
 }
 
-#[tokio::test]
-#[cfg_attr(msim, ignore)]
-async fn test_object_no_id_error() {
-    let mut build_config = BuildConfig::new_for_testing();
-    build_config.config.test_mode = true;
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // in this package object struct (NotObject) is defined incorrectly and publishing should
-    // fail (it's defined in test-only code hence cannot be checked by transactional testing
-    // framework which goes through "normal" publishing path which excludes tests).
-    path.extend(["src", "unit_tests", "data", "object_no_id"]);
-    let res = build_config.build(&path);
-
-    matches!(res.err().map(|e|e.into_inner()), Some(SuiErrorKind::ExecutionError(err_str)) if
-                 err_str.contains("SuiMoveVerificationError")
-                 && err_str.contains("First field of struct NotObject must be 'id'"));
-}
-
 pub fn build_test_package(test_dir: &str, with_unpublished_deps: bool) -> Vec<Vec<u8>> {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["src", "unit_tests", "data", test_dir]);
@@ -2807,7 +2791,6 @@ pub fn build_package(
     code_dir: &str,
     with_unpublished_deps: bool,
 ) -> (Vec<u8>, Vec<Vec<u8>>, Vec<ObjectID>) {
-    move_package::package_hooks::register_package_hooks(Box::new(SuiPackageHooks));
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["src", "unit_tests", "data", code_dir]);
     let compiled_package = BuildConfig::new_for_testing().build(&path).unwrap();
@@ -2827,11 +2810,13 @@ pub async fn build_and_try_publish_test_package(
     gas_price: u64,
     with_unpublished_deps: bool,
 ) -> (Transaction, SignedTransactionEffects) {
-    move_package::package_hooks::register_package_hooks(Box::new(SuiPackageHooks));
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["src", "unit_tests", "data", test_dir]);
 
-    let compiled_package = BuildConfig::new_for_testing().build(&path).unwrap();
+    let mut config = BuildConfig::new_for_testing();
+    config.config.set_unpublished_deps_to_zero = with_unpublished_deps;
+
+    let compiled_package = config.build_async(&path).await.unwrap();
     let all_module_bytes = compiled_package.get_package_bytes(with_unpublished_deps);
     let dependencies = compiled_package.get_dependency_storage_package_ids();
 
@@ -2850,10 +2835,7 @@ pub async fn build_and_try_publish_test_package(
 
     (
         transaction.clone(),
-        send_and_confirm_transaction(authority, transaction)
-            .await
-            .unwrap()
-            .1,
+        submit_and_execute(authority, transaction).await.unwrap().1,
     )
 }
 
@@ -2950,7 +2932,7 @@ pub async fn run_multi_txns(
     sender_key: &AccountKeyPair,
     gas_object_id: &ObjectID,
     builder: ProgrammableTransactionBuilder,
-) -> Result<(CertifiedTransaction, SignedTransactionEffects), SuiError> {
+) -> Result<(VerifiedExecutableTransaction, SignedTransactionEffects), SuiError> {
     // build the transaction data
     let pt = builder.finish();
     let gas_object = authority.get_object(gas_object_id).await;
@@ -2963,7 +2945,7 @@ pub async fn run_multi_txns(
         TransactionData::new_programmable(sender, vec![gas_object_ref], pt, gas_budget, gas_price);
     // run the transaction
     let transaction = to_sender_signed_transaction(data, sender_key);
-    send_and_confirm_transaction(authority, transaction).await
+    submit_and_execute(authority, transaction).await
 }
 
 pub fn build_multi_publish_txns(

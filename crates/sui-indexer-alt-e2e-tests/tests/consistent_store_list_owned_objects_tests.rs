@@ -1,27 +1,37 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, iter};
+use std::collections::BTreeMap;
+use std::iter;
 
-use move_core_types::{ident_str, u256::U256};
+use move_core_types::ident_str;
+use move_core_types::u256::U256;
 use prometheus::Registry;
 use rand::rngs::OsRng;
 use simulacrum::Simulacrum;
-use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::{
-    ListOwnedObjectsRequest, Owner, consistent_service_client::ConsistentServiceClient,
-    owner::OwnerKind,
-};
-use sui_indexer_alt_e2e_tests::{FullCluster, find};
-use sui_types::{
-    SUI_FRAMEWORK_PACKAGE_ID, TypeTag,
-    base_types::{FullObjectRef, ObjectRef, SuiAddress},
-    crypto::{Signature, Signer, get_account_key_pair},
-    effects::{TransactionEffects, TransactionEffectsAPI},
-    gas_coin::GasCoin,
-    programmable_transaction_builder::ProgrammableTransactionBuilder,
-    transaction::{Argument, Command, Transaction, TransactionData},
-};
-use tokio_util::sync::CancellationToken;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::ListOwnedObjectsRequest;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::Owner;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::consistent_service_client::ConsistentServiceClient;
+use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::owner::OwnerKind;
+use sui_types::SUI_FRAMEWORK_PACKAGE_ID;
+use sui_types::TypeTag;
+use sui_types::base_types::FullObjectRef;
+use sui_types::base_types::ObjectRef;
+use sui_types::base_types::SuiAddress;
+use sui_types::crypto::Signature;
+use sui_types::crypto::Signer;
+use sui_types::crypto::get_account_key_pair;
+use sui_types::effects::TransactionEffects;
+use sui_types::effects::TransactionEffectsAPI;
+use sui_types::gas_coin::GasCoin;
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::Argument;
+use sui_types::transaction::Command;
+use sui_types::transaction::Transaction;
+use sui_types::transaction::TransactionData;
+
+use sui_indexer_alt_e2e_tests::FullCluster;
+use sui_indexer_alt_e2e_tests::find;
 
 /// 5 SUI gas budget
 const DEFAULT_GAS_BUDGET: u64 = 5_000_000_000;
@@ -553,7 +563,6 @@ async fn test_coin_balance_change_cleanup() {
         Simulacrum::new_with_protocol_version(OsRng, 27.into()),
         Default::default(),
         &Registry::new(),
-        CancellationToken::new(),
     )
     .await
     .unwrap();

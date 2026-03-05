@@ -4,31 +4,46 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use async_graphql::{Context, Interface, Object, connection::Connection};
+use async_graphql::Context;
+use async_graphql::Interface;
+use async_graphql::Object;
+use async_graphql::connection::Connection;
 use futures::future::try_join_all;
-use sui_types::{dynamic_field::DynamicFieldType, object::MoveObject as NativeMoveObject};
+use sui_types::dynamic_field::DynamicFieldType;
+use sui_types::object::MoveObject as NativeMoveObject;
 use tokio::sync::OnceCell;
 
-use crate::{
-    api::scalars::{
-        base64::Base64, big_int::BigInt, sui_address::SuiAddress, type_filter::TypeInput,
-        uint53::UInt53,
-    },
-    error::RpcError,
-    pagination::{Page, PaginationConfig},
-};
-
-use super::{
-    balance::{self, Balance},
-    coin_metadata::CoinMetadata,
-    dynamic_field::{DynamicField, DynamicFieldName},
-    move_type::MoveType,
-    move_value::MoveValue,
-    object::{self, CLive, CVersion, Object, VersionFilter},
-    object_filter::{ObjectFilter, ObjectFilterValidator as OFValidator},
-    owner::Owner,
-    transaction::{CTransaction, Transaction, filter::TransactionFilter},
-};
+use crate::api::scalars::base64::Base64;
+use crate::api::scalars::big_int::BigInt;
+use crate::api::scalars::id::Id;
+use crate::api::scalars::sui_address::SuiAddress;
+use crate::api::scalars::type_filter::TypeInput;
+use crate::api::scalars::uint53::UInt53;
+use crate::api::types::address;
+use crate::api::types::address::Address;
+use crate::api::types::balance::Balance;
+use crate::api::types::balance::{self as balance};
+use crate::api::types::coin_metadata::CoinMetadata;
+use crate::api::types::dynamic_field;
+use crate::api::types::dynamic_field::DynamicField;
+use crate::api::types::dynamic_field::DynamicFieldName;
+use crate::api::types::move_type::MoveType;
+use crate::api::types::move_value::MoveValue;
+use crate::api::types::name_record::NameRecord;
+use crate::api::types::object::CLive;
+use crate::api::types::object::CVersion;
+use crate::api::types::object::Object;
+use crate::api::types::object::VersionFilter;
+use crate::api::types::object::{self as object};
+use crate::api::types::object_filter::ObjectFilter;
+use crate::api::types::object_filter::ObjectFilterValidator as OFValidator;
+use crate::api::types::owner::Owner;
+use crate::api::types::transaction::CTransaction;
+use crate::api::types::transaction::Transaction;
+use crate::api::types::transaction::filter::TransactionFilter;
+use crate::error::RpcError;
+use crate::pagination::Page;
+use crate::pagination::PaginationConfig;
 
 #[derive(Clone)]
 pub(crate) struct MoveObject {
@@ -102,19 +117,44 @@ pub(crate) enum IMoveObject {
 /// A MoveObject is a kind of Object that reprsents data stored on-chain.
 #[Object]
 impl MoveObject {
+    /// The Move object's globally unique identifier, which can be passed to `Query.node` to refetch it.
+    pub(crate) async fn id(&self) -> Id {
+        let a = self.super_.super_.address;
+        if let Some((v, d)) = self.super_.version_digest {
+            Id::MoveObjectByRef(a, v, d)
+        } else {
+            Id::MoveObjectByAddress(a)
+        }
+    }
+
     /// The MoveObject's ID.
     pub(crate) async fn address(&self, ctx: &Context<'_>) -> Result<SuiAddress, RpcError> {
         self.super_.address(ctx).await
     }
 
+    /// Fetch the address as it was at a different root version, or checkpoint.
+    ///
+    /// If no additional bound is provided, the address is fetched at the latest checkpoint known to the RPC.
+    pub(crate) async fn address_at(
+        &self,
+        ctx: &Context<'_>,
+        root_version: Option<UInt53>,
+        checkpoint: Option<UInt53>,
+    ) -> Option<Result<Address, RpcError<address::Error>>> {
+        self.super_
+            .address_at(ctx, root_version, checkpoint)
+            .await
+            .ok()?
+    }
+
     /// The version of this object that this content comes from.
-    pub(crate) async fn version(&self, ctx: &Context<'_>) -> Result<Option<UInt53>, RpcError> {
-        self.super_.version(ctx).await
+    pub(crate) async fn version(&self, ctx: &Context<'_>) -> Option<Result<UInt53, RpcError>> {
+        self.super_.version(ctx).await.ok()?
     }
 
     /// 32-byte hash that identifies the object's contents, encoded in Base58.
-    pub(crate) async fn digest(&self, ctx: &Context<'_>) -> Result<Option<String>, RpcError> {
-        self.super_.digest(ctx).await
+    pub(crate) async fn digest(&self, ctx: &Context<'_>) -> Option<Result<String, RpcError>> {
+        self.super_.digest(ctx).await.ok()?
     }
 
     /// Attempts to convert the object into a CoinMetadata.
@@ -140,8 +180,8 @@ impl MoveObject {
         &self,
         ctx: &Context<'_>,
         coin_type: TypeInput,
-    ) -> Result<Option<Balance>, RpcError<balance::Error>> {
-        self.super_.balance(ctx, coin_type).await
+    ) -> Option<Result<Balance, RpcError<balance::Error>>> {
+        self.super_.balance(ctx, coin_type).await.ok()?
     }
 
     /// Total balance across coins owned by this address, grouped by coin type.
@@ -152,8 +192,11 @@ impl MoveObject {
         after: Option<balance::Cursor>,
         last: Option<u64>,
         before: Option<balance::Cursor>,
-    ) -> Result<Option<Connection<String, Balance>>, RpcError<balance::Error>> {
-        self.super_.balances(ctx, first, after, last, before).await
+    ) -> Option<Result<Connection<String, Balance>, RpcError<balance::Error>>> {
+        self.super_
+            .balances(ctx, first, after, last, before)
+            .await
+            .ok()?
     }
 
     /// The structured representation of the object's contents.
@@ -162,20 +205,22 @@ impl MoveObject {
             return Ok(None);
         };
 
-        let type_ = MoveType::from_native(
-            native.type_().clone().into(),
-            self.super_.super_.scope.clone(),
-        );
+        let scope = self
+            .super_
+            .super_
+            .scope
+            .with_root_version(native.version().value());
 
+        let type_ = MoveType::from_native(native.type_().clone().into(), scope);
         Ok(Some(MoveValue::new(type_, native.contents().to_owned())))
     }
 
-    /// The domain explicitly configured as the default SuiNS name for this address.
-    pub(crate) async fn default_suins_name(
+    /// The domain explicitly configured as the default Name Service name for this address.
+    pub(crate) async fn default_name_record(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<Option<String>, RpcError> {
-        self.super_.default_suins_name(ctx).await
+    ) -> Option<Result<NameRecord, RpcError<object::Error>>> {
+        self.super_.default_name_record(ctx).await.ok()?
     }
 
     /// Access a dynamic field on an object using its type and BCS-encoded name.
@@ -185,7 +230,7 @@ impl MoveObject {
         &self,
         ctx: &Context<'_>,
         name: DynamicFieldName,
-    ) -> Result<Option<DynamicField>, RpcError> {
+    ) -> Result<Option<DynamicField>, RpcError<dynamic_field::Error>> {
         let scope = &self.super_.super_.scope;
         DynamicField::by_name(
             ctx,
@@ -230,7 +275,7 @@ impl MoveObject {
         &self,
         ctx: &Context<'_>,
         name: DynamicFieldName,
-    ) -> Result<Option<DynamicField>, RpcError> {
+    ) -> Result<Option<DynamicField>, RpcError<dynamic_field::Error>> {
         let scope = &self.super_.super_.scope;
         DynamicField::by_name(
             ctx,
@@ -271,7 +316,7 @@ impl MoveObject {
         &self,
         ctx: &Context<'_>,
         keys: Vec<DynamicFieldName>,
-    ) -> Result<Vec<Option<DynamicField>>, RpcError> {
+    ) -> Result<Vec<Option<DynamicField>>, RpcError<dynamic_field::Error>> {
         let scope = &self.super_.super_.scope;
         try_join_all(keys.into_iter().map(|key| {
             DynamicField::by_name(
@@ -292,8 +337,8 @@ impl MoveObject {
         &self,
         ctx: &Context<'_>,
         keys: Vec<TypeInput>,
-    ) -> Result<Option<Vec<Balance>>, RpcError<balance::Error>> {
-        self.super_.multi_get_balances(ctx, keys).await
+    ) -> Option<Result<Vec<Balance>, RpcError<balance::Error>>> {
+        self.super_.multi_get_balances(ctx, keys).await.ok()?
     }
 
     /// Access dynamic object fields on an object using their types and BCS-encoded names.
@@ -303,7 +348,7 @@ impl MoveObject {
         &self,
         ctx: &Context<'_>,
         keys: Vec<DynamicFieldName>,
-    ) -> Result<Vec<Option<DynamicField>>, RpcError> {
+    ) -> Result<Vec<Option<DynamicField>>, RpcError<dynamic_field::Error>> {
         let scope = &self.super_.super_.scope;
         try_join_all(keys.into_iter().map(|key| {
             DynamicField::by_name(
@@ -339,15 +384,16 @@ impl MoveObject {
         version: Option<UInt53>,
         root_version: Option<UInt53>,
         checkpoint: Option<UInt53>,
-    ) -> Result<Option<Object>, RpcError<object::Error>> {
+    ) -> Option<Result<Object, RpcError<object::Error>>> {
         self.super_
             .object_at(ctx, version, root_version, checkpoint)
             .await
+            .ok()?
     }
 
     /// The Base64-encoded BCS serialization of this object, as an `Object`.
-    pub(crate) async fn object_bcs(&self, ctx: &Context<'_>) -> Result<Option<Base64>, RpcError> {
-        self.super_.object_bcs(ctx).await
+    pub(crate) async fn object_bcs(&self, ctx: &Context<'_>) -> Option<Result<Base64, RpcError>> {
+        self.super_.object_bcs(ctx).await.ok()?
     }
 
     /// Paginate all versions of this object after this one.
@@ -359,10 +405,11 @@ impl MoveObject {
         last: Option<u64>,
         before: Option<CVersion>,
         filter: Option<VersionFilter>,
-    ) -> Result<Option<Connection<String, Object>>, RpcError> {
+    ) -> Option<Result<Connection<String, Object>, RpcError>> {
         self.super_
             .object_versions_after(ctx, first, after, last, before, filter)
             .await
+            .ok()?
     }
 
     /// Paginate all versions of this object before this one.
@@ -374,10 +421,11 @@ impl MoveObject {
         last: Option<u64>,
         before: Option<CVersion>,
         filter: Option<VersionFilter>,
-    ) -> Result<Option<Connection<String, Object>>, RpcError> {
+    ) -> Option<Result<Connection<String, Object>, RpcError>> {
         self.super_
             .object_versions_before(ctx, first, after, last, before, filter)
             .await
+            .ok()?
     }
 
     /// Objects owned by this object, optionally filtered by type.
@@ -389,31 +437,32 @@ impl MoveObject {
         last: Option<u64>,
         before: Option<CLive>,
         #[graphql(validator(custom = "OFValidator::allows_empty()"))] filter: Option<ObjectFilter>,
-    ) -> Result<Option<Connection<String, MoveObject>>, RpcError<object::Error>> {
+    ) -> Option<Result<Connection<String, MoveObject>, RpcError<object::Error>>> {
         self.super_
             .objects(ctx, first, after, last, before, filter)
             .await
+            .ok()?
     }
 
     /// The object's owner kind.
-    pub(crate) async fn owner(&self, ctx: &Context<'_>) -> Result<Option<Owner>, RpcError> {
-        self.super_.owner(ctx).await
+    pub(crate) async fn owner(&self, ctx: &Context<'_>) -> Option<Result<Owner, RpcError>> {
+        self.super_.owner(ctx).await.ok()?
     }
 
     /// The transaction that created this version of the object.
     pub(crate) async fn previous_transaction(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<Option<Transaction>, RpcError> {
-        self.super_.previous_transaction(ctx).await
+    ) -> Option<Result<Transaction, RpcError>> {
+        self.super_.previous_transaction(ctx).await.ok()?
     }
 
     /// The SUI returned to the sponsor or sender of the transaction that modifies or deletes this object.
     pub(crate) async fn storage_rebate(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<Option<BigInt>, RpcError> {
-        self.super_.storage_rebate(ctx).await
+    ) -> Option<Result<BigInt, RpcError>> {
+        self.super_.storage_rebate(ctx).await.ok()?
     }
 
     /// The transactions that sent objects to this object.
@@ -425,10 +474,11 @@ impl MoveObject {
         last: Option<u64>,
         before: Option<CTransaction>,
         filter: Option<TransactionFilter>,
-    ) -> Result<Option<Connection<String, Transaction>>, RpcError> {
+    ) -> Option<Result<Connection<String, Transaction>, RpcError>> {
         self.super_
             .received_transactions(ctx, first, after, last, before, filter)
             .await
+            .ok()?
     }
 }
 
@@ -448,7 +498,7 @@ impl MoveObject {
         object: &Object,
         ctx: &Context<'_>,
     ) -> Result<Option<Self>, RpcError> {
-        let Some(super_contents) = object.contents(ctx).await?.as_ref() else {
+        let Some(super_contents) = object.contents(ctx).await? else {
             return Ok(None);
         };
 
@@ -469,7 +519,7 @@ impl MoveObject {
     ) -> Result<&Option<NativeMoveObject>, RpcError> {
         self.native
             .get_or_try_init(async || {
-                let Some(contents) = self.super_.contents(ctx).await?.as_ref() else {
+                let Some(contents) = self.super_.contents(ctx).await? else {
                     return Ok(None);
                 };
 

@@ -6,13 +6,13 @@ use futures::future;
 use move_binary_format::CompiledModule;
 use move_compiler::compiled_unit::NamedCompiledModule;
 use move_core_types::account_address::AccountAddress;
+use move_package_alt::schema::Environment;
 use move_symbol_pool::Symbol;
 use std::collections::{HashMap, HashSet};
 use sui_move_build::CompiledPackage;
-use sui_sdk::apis::ReadApi;
-use sui_sdk::error::Error as SdkError;
-use sui_sdk::rpc_types::{SuiObjectDataOptions, SuiRawData, SuiRawMovePackage};
+use sui_rpc_api::Client;
 use sui_types::base_types::ObjectID;
+use sui_types::move_package::MovePackage;
 use toolchain::units_for_toolchain;
 
 pub mod error;
@@ -39,7 +39,7 @@ pub enum ValidationMode {
 }
 
 pub struct BytecodeSourceVerifier<'a> {
-    rpc_client: &'a ReadApi,
+    rpc_client: &'a Client,
 }
 
 /// Map package addresses and module names to package names and bytecode.
@@ -109,7 +109,7 @@ impl ValidationMode {
     fn root_address(&self, package: &CompiledPackage) -> Result<Option<AccountAddress>, Error> {
         match self {
             Self::Root { at: Some(addr), .. } => Ok(Some(*addr)),
-            Self::Root { at: None, .. } => Ok(Some(*package.published_at.clone()?)),
+            Self::Root { at: None, .. } => Ok(package.published_at.map(AccountAddress::from)),
             Self::Deps => Ok(None),
         }
     }
@@ -147,23 +147,22 @@ impl ValidationMode {
             future::join_all(addrs.iter().copied().map(|a| verifier.pkg_for_address(a))).await;
 
         for (storage_id, pkg) in addrs.into_iter().zip(resps) {
-            let SuiRawMovePackage {
-                module_map,
-                linkage_table,
-                ..
-            } = pkg?;
+            let pkg = pkg?;
+
+            let module_map = pkg.serialized_module_map();
+            let linkage_table = pkg.linkage_table();
 
             let mut modules = module_map
-                .into_iter()
+                .iter()
                 .map(|(name, bytes)| {
-                    let Ok(module) = CompiledModule::deserialize_with_defaults(&bytes) else {
+                    let Ok(module) = CompiledModule::deserialize_with_defaults(bytes) else {
                         return Err(Error::OnChainDependencyDeserializationError {
                             address: storage_id,
-                            module: name.into(),
+                            module: name.as_str().into(),
                         });
                     };
 
-                    Ok::<_, Error>((Symbol::from(name), module))
+                    Ok::<_, Error>((Symbol::from(name.as_str()), module))
                 })
                 .peekable();
 
@@ -199,7 +198,10 @@ impl ValidationMode {
 
             if root.is_some_and(|r| r == storage_id) {
                 on_chain.on_chain_dependencies = Some(HashSet::from_iter(
-                    linkage_table.into_values().map(|info| *info.upgraded_id),
+                    linkage_table
+                        .clone()
+                        .into_values()
+                        .map(|info| *info.upgraded_id),
                 ));
             }
         }
@@ -219,31 +221,37 @@ impl ValidationMode {
     /// modules from the root package will be expected at address `0x0` and this address will be
     /// substituted with the specified address.
     #[allow(clippy::result_large_err)]
-    fn local(&self, package: &CompiledPackage) -> Result<LocalModules, Error> {
+    fn local(&self, package: &CompiledPackage, env: &Environment) -> Result<LocalModules, Error> {
         let sui_package = package;
         let package = &package.package;
         let root_package = package.compiled_package_info.package_name;
         let mut map = LocalModules::new();
 
         if self.verify_deps() {
-            let deps_compiled_units =
-                units_for_toolchain(&package.deps_compiled_units).map_err(|e| {
-                    Error::CannotCheckLocalModules {
-                        package: package.compiled_package_info.package_name,
-                        message: e.to_string(),
-                    }
+            let deps_compiled_units = units_for_toolchain(&package.deps_compiled_units, env)
+                .map_err(|e| Error::CannotCheckLocalModules {
+                    package: package.compiled_package_info.package_name,
+                    message: e.to_string(),
                 })?;
 
+            // TODO: pkg-alt does this still work correctly given that pkg names might have
+            // changed?
             // only keep modules that are actually used
             let deps_compiled_units: Vec<_> = deps_compiled_units
                 .into_iter()
-                .filter(|pkg| sui_package.dependency_ids.published.contains_key(&pkg.0))
+                .filter(|pkg| {
+                    sui_package
+                        .dependency_ids
+                        .published
+                        .contains_key(&Symbol::from(pkg.0.as_str()))
+                })
                 .collect();
 
             for (package, local_unit) in deps_compiled_units {
                 let m = &local_unit.unit;
                 let module = m.name;
                 let address = m.address.into_inner();
+                let package = Symbol::from(package.as_str());
 
                 // Skip modules with on 0x0 because they are treated as part of the root package,
                 // even if they are a source dependency.
@@ -252,19 +260,6 @@ impl ValidationMode {
                 }
 
                 map.insert((address, module), (package, m.module.clone()));
-            }
-
-            // Include bytecode dependencies.
-            for (package, module) in sui_package.bytecode_deps.iter() {
-                let address = *module.address();
-                if address == AccountAddress::ZERO {
-                    continue;
-                }
-
-                map.insert(
-                    (address, Symbol::from(module.name().as_str())),
-                    (*package, module.clone()),
-                );
             }
         }
 
@@ -280,6 +275,7 @@ impl ValidationMode {
                 .iter()
                 .map(|u| ("root".into(), u.clone()))
                 .collect(),
+            env,
         )
         .map_err(|e| Error::CannotCheckLocalModules {
             package: package.compiled_package_info.package_name,
@@ -331,7 +327,7 @@ impl ValidationMode {
 }
 
 impl<'a> BytecodeSourceVerifier<'a> {
-    pub fn new(rpc_client: &'a ReadApi) -> Self {
+    pub fn new(rpc_client: &'a Client) -> Self {
         BytecodeSourceVerifier { rpc_client }
     }
 
@@ -342,6 +338,7 @@ impl<'a> BytecodeSourceVerifier<'a> {
         &self,
         package: &CompiledPackage,
         mode: ValidationMode,
+        env: &Environment,
     ) -> Result<(), AggregateError> {
         if matches!(
             mode,
@@ -353,7 +350,7 @@ impl<'a> BytecodeSourceVerifier<'a> {
             return Err(Error::ZeroOnChainAddresSpecifiedFailure.into());
         }
 
-        let local = mode.local(package)?;
+        let local = mode.local(package, env)?;
         let mut chain = mode.on_chain(package, self).await?;
         let mut errs = vec![];
 
@@ -398,7 +395,7 @@ impl<'a> BytecodeSourceVerifier<'a> {
         Ok(())
     }
 
-    async fn pkg_for_address(&self, addr: AccountAddress) -> Result<SuiRawMovePackage, Error> {
+    async fn pkg_for_address(&self, addr: AccountAddress) -> Result<MovePackage, Error> {
         // Move packages are specified with an AccountAddress, but are
         // fetched from a sui network via sui_getObject, which takes an object ID
         let obj_id = ObjectID::from(addr);
@@ -406,27 +403,16 @@ impl<'a> BytecodeSourceVerifier<'a> {
         // fetch the Sui object at the address specified for the package in the local resolution table
         // if future packages with a large set of dependency packages prove too slow to verify,
         // batched object fetching should be added to the ReadApi & used here
-        let obj_read = self
+        let obj = self
             .rpc_client
-            .get_object_with_options(obj_id, SuiObjectDataOptions::new().with_bcs())
+            .clone()
+            .get_object(obj_id)
             .await
-            .map_err(Error::DependencyObjectReadFailure)?;
+            .map_err(|e| Error::DependencyObjectReadFailure(e.message().to_owned()))?;
 
-        let obj = obj_read
-            .into_object()
-            .map_err(Error::SuiObjectRefFailure)?
-            .bcs
-            .ok_or_else(|| {
-                Error::DependencyObjectReadFailure(SdkError::DataError(
-                    "Bcs field is not found".to_string(),
-                ))
-            })?;
-
-        match obj {
-            SuiRawData::Package(pkg) => Ok(pkg),
-            SuiRawData::MoveObject(move_obj) => {
-                Err(Error::ObjectFoundWhenPackageExpected(obj_id, move_obj))
-            }
+        match &obj.data {
+            sui_types::object::Data::Package(pkg) => Ok(pkg.to_owned()),
+            sui_types::object::Data::Move(_) => Err(Error::ObjectFoundWhenPackageExpected(obj_id)),
         }
     }
 }

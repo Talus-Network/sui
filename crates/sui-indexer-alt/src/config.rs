@@ -2,14 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sui_default_config::DefaultConfig;
-use sui_indexer_alt_framework::{
-    ingestion::IngestionConfig,
-    pipeline::{
-        CommitterConfig,
-        concurrent::{ConcurrentConfig, PrunerConfig},
-        sequential::SequentialConfig,
-    },
-};
+use sui_indexer_alt_framework::ingestion::IngestionConfig;
+use sui_indexer_alt_framework::pipeline::CommitterConfig;
+use sui_indexer_alt_framework::pipeline::concurrent::ConcurrentConfig;
+use sui_indexer_alt_framework::pipeline::concurrent::PrunerConfig;
+use sui_indexer_alt_framework::pipeline::sequential::SequentialConfig;
 
 /// Trait for merging configuration structs together.
 pub trait Merge: Sized {
@@ -55,6 +52,8 @@ pub struct IngestionLayer {
     pub retry_interval_ms: Option<u64>,
     pub streaming_backoff_initial_batch_size: Option<usize>,
     pub streaming_backoff_max_batch_size: Option<usize>,
+    pub streaming_connection_timeout_ms: Option<u64>,
+    pub streaming_statement_timeout_ms: Option<u64>,
 }
 
 #[DefaultConfig]
@@ -101,6 +100,8 @@ pub struct PipelineLayer {
     pub sum_displays: Option<SequentialLayer>,
 
     // All concurrent pipelines
+    pub cp_bloom_blocks: Option<ConcurrentLayer>,
+    pub cp_blooms: Option<ConcurrentLayer>,
     pub coin_balance_buckets: Option<ConcurrentLayer>,
     pub obj_info: Option<ConcurrentLayer>,
     pub cp_sequence_numbers: Option<ConcurrentLayer>,
@@ -178,6 +179,12 @@ impl IngestionLayer {
             streaming_backoff_max_batch_size: self
                 .streaming_backoff_max_batch_size
                 .unwrap_or(base.streaming_backoff_max_batch_size),
+            streaming_connection_timeout_ms: self
+                .streaming_connection_timeout_ms
+                .unwrap_or(base.streaming_connection_timeout_ms),
+            streaming_statement_timeout_ms: self
+                .streaming_statement_timeout_ms
+                .unwrap_or(base.streaming_statement_timeout_ms),
         })
     }
 }
@@ -221,6 +228,7 @@ impl CommitterLayer {
             watermark_interval_ms: self
                 .watermark_interval_ms
                 .unwrap_or(base.watermark_interval_ms),
+            watermark_interval_jitter_ms: 0,
         })
     }
 }
@@ -242,6 +250,8 @@ impl PipelineLayer {
     /// configure.
     pub fn example() -> Self {
         PipelineLayer {
+            cp_blooms: Some(Default::default()),
+            cp_bloom_blocks: Some(Default::default()),
             coin_balance_buckets: Some(Default::default()),
             obj_info: Some(Default::default()),
             sum_displays: Some(Default::default()),
@@ -290,6 +300,12 @@ impl Merge for IngestionLayer {
             streaming_backoff_max_batch_size: other
                 .streaming_backoff_max_batch_size
                 .or(self.streaming_backoff_max_batch_size),
+            streaming_connection_timeout_ms: other
+                .streaming_connection_timeout_ms
+                .or(self.streaming_connection_timeout_ms),
+            streaming_statement_timeout_ms: other
+                .streaming_statement_timeout_ms
+                .or(self.streaming_statement_timeout_ms),
         })
     }
 }
@@ -343,6 +359,8 @@ impl Merge for PrunerLayer {
 impl Merge for PipelineLayer {
     fn merge(self, other: PipelineLayer) -> anyhow::Result<PipelineLayer> {
         Ok(PipelineLayer {
+            cp_blooms: self.cp_blooms.merge(other.cp_blooms)?,
+            cp_bloom_blocks: self.cp_bloom_blocks.merge(other.cp_bloom_blocks)?,
             coin_balance_buckets: self
                 .coin_balance_buckets
                 .merge(other.coin_balance_buckets)?,
@@ -390,6 +408,8 @@ impl From<IngestionConfig> for IngestionLayer {
             retry_interval_ms: Some(config.retry_interval_ms),
             streaming_backoff_initial_batch_size: Some(config.streaming_backoff_initial_batch_size),
             streaming_backoff_max_batch_size: Some(config.streaming_backoff_max_batch_size),
+            streaming_connection_timeout_ms: Some(config.streaming_connection_timeout_ms),
+            streaming_statement_timeout_ms: Some(config.streaming_statement_timeout_ms),
         }
     }
 }
@@ -590,6 +610,7 @@ mod tests {
                 write_concurrency: 5,
                 collect_interval_ms: 50,
                 watermark_interval_ms: 500,
+                ..Default::default()
             },
             pruner: Some(PrunerConfig::default()),
         };
@@ -601,6 +622,7 @@ mod tests {
                     write_concurrency: 5,
                     collect_interval_ms: 50,
                     watermark_interval_ms: 500,
+                    ..
                 },
                 pruner: None,
             },
@@ -619,6 +641,7 @@ mod tests {
                 write_concurrency: 5,
                 collect_interval_ms: 50,
                 watermark_interval_ms: 500,
+                ..Default::default()
             },
             pruner: None,
         };
@@ -630,6 +653,7 @@ mod tests {
                     write_concurrency: 5,
                     collect_interval_ms: 50,
                     watermark_interval_ms: 500,
+                    ..
                 },
                 pruner: None,
             },
@@ -651,6 +675,7 @@ mod tests {
                 write_concurrency: 5,
                 collect_interval_ms: 50,
                 watermark_interval_ms: 500,
+                ..Default::default()
             },
             pruner: Some(PrunerConfig {
                 interval_ms: 100,
@@ -668,6 +693,7 @@ mod tests {
                     write_concurrency: 5,
                     collect_interval_ms: 50,
                     watermark_interval_ms: 500,
+                    ..
                 },
                 pruner: Some(PrunerConfig {
                     interval_ms: 1000,

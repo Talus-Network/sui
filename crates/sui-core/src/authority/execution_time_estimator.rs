@@ -1508,7 +1508,6 @@ mod tests {
     }
 
     #[tokio::test]
-    // TODO-DNS add tests for min stake amt
     async fn test_stake_weighted_median() {
         telemetry_subscribers::init_for_testing();
 
@@ -1886,7 +1885,7 @@ mod tests {
     )> {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-        let observation_keys = vec![
+        let observation_keys = [
             ExecutionTimeObservationKey::MoveEntryPoint {
                 package: ObjectID::from_hex_literal("0x1").unwrap(),
                 module: "coin".to_string(),

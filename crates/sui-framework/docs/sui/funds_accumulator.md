@@ -22,6 +22,7 @@ A module for accumulating funds, i.e. Balance-like types.
 
 <pre><code><b>use</b> <a href="../std/ascii.md#std_ascii">std::ascii</a>;
 <b>use</b> <a href="../std/bcs.md#std_bcs">std::bcs</a>;
+<b>use</b> <a href="../std/internal.md#std_internal">std::internal</a>;
 <b>use</b> <a href="../std/option.md#std_option">std::option</a>;
 <b>use</b> <a href="../std/string.md#std_string">std::string</a>;
 <b>use</b> <a href="../std/vector.md#std_vector">std::vector</a>;
@@ -31,6 +32,7 @@ A module for accumulating funds, i.e. Balance-like types.
 <b>use</b> <a href="../sui/hex.md#sui_hex">sui::hex</a>;
 <b>use</b> <a href="../sui/object.md#sui_object">sui::object</a>;
 <b>use</b> <a href="../sui/party.md#sui_party">sui::party</a>;
+<b>use</b> <a href="../sui/protocol_config.md#sui_protocol_config">sui::protocol_config</a>;
 <b>use</b> <a href="../sui/transfer.md#sui_transfer">sui::transfer</a>;
 <b>use</b> <a href="../sui/tx_context.md#sui_tx_context">sui::tx_context</a>;
 <b>use</b> <a href="../sui/vec_map.md#sui_vec_map">sui::vec_map</a>;
@@ -108,6 +110,17 @@ Attempted to join two withdrawals with different owners.
 
 <pre><code>#[error]
 <b>const</b> <a href="../sui/funds_accumulator.md#sui_funds_accumulator_EOwnerMismatch">EOwnerMismatch</a>: vector&lt;u8&gt; = b"<a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">Withdrawal</a> owners do not match";
+</code></pre>
+
+
+
+<a name="sui_funds_accumulator_EObjectFundsWithdrawNotEnabled"></a>
+
+Attempted to withdraw funds from an object when the feature flag is not enabled.
+
+
+<pre><code>#[error]
+<b>const</b> <a href="../sui/funds_accumulator.md#sui_funds_accumulator_EObjectFundsWithdrawNotEnabled">EObjectFundsWithdrawNotEnabled</a>: vector&lt;u8&gt; = b"Object funds withdraw is not enabled";
 </code></pre>
 
 
@@ -227,7 +240,7 @@ Aborts with <code><a href="../sui/funds_accumulator.md#sui_funds_accumulator_EOv
 
 
 
-<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/funds_accumulator.md#sui_funds_accumulator_redeem">redeem</a>&lt;T: store&gt;(withdrawal: <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">sui::funds_accumulator::Withdrawal</a>&lt;T&gt;): T
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/funds_accumulator.md#sui_funds_accumulator_redeem">redeem</a>&lt;T: store&gt;(withdrawal: <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">sui::funds_accumulator::Withdrawal</a>&lt;T&gt;, _: <a href="../std/internal.md#std_internal_Permit">std::internal::Permit</a>&lt;T&gt;): T
 </code></pre>
 
 
@@ -236,7 +249,7 @@ Aborts with <code><a href="../sui/funds_accumulator.md#sui_funds_accumulator_EOv
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/funds_accumulator.md#sui_funds_accumulator_redeem">redeem</a>&lt;/* internal */ T: store&gt;(withdrawal: <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">Withdrawal</a>&lt;T&gt;): T {
+<pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/funds_accumulator.md#sui_funds_accumulator_redeem">redeem</a>&lt;T: store&gt;(withdrawal: <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">Withdrawal</a>&lt;T&gt;, _: internal::Permit&lt;T&gt;): T {
     <b>let</b> <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">Withdrawal</a> { owner, limit: value } = withdrawal;
     <a href="../sui/funds_accumulator.md#sui_funds_accumulator_withdraw_impl">withdraw_impl</a>(owner, value)
 }
@@ -262,6 +275,10 @@ Aborts with <code><a href="../sui/funds_accumulator.md#sui_funds_accumulator_EOv
 
 
 <pre><code><b>public</b>(<a href="../sui/package.md#sui_package">package</a>) <b>fun</b> <a href="../sui/funds_accumulator.md#sui_funds_accumulator_withdraw_from_object">withdraw_from_object</a>&lt;T: store&gt;(obj: &<b>mut</b> UID, limit: u256): <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">Withdrawal</a>&lt;T&gt; {
+    <b>assert</b>!(
+        <a href="../sui/protocol_config.md#sui_protocol_config_is_feature_enabled">sui::protocol_config::is_feature_enabled</a>(b"enable_object_funds_withdraw"),
+        <a href="../sui/funds_accumulator.md#sui_funds_accumulator_EObjectFundsWithdrawNotEnabled">EObjectFundsWithdrawNotEnabled</a>,
+    );
     <b>let</b> owner = obj.to_address();
     <a href="../sui/funds_accumulator.md#sui_funds_accumulator_Withdrawal">Withdrawal</a> { owner, limit }
 }

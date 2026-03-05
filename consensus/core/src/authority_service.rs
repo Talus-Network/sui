@@ -178,7 +178,6 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
             info!("Block with wrong authority from {}: {}", peer, e);
             return Err(e);
         }
-        let peer_hostname = &self.context.committee.authority(peer).hostname;
 
         // Reject blocks failing validations.
         let (verified_block, reject_txn_votes) = self
@@ -444,7 +443,7 @@ impl<C: CoreThreadDispatcher> NetworkService for AuthorityService<C> {
                 let selected_num_blocks = max_response_num_blocks.saturating_sub(blocks.len());
                 if selected_num_blocks < missing_ancestors.len() {
                     missing_ancestors = missing_ancestors
-                        .choose_multiple(&mut rand::thread_rng(), selected_num_blocks)
+                        .choose_multiple(&mut mysten_common::random::get_rng(), selected_num_blocks)
                         .copied()
                         .collect::<Vec<_>>();
                 }
@@ -963,6 +962,7 @@ mod tests {
             dag_state.clone(),
             blocks_sender,
         );
+        let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
         let synchronizer = Synchronizer::start(
             network_client,
             context.clone(),
@@ -970,10 +970,10 @@ mod tests {
             commit_vote_monitor.clone(),
             block_verifier.clone(),
             transaction_certifier.clone(),
+            round_tracker.clone(),
             dag_state.clone(),
             false,
         );
-        let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
         let authority_service = Arc::new(AuthorityService::new(
             context.clone(),
             block_verifier,
@@ -1081,6 +1081,7 @@ mod tests {
             dag_state.clone(),
             blocks_sender,
         );
+        let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
         let synchronizer = Synchronizer::start(
             network_client,
             context.clone(),
@@ -1088,10 +1089,10 @@ mod tests {
             commit_vote_monitor.clone(),
             block_verifier.clone(),
             transaction_certifier.clone(),
+            round_tracker.clone(),
             dag_state.clone(),
             false,
         );
-        let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
         let authority_service = Arc::new(AuthorityService::new(
             context.clone(),
             block_verifier,
@@ -1248,6 +1249,7 @@ mod tests {
             dag_state.clone(),
             blocks_sender,
         );
+        let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
         let synchronizer = Synchronizer::start(
             network_client,
             context.clone(),
@@ -1255,10 +1257,10 @@ mod tests {
             commit_vote_monitor.clone(),
             block_verifier.clone(),
             transaction_certifier.clone(),
+            round_tracker.clone(),
             dag_state.clone(),
             true,
         );
-        let round_tracker = Arc::new(RwLock::new(PeerRoundTracker::new(context.clone())));
         let authority_service = Arc::new(AuthorityService::new(
             context.clone(),
             block_verifier,

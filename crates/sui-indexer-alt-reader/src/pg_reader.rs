@@ -3,19 +3,22 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
+use anyhow::bail;
 use async_graphql::dataloader::DataLoader;
 use diesel::deserialize::FromSqlRow;
 use diesel::expression::QueryMetadata;
 use diesel::pg::Pg;
-use diesel::query_builder::{Query, QueryFragment, QueryId};
+use diesel::query_builder::Query;
+use diesel::query_builder::QueryFragment;
+use diesel::query_builder::QueryId;
 use diesel::query_dsl::CompatibleType;
 use diesel::query_dsl::methods::LimitDsl;
 use diesel_async::RunQueryDsl;
 use prometheus::Registry;
 use sui_indexer_alt_metrics::db::DbConnectionStatsCollector;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::debug;
+use tracing::warn;
 use url::Url;
 
 use crate::metrics::DbReaderMetrics;
@@ -28,7 +31,6 @@ pub use sui_pg_db as db;
 pub struct PgReader {
     db: Option<db::Db>,
     metrics: Arc<DbReaderMetrics>,
-    cancel: CancellationToken,
 }
 
 pub struct Connection<'p> {
@@ -46,7 +48,6 @@ impl PgReader {
         database_url: Option<Url>,
         db_args: db::DbArgs,
         registry: &Registry,
-        cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
         let db = if let Some(database_url) = database_url {
             let db = db::Db::for_read(database_url, db_args)
@@ -67,11 +68,7 @@ impl PgReader {
 
         let metrics = DbReaderMetrics::new(prefix, registry);
 
-        Ok(Self {
-            db,
-            metrics,
-            cancel,
-        })
+        Ok(Self { db, metrics })
     }
 
     /// Create a data loader backed by this reader.
@@ -84,25 +81,22 @@ impl PgReader {
         self.db.is_some()
     }
 
-    /// Acquire a connection to the database. This can potentially fail if the service is cancelled
-    /// while the connection is being acquired.
+    /// Acquire a connection to the database. This can fail if a database has not been configured
+    /// to connect to.
     pub async fn connect(&self) -> anyhow::Result<Connection<'_>> {
         let Some(db) = &self.db else {
             bail!("No database to connect to");
         };
 
-        tokio::select! {
-            _ = self.cancel.cancelled() => {
-                bail!("Cancelled while connecting to the database");
-            }
+        let conn = db
+            .connect()
+            .await
+            .context("Failed to connect to database")?;
 
-            conn = db.connect() => {
-                Ok(Connection {
-                    conn: conn.context("Failed to connect to database")?,
-                    metrics: self.metrics.clone(),
-                })
-            }
-        }
+        Ok(Connection {
+            conn,
+            metrics: self.metrics.clone(),
+        })
     }
 }
 
@@ -117,24 +111,28 @@ impl Connection<'_> {
         ST: 'static,
     {
         let query = query.limit(1);
-        let query_debug = diesel::debug_query(&query).to_string();
-        debug!("{query_debug}");
 
         self.metrics.requests_received.inc();
         let _guard = self.metrics.latency.start_timer();
 
-        let res = query.get_result(&mut self.conn).await;
-        if res.as_ref().is_err_and(is_timeout) {
-            warn!(query = query_debug, "Query timed out");
+        let pid = self.conn.pid;
+        let query_debug = diesel::debug_query(&query).to_string();
+        match query.get_result(&mut self.conn).await {
+            Ok(results) => {
+                self.metrics.requests_succeeded.inc();
+                debug!(pid, "{query_debug}");
+                Ok(results)
+            }
+            Err(err) => {
+                self.metrics.requests_failed.inc();
+                if is_timeout(&err) {
+                    warn!(pid, "Timed out: {query_debug}");
+                } else {
+                    warn!(pid, "Failed with '{err:?}': {query_debug}");
+                };
+                Err(err).with_context(|| format!("First error from DB request pid={pid}"))
+            }
         }
-
-        if res.is_ok() {
-            self.metrics.requests_succeeded.inc();
-        } else {
-            self.metrics.requests_failed.inc();
-        }
-
-        Ok(res?)
     }
 
     pub async fn results<'q, Q, ST, U>(&mut self, query: Q) -> anyhow::Result<Vec<U>>
@@ -145,24 +143,27 @@ impl Connection<'_> {
         Pg: QueryMetadata<Q::SqlType>,
         ST: 'static,
     {
-        let query_debug = diesel::debug_query(&query).to_string();
-        debug!("{query_debug}");
-
         self.metrics.requests_received.inc();
         let _guard = self.metrics.latency.start_timer();
 
-        let res = query.get_results(&mut self.conn).await;
-        if res.as_ref().is_err_and(is_timeout) {
-            warn!(query = query_debug, "Query timed out");
+        let pid = self.conn.pid;
+        let query_debug = diesel::debug_query(&query).to_string();
+        match query.get_results(&mut self.conn).await {
+            Ok(results) => {
+                self.metrics.requests_succeeded.inc();
+                debug!(pid, "{query_debug}");
+                Ok(results)
+            }
+            Err(err) => {
+                self.metrics.requests_failed.inc();
+                if is_timeout(&err) {
+                    warn!(pid, "Timed out: {query_debug}");
+                } else {
+                    warn!(pid, "Failed with '{err:?}': {query_debug}");
+                };
+                Err(err).with_context(|| format!("Results error from DB request pid={pid}"))
+            }
         }
-
-        if res.is_ok() {
-            self.metrics.requests_succeeded.inc();
-        } else {
-            self.metrics.requests_failed.inc();
-        }
-
-        Ok(res?)
     }
 }
 

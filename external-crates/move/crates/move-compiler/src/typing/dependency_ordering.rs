@@ -312,18 +312,18 @@ fn types<'a>(context: &mut Context, tys: impl IntoIterator<Item = &'a N::Type>) 
 }
 
 fn type_(context: &mut Context, sp!(_, ty_): &N::Type) {
-    use N::Type_ as T;
-    match ty_ {
-        T::Apply(_, tn, tys) => {
+    use N::TypeInner as TI;
+    match ty_.inner() {
+        TI::Apply(_, tn, tys) => {
             type_name(context, tn);
             types(context, tys);
         }
-        T::Ref(_, t) => type_(context, t),
-        T::Fun(tys, t) => {
+        TI::Ref(_, t) => type_(context, t),
+        TI::Fun(tys, t) => {
             types(context, tys);
             type_(context, t);
         }
-        T::Unit | T::Param(_) | T::Var(_) | T::Anything | T::Void | T::UnresolvedError => (),
+        TI::Unit | TI::Param(_) | TI::Var(_) | TI::Anything | TI::Void | TI::UnresolvedError => (),
     }
 }
 
@@ -331,7 +331,7 @@ fn type_name(context: &mut Context, sp!(loc, tn_): &N::TypeName) {
     match tn_ {
         N::TypeName_::Multiple(_) | N::TypeName_::Builtin(_) => (),
         N::TypeName_::ModuleType(m, _) => {
-            context.add_usage(*m, *loc);
+            context.add_usage(*m.as_ref(), *loc);
         }
     }
 }

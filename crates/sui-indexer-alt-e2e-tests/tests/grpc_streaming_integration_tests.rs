@@ -5,20 +5,23 @@ use std::time::Duration;
 
 use diesel::QueryDsl;
 use diesel_async::RunQueryDsl;
+use prometheus::Registry;
 use sui_field_count::FieldCount;
-use sui_indexer_alt_framework::{
-    cluster::IndexerCluster,
-    ingestion::{
-        ClientArgs, ingestion_client::IngestionClientArgs, streaming_client::StreamingClientArgs,
-    },
-    pipeline::{
-        Processor,
-        concurrent::{self, BatchStatus, ConcurrentConfig},
-    },
-};
-use sui_pg_db::{Db, DbArgs};
+use sui_indexer_alt_framework::Indexer;
+use sui_indexer_alt_framework::IndexerArgs;
+use sui_indexer_alt_framework::ingestion::ClientArgs;
+use sui_indexer_alt_framework::ingestion::IngestionConfig;
+use sui_indexer_alt_framework::ingestion::ingestion_client::IngestionClientArgs;
+use sui_indexer_alt_framework::ingestion::streaming_client::StreamingClientArgs;
+use sui_indexer_alt_framework::pipeline::Processor;
+use sui_indexer_alt_framework::pipeline::concurrent::BatchStatus;
+use sui_indexer_alt_framework::pipeline::concurrent::ConcurrentConfig;
+use sui_indexer_alt_framework::pipeline::concurrent::{self};
+use sui_pg_db::Db;
+use sui_pg_db::DbArgs;
 use sui_test_transaction_builder::TestTransactionBuilder;
-use sui_types::{full_checkpoint_content::Checkpoint, transaction::TransactionDataAPI};
+use sui_types::full_checkpoint_content::Checkpoint;
+use sui_types::transaction::TransactionDataAPI;
 use tempfile::tempdir;
 use test_cluster::TestClusterBuilder;
 
@@ -98,14 +101,18 @@ async fn transfer_coin(
         .gas_for_owner_budget(sender, 5000, Default::default())
         .await
         .unwrap();
-    let gas_obj = gas_objs.1.object_ref();
+    let gas_obj = gas_objs.1.compute_object_reference();
 
     let tx_data = TestTransactionBuilder::new(sender, gas_obj, 1000)
         .transfer_sui(Some(1000), sender)
         .build();
     let tx = wallet.sign_transaction(&tx_data).await;
 
-    wallet.execute_transaction_must_succeed(tx).await.digest
+    wallet
+        .execute_transaction_must_succeed(tx)
+        .await
+        .transaction
+        .digest()
 }
 
 #[tokio::test]
@@ -148,8 +155,10 @@ async fn test_indexer_cluster_with_grpc_streaming() {
     let reader = Db::for_read(url.clone(), DbArgs::default()).await.unwrap();
     let writer = Db::for_write(url.clone(), DbArgs::default()).await.unwrap();
 
-    // Create the tx_counts table
+    // Create the schema for the test.
     {
+        writer.run_migrations(None).await.unwrap();
+
         let mut conn = writer.connect().await.unwrap();
         diesel::sql_query(
             r#"
@@ -164,13 +173,17 @@ async fn test_indexer_cluster_with_grpc_streaming() {
         .unwrap();
     }
 
-    // Build the indexer cluster with gRPC streaming configuration
-    let mut indexer = IndexerCluster::builder()
-        .with_database_url(url.clone())
-        .with_client_args(client_args)
-        .build()
-        .await
-        .unwrap();
+    // Build the indexer with gRPC streaming configuration
+    let mut indexer = Indexer::new(
+        writer,
+        IndexerArgs::default(),
+        client_args,
+        IngestionConfig::default(),
+        None,
+        &Registry::new(),
+    )
+    .await
+    .unwrap();
 
     // Add the tx_counts pipeline
     indexer
@@ -178,11 +191,10 @@ async fn test_indexer_cluster_with_grpc_streaming() {
         .await
         .unwrap();
 
-    let cancel = indexer.cancel().clone();
-
     // Run the indexer - it will use gRPC streaming from TestCluster
-    // and fall back to local ingestion if needed
-    let handle = indexer.run().await.unwrap();
+    // and fall back to local ingestion if needed. Hold on to the service so it doesn't get
+    // dropped (and therefore aborted) until the test ends.
+    let _service = indexer.run().await.unwrap();
 
     // Poll every 100ms with a 5s timeout for the sum of user transactions to reach 5
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -203,7 +215,4 @@ async fn test_indexer_cluster_with_grpc_streaming() {
     })
     .await
     .expect("Timeout: Expected sum of user transactions to reach 5 within 5 seconds");
-
-    cancel.cancel();
-    handle.await.unwrap();
 }

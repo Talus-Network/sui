@@ -32,8 +32,8 @@ use sui_types::coin::{COIN_MODULE_NAME, TreasuryCap};
 use sui_types::crypto::Signature;
 use sui_types::digests::ObjectDigest;
 use sui_types::gas_coin::GAS;
-use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 use sui_types::signature::GenericSignature;
+use sui_types::transaction_driver_types::ExecuteTransactionRequestType;
 use sui_types::utils::load_test_vectors;
 use sui_types::zk_login_authenticator::ZkLoginAuthenticator;
 use sui_types::{SUI_FRAMEWORK_ADDRESS, parse_sui_struct_tag};
@@ -199,8 +199,9 @@ async fn test_publish() -> Result<(), anyhow::Error> {
         .await?;
     let gas = objects.data.first().unwrap().object().unwrap();
 
-    let compiled_package =
-        BuildConfig::new_for_testing().build(Path::new("../../examples/move/basics"))?;
+    let compiled_package = BuildConfig::new_for_testing()
+        .build_async(Path::new("../../examples/move/basics"))
+        .await?;
     let compiled_modules_bytes =
         compiled_package.get_package_base64(/* with_unpublished_deps */ false);
     let dependencies = compiled_package.get_dependency_storage_package_ids();
@@ -492,7 +493,7 @@ async fn test_get_metadata() -> Result<(), anyhow::Error> {
     // Publish test coin package
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["tests", "data", "dummy_modules_publish"]);
-    let compiled_package = BuildConfig::new_for_testing().build(&path)?;
+    let compiled_package = BuildConfig::new_for_testing().build_async(&path).await?;
     let compiled_modules_bytes =
         compiled_package.get_package_base64(/* with_unpublished_deps */ false);
     let dependencies = compiled_package.get_dependency_storage_package_ids();
@@ -577,7 +578,7 @@ async fn test_get_total_supply() -> Result<(), anyhow::Error> {
     // Publish test coin package
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["tests", "data", "dummy_modules_publish"]);
-    let compiled_package = BuildConfig::new_for_testing().build(&path)?;
+    let compiled_package = BuildConfig::new_for_testing().build_async(&path).await?;
     let compiled_modules_bytes =
         compiled_package.get_package_base64(/* with_unpublished_deps */ false);
     let dependencies = compiled_package.get_dependency_storage_package_ids();

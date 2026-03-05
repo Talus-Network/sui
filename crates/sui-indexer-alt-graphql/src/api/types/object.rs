@@ -3,65 +3,82 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, anyhow};
-use async_graphql::{
-    Context, InputObject, Interface, Object,
-    connection::{Connection, CursorType, Edge},
-    dataloader::DataLoader,
-};
-use diesel::{ExpressionMethods, QueryDsl, sql_types::Bool};
-use fastcrypto::encoding::{Base58, Encoding};
+use anyhow::Context as _;
+use anyhow::anyhow;
+use async_graphql::Context;
+use async_graphql::InputObject;
+use async_graphql::Interface;
+use async_graphql::Object;
+use async_graphql::connection::Connection;
+use async_graphql::connection::CursorType;
+use async_graphql::connection::Edge;
+use async_graphql::dataloader::DataLoader;
+use diesel::ExpressionMethods;
+use diesel::QueryDsl;
+use diesel::sql_types::Bool;
+use fastcrypto::encoding::Base58;
+use fastcrypto::encoding::Encoding;
 use futures::future::try_join_all;
 use move_core_types::language_storage::StructTag;
-use sui_indexer_alt_reader::{
-    consistent_reader::{self, ConsistentReader},
-    kv_loader::KvLoader,
-    object_versions::{
-        CheckpointBoundedObjectVersionKey, VersionBoundedObjectVersionKey,
-        VersionedObjectVersionKey,
-    },
-    pg_reader::PgReader,
-};
-use sui_indexer_alt_schema::{objects::StoredObjVersion, schema::obj_versions};
+use sui_indexer_alt_reader::consistent_reader::ConsistentReader;
+use sui_indexer_alt_reader::consistent_reader::{self};
+use sui_indexer_alt_reader::kv_loader::KvLoader;
+use sui_indexer_alt_reader::object_versions::CheckpointBoundedObjectVersionKey;
+use sui_indexer_alt_reader::object_versions::VersionBoundedObjectVersionKey;
+use sui_indexer_alt_reader::object_versions::VersionedObjectVersionKey;
+use sui_indexer_alt_reader::pg_reader::PgReader;
+use sui_indexer_alt_schema::objects::StoredObjVersion;
+use sui_indexer_alt_schema::schema::obj_versions;
 use sui_pg_db::sql;
-use sui_types::{
-    base_types::{
-        SequenceNumber, SuiAddress as NativeSuiAddress, TransactionDigest, VersionDigest,
-    },
-    digests::ObjectDigest,
-    dynamic_field::DynamicFieldType,
-    object::Object as NativeObject,
-    transaction::GenesisObject,
-};
-use tokio::{join, sync::OnceCell};
+use sui_types::base_types::SequenceNumber;
+use sui_types::base_types::SuiAddress as NativeSuiAddress;
+use sui_types::base_types::TransactionDigest;
+use sui_types::base_types::VersionDigest;
+use sui_types::digests::ObjectDigest;
+use sui_types::dynamic_field::DynamicFieldType;
+use sui_types::object::Object as NativeObject;
+use sui_types::transaction::GenesisObject;
+use tokio::join;
+use tokio::sync::OnceCell;
 
-use crate::{
-    api::scalars::{
-        base64::Base64,
-        big_int::BigInt,
-        cursor::{BcsCursor, JsonCursor},
-        owner_kind::OwnerKind,
-        sui_address::SuiAddress,
-        type_filter::{TypeFilter, TypeInput},
-        uint53::UInt53,
-    },
-    error::{RpcError, bad_user_input, feature_unavailable, upcast},
-    intersect,
-    pagination::{Page, PageLimits, PaginationConfig},
-    scope::Scope,
-};
-
-use super::{
-    address::Address,
-    balance::{self, Balance},
-    coin_metadata::CoinMetadata,
-    dynamic_field::{DynamicField, DynamicFieldName},
-    move_object::MoveObject,
-    move_package::MovePackage,
-    object_filter::{ObjectFilter, ObjectFilterValidator as OFValidator},
-    owner::Owner,
-    transaction::{CTransaction, Transaction, filter::TransactionFilter},
-};
+use crate::api::scalars::base64::Base64;
+use crate::api::scalars::big_int::BigInt;
+use crate::api::scalars::cursor::BcsCursor;
+use crate::api::scalars::cursor::JsonCursor;
+use crate::api::scalars::id::Id;
+use crate::api::scalars::owner_kind::OwnerKind;
+use crate::api::scalars::sui_address::SuiAddress;
+use crate::api::scalars::type_filter::TypeFilter;
+use crate::api::scalars::type_filter::TypeInput;
+use crate::api::scalars::uint53::UInt53;
+use crate::api::types::address;
+use crate::api::types::address::Address;
+use crate::api::types::balance::Balance;
+use crate::api::types::balance::{self as balance};
+use crate::api::types::coin_metadata::CoinMetadata;
+use crate::api::types::dynamic_field;
+use crate::api::types::dynamic_field::DynamicField;
+use crate::api::types::dynamic_field::DynamicFieldName;
+use crate::api::types::move_object::MoveObject;
+use crate::api::types::move_package::MovePackage;
+use crate::api::types::name_record::NameRecord;
+use crate::api::types::object_filter::ObjectFilter;
+use crate::api::types::object_filter::ObjectFilterValidator as OFValidator;
+use crate::api::types::owner::Owner;
+use crate::api::types::transaction::CTransaction;
+use crate::api::types::transaction::Transaction;
+use crate::api::types::transaction::filter::TransactionFilter;
+use crate::error::RpcError;
+use crate::error::bad_user_input;
+use crate::error::feature_unavailable;
+use crate::error::upcast;
+use crate::extensions::query_limits;
+use crate::intersect;
+use crate::pagination::Page;
+use crate::pagination::PageLimits;
+use crate::pagination::PaginationConfig;
+use crate::scope::Scope;
+use crate::task::watermark::Watermarks;
 
 /// Interface implemented by versioned on-chain values that are addressable by an ID (also referred to as its address). This includes Move objects and packages.
 #[allow(clippy::duplicated_attributes)]
@@ -70,12 +87,12 @@ use super::{
     name = "IObject",
     field(
         name = "version",
-        ty = "Result<Option<UInt53>, RpcError>",
+        ty = "Option<Result<UInt53, RpcError>>",
         desc = "The version of this object that this content comes from.",
     ),
     field(
         name = "digest",
-        ty = "Result<Option<String>, RpcError>",
+        ty = "Option<Result<String, RpcError>>",
         desc = "32-byte hash that identifies the object's contents, encoded in Base58.",
     ),
     field(
@@ -83,12 +100,12 @@ use super::{
         arg(name = "version", ty = "Option<UInt53>"),
         arg(name = "root_version", ty = "Option<UInt53>"),
         arg(name = "checkpoint", ty = "Option<UInt53>"),
-        ty = "Result<Option<Object>, RpcError<Error>>",
+        ty = "Option<Result<Object, RpcError<Error>>>",
         desc = "Fetch the object with the same ID, at a different version, root version bound, or checkpoint.",
     ),
     field(
         name = "object_bcs",
-        ty = "Result<Option<Base64>, RpcError>",
+        ty = "Option<Result<Base64, RpcError>>",
         desc = "The Base64-encoded BCS serialization of this object, as an `Object`."
     ),
     field(
@@ -98,7 +115,7 @@ use super::{
         arg(name = "last", ty = "Option<u64>"),
         arg(name = "before", ty = "Option<CVersion>"),
         arg(name = "filter", ty = "Option<VersionFilter>"),
-        ty = "Result<Option<Connection<String, Object>>, RpcError>",
+        ty = "Option<Result<Connection<String, Object>, RpcError>>",
         desc = "Paginate all versions of this object after this one."
     ),
     field(
@@ -108,22 +125,22 @@ use super::{
         arg(name = "last", ty = "Option<u64>"),
         arg(name = "before", ty = "Option<CVersion>"),
         arg(name = "filter", ty = "Option<VersionFilter>"),
-        ty = "Result<Option<Connection<String, Object>>, RpcError>",
+        ty = "Option<Result<Connection<String, Object>, RpcError>>",
         desc = "Paginate all versions of this object before this one."
     ),
     field(
         name = "owner",
-        ty = "Result<Option<Owner>, RpcError<Error>>",
+        ty = "Option<Result<Owner, RpcError>>",
         desc = "The object's owner kind."
     ),
     field(
         name = "previous_transaction",
-        ty = "Result<Option<Transaction>, RpcError<Error>>",
+        ty = "Option<Result<Transaction, RpcError>>",
         desc = "The transaction that created this version of the object"
     ),
     field(
         name = "storage_rebate",
-        ty = "Result<Option<BigInt>, RpcError<Error>>",
+        ty = "Option<Result<BigInt, RpcError>>",
         desc = "The SUI returned to the sponsor or sender of the transaction that modifies or deletes this object."
     ),
     field(
@@ -133,7 +150,7 @@ use super::{
         arg(name = "last", ty = "Option<u64>"),
         arg(name = "before", ty = "Option<CTransaction>"),
         arg(name = "filter", ty = "Option<TransactionFilter>"),
-        ty = "Result<Option<Connection<String, Transaction>>, RpcError>",
+        ty = "Option<Result<Connection<String, Transaction>, RpcError>>",
         desc = "The transactions that sent objects to this object."
     )
 )]
@@ -220,50 +237,77 @@ pub(crate) type CVersion = JsonCursor<u64>;
 /// Every object on Sui is identified by a unique address, and has a version number that increases with every modification. Objects also hold metadata detailing their current owner (who can sign for access to the object and whether that access can modify and/or delete the object), and the digest of the last transaction that modified the object.
 #[Object]
 impl Object {
+    /// The object's globally unique identifier, which can be passed to `Query.node` to refetch it.
+    pub(crate) async fn id(&self) -> Id {
+        let a = self.super_.address;
+        if let Some((v, d)) = self.version_digest {
+            Id::ObjectByRef(a, v, d)
+        } else {
+            Id::ObjectByAddress(a)
+        }
+    }
+
     /// The Object's ID.
     pub(crate) async fn address(&self, ctx: &Context<'_>) -> Result<SuiAddress, RpcError> {
         self.super_.address(ctx).await
     }
 
+    /// Fetch the address as it was at a different root version, or checkpoint.
+    ///
+    /// If no additional bound is provided, the address is fetched at the latest checkpoint known to the RPC.
+    pub(crate) async fn address_at(
+        &self,
+        ctx: &Context<'_>,
+        root_version: Option<UInt53>,
+        checkpoint: Option<UInt53>,
+    ) -> Option<Result<Address, RpcError<address::Error>>> {
+        self.super_
+            .address_at(ctx, root_version, checkpoint)
+            .await
+            .ok()?
+    }
+
     /// The version of this object that this content comes from.
-    pub(crate) async fn version(&self, ctx: &Context<'_>) -> Result<Option<UInt53>, RpcError> {
+    pub(crate) async fn version(&self, ctx: &Context<'_>) -> Option<Result<UInt53, RpcError>> {
         if let Some((version, _)) = self.version_digest {
-            return Ok(Some(version.into()));
+            return Some(Ok(version.into()));
         }
 
         // Fall back to loading from contents
-        let Some(contents) = self.contents(ctx).await?.as_ref() else {
-            return Ok(None);
+        let contents = match self.contents(ctx).await.transpose()? {
+            Ok(contents) => contents,
+            Err(e) => return Some(Err(e)),
         };
 
-        Ok(Some(contents.version().into()))
+        Some(Ok(contents.version().into()))
     }
 
     /// 32-byte hash that identifies the object's contents, encoded in Base58.
-    pub(crate) async fn digest(&self, ctx: &Context<'_>) -> Result<Option<String>, RpcError> {
+    pub(crate) async fn digest(&self, ctx: &Context<'_>) -> Option<Result<String, RpcError>> {
         if let Some((_, digest)) = self.version_digest {
-            return Ok(Some(Base58::encode(digest.inner())));
+            return Some(Ok(Base58::encode(digest.inner())));
         }
 
         // Fall back to loading from contents
-        let Some(contents) = self.contents(ctx).await?.as_ref() else {
-            return Ok(None);
+        let contents = match self.contents(ctx).await.transpose()? {
+            Ok(contents) => contents,
+            Err(e) => return Some(Err(e)),
         };
 
-        Ok(Some(Base58::encode(contents.digest().inner())))
+        Some(Ok(Base58::encode(contents.digest().inner())))
     }
 
     /// Attempts to convert the object into a MoveObject.
     pub(crate) async fn as_move_object(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<Option<MoveObject>, RpcError> {
-        MoveObject::from_object(self, ctx).await
+    ) -> Option<Result<MoveObject, RpcError>> {
+        MoveObject::from_object(self, ctx).await.transpose()
     }
 
     /// Attempts to convert the object into a MovePackage.
-    async fn as_move_package(&self, ctx: &Context<'_>) -> Result<Option<MovePackage>, RpcError> {
-        MovePackage::from_object(self, ctx).await
+    async fn as_move_package(&self, ctx: &Context<'_>) -> Option<Result<MovePackage, RpcError>> {
+        MovePackage::from_object(self, ctx).await.transpose()
     }
 
     /// Fetch the total balance for coins with marker type `coinType` (e.g. `0x2::sui::SUI`), owned by this address.
@@ -273,8 +317,8 @@ impl Object {
         &self,
         ctx: &Context<'_>,
         coin_type: TypeInput,
-    ) -> Result<Option<Balance>, RpcError<balance::Error>> {
-        self.super_.balance(ctx, coin_type).await
+    ) -> Option<Result<Balance, RpcError<balance::Error>>> {
+        self.super_.balance(ctx, coin_type).await.ok()?
     }
 
     /// Total balance across coins owned by this address, grouped by coin type.
@@ -285,16 +329,19 @@ impl Object {
         after: Option<balance::Cursor>,
         last: Option<u64>,
         before: Option<balance::Cursor>,
-    ) -> Result<Option<Connection<String, Balance>>, RpcError<balance::Error>> {
-        self.super_.balances(ctx, first, after, last, before).await
+    ) -> Option<Result<Connection<String, Balance>, RpcError<balance::Error>>> {
+        self.super_
+            .balances(ctx, first, after, last, before)
+            .await
+            .ok()?
     }
 
-    /// The domain explicitly configured as the default SuiNS name for this address.
-    pub(crate) async fn default_suins_name(
+    /// The domain explicitly configured as the default Name Service name for this address.
+    pub(crate) async fn default_name_record(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<Option<String>, RpcError> {
-        self.super_.default_suins_name(ctx).await
+    ) -> Option<Result<NameRecord, RpcError<Error>>> {
+        self.super_.default_name_record(ctx).await.ok()?
     }
 
     /// Access a dynamic field on an object using its type and BCS-encoded name.
@@ -304,7 +351,7 @@ impl Object {
         &self,
         ctx: &Context<'_>,
         name: DynamicFieldName,
-    ) -> Result<Option<DynamicField>, RpcError<Error>> {
+    ) -> Result<Option<DynamicField>, RpcError<dynamic_field::Error>> {
         DynamicField::by_name(
             ctx,
             self.super_.scope.clone(),
@@ -313,7 +360,6 @@ impl Object {
             name,
         )
         .await
-        .map_err(upcast)
     }
 
     /// Dynamic fields owned by this object.
@@ -347,7 +393,7 @@ impl Object {
         &self,
         ctx: &Context<'_>,
         name: DynamicFieldName,
-    ) -> Result<Option<DynamicField>, RpcError<Error>> {
+    ) -> Result<Option<DynamicField>, RpcError<dynamic_field::Error>> {
         DynamicField::by_name(
             ctx,
             self.super_.scope.clone(),
@@ -356,7 +402,6 @@ impl Object {
             name,
         )
         .await
-        .map_err(upcast)
     }
 
     /// Access dynamic fields on an object using their types and BCS-encoded names.
@@ -366,7 +411,7 @@ impl Object {
         &self,
         ctx: &Context<'_>,
         keys: Vec<DynamicFieldName>,
-    ) -> Result<Vec<Option<DynamicField>>, RpcError<Error>> {
+    ) -> Result<Vec<Option<DynamicField>>, RpcError<dynamic_field::Error>> {
         try_join_all(keys.into_iter().map(|key| {
             DynamicField::by_name(
                 ctx,
@@ -377,7 +422,6 @@ impl Object {
             )
         }))
         .await
-        .map_err(upcast)
     }
 
     /// Access dynamic object fields on an object using their types and BCS-encoded names.
@@ -387,7 +431,7 @@ impl Object {
         &self,
         ctx: &Context<'_>,
         keys: Vec<DynamicFieldName>,
-    ) -> Result<Vec<Option<DynamicField>>, RpcError<Error>> {
+    ) -> Result<Vec<Option<DynamicField>>, RpcError<dynamic_field::Error>> {
         try_join_all(keys.into_iter().map(|key| {
             DynamicField::by_name(
                 ctx,
@@ -398,7 +442,6 @@ impl Object {
             )
         }))
         .await
-        .map_err(upcast)
     }
 
     /// Fetch the total balances keyed by coin types (e.g. `0x2::sui::SUI`) owned by this address.
@@ -409,38 +452,47 @@ impl Object {
         &self,
         ctx: &Context<'_>,
         keys: Vec<TypeInput>,
-    ) -> Result<Option<Vec<Balance>>, RpcError<balance::Error>> {
-        self.super_.multi_get_balances(ctx, keys).await
+    ) -> Option<Result<Vec<Balance>, RpcError<balance::Error>>> {
+        self.super_.multi_get_balances(ctx, keys).await.ok()?
     }
 
     /// Fetch the object with the same ID, at a different version, root version bound, or checkpoint.
     ///
-    /// If no additional bound is provided, the latest version of this object is fetched at the latest checkpoint.
+    /// If no additional bound is provided, the object is fetched at the latest checkpoint known to the RPC.
     pub(crate) async fn object_at(
         &self,
         ctx: &Context<'_>,
         version: Option<UInt53>,
         root_version: Option<UInt53>,
         checkpoint: Option<UInt53>,
-    ) -> Result<Option<Self>, RpcError<Error>> {
-        let key = ObjectKey {
-            address: self.super_.address.into(),
-            version,
-            root_version,
-            at_checkpoint: checkpoint,
-        };
+    ) -> Option<Result<Self, RpcError<Error>>> {
+        async {
+            let key = ObjectKey {
+                address: self.super_.address.into(),
+                version,
+                root_version,
+                at_checkpoint: checkpoint,
+            };
 
-        Object::by_key(ctx, self.super_.scope.without_root_version(), key).await
+            Object::by_key(ctx, Scope::new(ctx)?, key).await
+        }
+        .await
+        .transpose()
     }
 
     /// The Base64-encoded BCS serialization of this object, as an `Object`.
-    pub(crate) async fn object_bcs(&self, ctx: &Context<'_>) -> Result<Option<Base64>, RpcError> {
-        let Some(object) = self.contents(ctx).await?.as_ref() else {
-            return Ok(None);
+    pub(crate) async fn object_bcs(&self, ctx: &Context<'_>) -> Option<Result<Base64, RpcError>> {
+        let contents = match self.contents(ctx).await.transpose()? {
+            Ok(contents) => contents,
+            Err(e) => return Some(Err(e)),
         };
 
-        let bytes = bcs::to_bytes(object).context("Failed to serialize object")?;
-        Ok(Some(Base64(bytes)))
+        Some(
+            bcs::to_bytes(contents)
+                .context("Failed to serialize object")
+                .map(Base64)
+                .map_err(RpcError::from),
+        )
     }
 
     /// Paginate all versions of this object after this one.
@@ -452,34 +504,36 @@ impl Object {
         last: Option<u64>,
         before: Option<CVersion>,
         filter: Option<VersionFilter>,
-    ) -> Result<Option<Connection<String, Object>>, RpcError> {
-        let pagination: &PaginationConfig = ctx.data()?;
-        let limits = pagination.limits("IObject", "objectVersionsAfter");
-        let page = Page::from_params(limits, first, after, last, before)?;
+    ) -> Option<Result<Connection<String, Object>, RpcError>> {
+        let version = self.version(ctx).await.ok()??;
 
-        let Some(version) = self.version(ctx).await? else {
-            return Ok(None);
-        };
+        let result = async {
+            let pagination: &PaginationConfig = ctx.data()?;
+            let limits = pagination.limits("IObject", "objectVersionsAfter");
+            let page = Page::from_params(limits, first, after, last, before)?;
+            let version = version?;
 
-        // Apply any filter that was supplied to the query, but add an additional version
-        // lowerbound constraint.
-        let Some(filter) = filter.unwrap_or_default().intersect(VersionFilter {
-            after_version: Some(version),
-            ..VersionFilter::default()
-        }) else {
-            return Ok(Some(Connection::new(false, false)));
-        };
+            // Apply any filter that was supplied to the query, but add an additional version
+            // lowerbound constraint.
+            let Some(filter) = filter.unwrap_or_default().intersect(VersionFilter {
+                after_version: Some(version),
+                ..VersionFilter::default()
+            }) else {
+                return Ok(Connection::new(false, false));
+            };
 
-        Ok(Some(
             Object::paginate_by_version(
                 ctx,
-                self.super_.scope.without_root_version(),
+                self.super_.scope.without_root_bound(),
                 page,
                 self.super_.address,
                 filter,
             )
-            .await?,
-        ))
+            .await
+        }
+        .await;
+
+        Some(result)
     }
 
     /// Paginate all versions of this object before this one.
@@ -491,34 +545,36 @@ impl Object {
         last: Option<u64>,
         before: Option<CVersion>,
         filter: Option<VersionFilter>,
-    ) -> Result<Option<Connection<String, Object>>, RpcError> {
-        let pagination: &PaginationConfig = ctx.data()?;
-        let limits = pagination.limits("IObject", "objectVersionsBefore");
-        let page = Page::from_params(limits, first, after, last, before)?;
+    ) -> Option<Result<Connection<String, Object>, RpcError>> {
+        let version = self.version(ctx).await.ok()??;
 
-        let Some(version) = self.version(ctx).await? else {
-            return Ok(None);
-        };
+        let result = async {
+            let pagination: &PaginationConfig = ctx.data()?;
+            let limits = pagination.limits("IObject", "objectVersionsBefore");
+            let page = Page::from_params(limits, first, after, last, before)?;
+            let version = version?;
 
-        // Apply any filter that was supplied to the query, but add an additional version
-        // upperbound constraint.
-        let Some(filter) = filter.unwrap_or_default().intersect(VersionFilter {
-            before_version: Some(version),
-            ..VersionFilter::default()
-        }) else {
-            return Ok(Some(Connection::new(false, false)));
-        };
+            // Apply any filter that was supplied to the query, but add an additional version
+            // upperbound constraint.
+            let Some(filter) = filter.unwrap_or_default().intersect(VersionFilter {
+                before_version: Some(version),
+                ..VersionFilter::default()
+            }) else {
+                return Ok(Connection::new(false, false));
+            };
 
-        Ok(Some(
             Object::paginate_by_version(
                 ctx,
-                self.super_.scope.without_root_version(),
+                self.super_.scope.without_root_bound(),
                 page,
                 self.super_.address,
                 filter,
             )
-            .await?,
-        ))
+            .await
+        }
+        .await;
+
+        Some(result)
     }
 
     /// Objects owned by this object, optionally filtered by type.
@@ -530,21 +586,23 @@ impl Object {
         last: Option<u64>,
         before: Option<CLive>,
         #[graphql(validator(custom = "OFValidator::allows_empty()"))] filter: Option<ObjectFilter>,
-    ) -> Result<Option<Connection<String, MoveObject>>, RpcError<Error>> {
+    ) -> Option<Result<Connection<String, MoveObject>, RpcError<Error>>> {
         self.super_
             .objects(ctx, first, after, last, before, filter)
             .await
+            .ok()?
     }
 
     /// The object's owner kind.
-    pub(crate) async fn owner(&self, ctx: &Context<'_>) -> Result<Option<Owner>, RpcError> {
-        let Some(object) = self.contents(ctx).await?.as_ref() else {
-            return Ok(None);
+    pub(crate) async fn owner(&self, ctx: &Context<'_>) -> Option<Result<Owner, RpcError>> {
+        let contents = match self.contents(ctx).await.transpose()? {
+            Ok(contents) => contents,
+            Err(e) => return Some(Err(e)),
         };
 
-        Ok(Some(Owner::from_native(
+        Some(Ok(Owner::from_native(
             self.super_.scope.clone(),
-            object.owner.clone(),
+            contents.owner.clone(),
         )))
     }
 
@@ -552,14 +610,15 @@ impl Object {
     pub(crate) async fn previous_transaction(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<Option<Transaction>, RpcError> {
-        let Some(object) = self.contents(ctx).await?.as_ref() else {
-            return Ok(None);
+    ) -> Option<Result<Transaction, RpcError>> {
+        let contents = match self.contents(ctx).await.transpose()? {
+            Ok(contents) => contents,
+            Err(e) => return Some(Err(e)),
         };
 
-        Ok(Some(Transaction::with_id(
-            self.super_.scope.without_root_version(),
-            object.previous_transaction,
+        Some(Ok(Transaction::with_digest(
+            self.super_.scope.without_root_bound(),
+            contents.previous_transaction,
         )))
     }
 
@@ -567,12 +626,13 @@ impl Object {
     pub(crate) async fn storage_rebate(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<Option<BigInt>, RpcError> {
-        let Some(object) = self.contents(ctx).await?.as_ref() else {
-            return Ok(None);
+    ) -> Option<Result<BigInt, RpcError>> {
+        let contents = match self.contents(ctx).await.transpose()? {
+            Ok(contents) => contents,
+            Err(e) => return Some(Err(e)),
         };
 
-        Ok(Some(BigInt::from(object.storage_rebate)))
+        Some(Ok(BigInt::from(contents.storage_rebate)))
     }
 
     /// The transactions that sent objects to this object
@@ -584,25 +644,28 @@ impl Object {
         last: Option<u64>,
         before: Option<CTransaction>,
         filter: Option<TransactionFilter>,
-    ) -> Result<Option<Connection<String, Transaction>>, RpcError> {
-        let pagination: &PaginationConfig = ctx.data()?;
-        let limits = pagination.limits("IObject", "receivedTransactions");
-        let page = Page::from_params(limits, first, after, last, before)?;
+    ) -> Option<Result<Connection<String, Transaction>, RpcError>> {
+        let result = async {
+            let pagination: &PaginationConfig = ctx.data()?;
+            let limits = pagination.limits("IObject", "receivedTransactions");
+            let page = Page::from_params(limits, first, after, last, before)?;
 
-        // Create filter for transactions that affected this object's address
-        let address_filter = TransactionFilter {
-            affected_address: Some(self.super_.address.into()),
-            ..Default::default()
-        };
+            // Create filter for transactions that affected this object's address
+            let address_filter = TransactionFilter {
+                affected_address: Some(self.super_.address.into()),
+                ..Default::default()
+            };
 
-        // Intersect with user-provided filter
-        let Some(filter) = filter.unwrap_or_default().intersect(address_filter) else {
-            return Ok(Some(Connection::new(false, false)));
-        };
+            // Intersect with user-provided filter
+            let Some(filter) = filter.unwrap_or_default().intersect(address_filter) else {
+                return Ok(Connection::new(false, false));
+            };
 
-        Transaction::paginate(ctx, self.super_.scope.clone(), page, filter)
-            .await
-            .map(Some)
+            Transaction::paginate(ctx, self.super_.scope.clone(), page, filter).await
+        }
+        .await;
+
+        Some(result)
     }
 }
 
@@ -675,9 +738,11 @@ impl Object {
                 .await
                 .map_err(upcast)
         } else if let Some(cp) = key.at_checkpoint {
-            let scope = scope
-                .with_checkpoint_viewed_at(cp.into())
-                .ok_or_else(|| bad_user_input(Error::Future(cp.into())))?;
+            // Validate checkpoint isn't in the future
+            let watermark: &Arc<Watermarks> = ctx.data()?;
+            if u64::from(cp) > watermark.high_watermark().checkpoint() {
+                return Err(bad_user_input(Error::Future(cp.into())));
+            }
 
             Self::checkpoint_bounded(ctx, scope, key.address, cp)
                 .await
@@ -687,9 +752,29 @@ impl Object {
         }
     }
 
+    /// Get the latest version of the object at the given address, respecting any root bounds in
+    /// scope.
+    ///
+    /// If a root version bound is set, fetches the object at that version.
+    /// Otherwise, fetches the object at the root checkpoint (which falls back to the checkpoint
+    /// being viewed).
+    pub(crate) async fn latest(
+        ctx: &Context<'_>,
+        scope: Scope,
+        address: SuiAddress,
+    ) -> Result<Option<Self>, RpcError> {
+        if let Some(version) = scope.root_version() {
+            Self::version_bounded(ctx, scope, address, version.into()).await
+        } else if let Some(cp) = scope.root_checkpoint() {
+            Self::checkpoint_bounded(ctx, scope, address, cp.into()).await
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Fetch the latest version of the object at the given address less than or equal to
     /// `root_version`.
-    pub(crate) async fn version_bounded(
+    async fn version_bounded(
         ctx: &Context<'_>,
         scope: Scope,
         address: SuiAddress,
@@ -711,23 +796,9 @@ impl Object {
         Object::from_stored_version(scope.with_root_version(root_version.into()), stored)
     }
 
-    /// Get the latest version of the object at the given address, as of the latest checkpoint
-    /// according to `scope`.
-    pub(crate) async fn latest(
-        ctx: &Context<'_>,
-        scope: Scope,
-        address: SuiAddress,
-    ) -> Result<Option<Self>, RpcError> {
-        let Some(cp) = scope.checkpoint_viewed_at() else {
-            return Ok(None);
-        };
-
-        Self::checkpoint_bounded(ctx, scope, address, cp.into()).await
-    }
-
     /// Fetch the latest version of the object at the given address as of the checkpoint with
     /// sequence number `at_checkpoint`.
-    pub(crate) async fn checkpoint_bounded(
+    async fn checkpoint_bounded(
         ctx: &Context<'_>,
         scope: Scope,
         address: SuiAddress,
@@ -746,7 +817,7 @@ impl Object {
             return Ok(None);
         };
 
-        Object::from_stored_version(scope, stored)
+        Object::from_stored_version(scope.with_root_checkpoint(at_checkpoint.into()), stored)
     }
 
     /// Load the object at the given ID and version from the store, and return it fully inflated
@@ -869,6 +940,7 @@ impl Object {
             return Ok(Connection::new(false, false));
         };
 
+        query_limits::rich::debit(ctx)?;
         let pg_reader: &PgReader = ctx.data()?;
 
         let mut query = v::obj_versions
@@ -951,27 +1023,29 @@ impl Object {
         if scope.root_version().is_some() {
             return Err(bad_user_input(Error::RootVersionOwnership));
         }
-        let Some(checkpoint_viewed_at) = scope.checkpoint_viewed_at() else {
+
+        let Some(root_checkpoint) = scope.root_checkpoint() else {
             return Ok(Connection::new(false, false));
         };
 
+        query_limits::rich::debit(ctx)?;
         let consistent_reader: &ConsistentReader = ctx.data()?;
 
         // Figure out which checkpoint to pin results to, based on the pagination cursors and
-        // defaulting to the current scope. If both cursors are provided, they must agree on the
-        // checkpoint they are pinning, and this checkpoint must be at or below the scope's latest
-        // checkpoint.
+        // defaulting to the root checkpoint bound. If both cursors are provided, they must agree
+        // on the checkpoint they are pinning, and this checkpoint must be at or below the scope's
+        // root checkpoint.
         let checkpoint = match (page.after(), page.before()) {
             (Some(a), Some(b)) if a.0 != b.0 => {
                 return Err(bad_user_input(Error::CursorInconsistency(a.0, b.0)));
             }
-            (None, None) => checkpoint_viewed_at,
+            (None, None) => root_checkpoint,
             (Some(c), _) | (_, Some(c)) => c.0,
         };
 
         // Set the checkpoint being viewed to the one calculated from the cursors, so that
         // nested queries about the resulting objects also treat this checkpoint as latest.
-        let Some(scope) = scope.with_checkpoint_viewed_at(checkpoint) else {
+        let Some(scope) = scope.with_checkpoint_viewed_at(ctx, checkpoint) else {
             return Err(bad_user_input(Error::Future(checkpoint)));
         };
 
@@ -983,7 +1057,7 @@ impl Object {
             } => {
                 consistent_reader
                     .list_owned_objects(
-                        checkpoint,
+                        Some(checkpoint),
                         kind.unwrap_or(OwnerKind::Address).into(),
                         Some(address.to_string()),
                         type_.map(|t| t.to_string()),
@@ -1002,7 +1076,7 @@ impl Object {
             } => {
                 consistent_reader
                     .list_owned_objects(
-                        checkpoint,
+                        Some(checkpoint),
                         kind.into(),
                         None,
                         Some(type_.to_string()),
@@ -1021,7 +1095,7 @@ impl Object {
             } => {
                 consistent_reader
                     .list_objects_by_type(
-                        checkpoint,
+                        Some(checkpoint),
                         type_.to_string(),
                         Some(page.limit() as u32),
                         page.after().map(|c| c.1.clone()),
@@ -1101,7 +1175,7 @@ impl Object {
     pub(crate) async fn contents(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<&Option<NativeObject>, RpcError> {
+    ) -> Result<Option<&NativeObject>, RpcError> {
         self.contents
             .get_or_try_init(async || {
                 let pg_loader: &Arc<DataLoader<PgReader>> = ctx.data()?;
@@ -1143,6 +1217,7 @@ impl Object {
                 }
             })
             .await
+            .map(Option::as_ref)
     }
 }
 

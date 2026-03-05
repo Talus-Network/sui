@@ -1,29 +1,33 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use anyhow::Context as _;
-use backoff::{Error as BE, ExponentialBackoff};
-use futures::{future::try_join_all, stream};
-use sui_indexer_alt_framework::task::{TrySpawnStreamExt, with_slow_future_monitor};
-use tokio::{sync::mpsc, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use backoff::Error as BE;
+use backoff::ExponentialBackoff;
+use futures::future::try_join_all;
+use futures::stream;
+use sui_futures::future::with_slow_future_monitor;
+use sui_futures::service::Service;
+use sui_futures::stream::Break;
+use sui_futures::stream::TrySpawnStreamExt;
+use tokio::sync::mpsc;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 
 use crate::db::Db;
-
-use super::{
-    Break, FormalSnapshot, LiveObjects, RestorerMetrics,
-    format::{EpochManifest, FileMetadata, FileType},
-};
+use crate::restore::FormalSnapshot;
+use crate::restore::LiveObjects;
+use crate::restore::RestorerMetrics;
+use crate::restore::format::EpochManifest;
+use crate::restore::format::FileMetadata;
+use crate::restore::format::FileType;
 
 /// Wait at most this long between retries while fetching files from the snapshot.
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -35,32 +39,24 @@ const SLOW_FETCH_THRESHOLD: Duration = Duration::from_secs(600);
 /// fetching object files from the formal snapshot and disseminating them to all subscribers in
 /// `subscribers`.
 ///
-/// The task will shut down if the `cancel` token is signalled, or if all object files have been
-/// restored across all subscribers. Returns `Ok(_)` if all object files were successfully fetched
-/// and passed to subscribers, or `Err(_)` otherwise.
+/// The task will shut down if all object files have been restored across all subscribers. Returns
+/// `Ok(_)` if all object files were successfully fetched and passed to subscribers, or `Err(_)`
+/// otherwise.
 pub(super) fn broadcaster(
     object_file_concurrency: usize,
     subscribers: BTreeMap<String, mpsc::Sender<Arc<LiveObjects>>>,
     db: Arc<Db>,
     snapshot: FormalSnapshot,
     metrics: Arc<RestorerMetrics>,
-    cancel: CancellationToken,
-) -> JoinHandle<Result<(), ()>> {
-    tokio::spawn(async move {
+) -> Service {
+    Service::new().spawn_aborting(async move {
         info!("Starting broadcaster");
 
-        let manifest = match snapshot
+        let manifest = snapshot
             .manifest()
             .await
             .and_then(|bs| EpochManifest::read(&bs))
-        {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                error!("Failed to read snapshot manifest: {e:#}");
-                cancel.cancel();
-                return Err(());
-            }
-        };
+            .context("Failed to read snapshot manifest")?;
 
         let metadata: Vec<_> = manifest
             .metadata()
@@ -79,9 +75,6 @@ pub(super) fn broadcaster(
                 let snapshot = snapshot.clone();
                 let metrics = metrics.clone();
 
-                let supervisor_cancel = cancel.clone();
-                let cancel = cancel.clone();
-
                 async move {
                     let restored = db
                         .is_restored(
@@ -89,7 +82,8 @@ pub(super) fn broadcaster(
                             metadata.partition,
                             subscribers.keys().map(|p| p.as_str()),
                         )
-                        .context("Failed to check restored markers")?;
+                        .context("Failed to check restored markers")
+                        .map_err(Break::Err)?;
 
                     // If all the pipelines have restored this partition, it can be skipped.
                     if restored.iter().all(|r| *r) {
@@ -109,12 +103,11 @@ pub(super) fn broadcaster(
                     }
 
                     // Download the object file.
-                    let objects = tokio::select! {
-                        objects = fetch_objects(snapshot, metadata, metrics.as_ref()) => Arc::new(objects?),
-                        _ = cancel.cancelled() => {
-                            return Err(Break::Cancel);
-                        }
-                    };
+                    let objects = Arc::new(
+                        fetch_objects(snapshot, metadata, metrics.as_ref())
+                            .await
+                            .map_err(Break::Err)?,
+                    );
 
                     // Send it to all subscribers who are not restored yet.
                     let futures = subscribers
@@ -125,8 +118,7 @@ pub(super) fn broadcaster(
 
                     if try_join_all(futures).await.is_err() {
                         info!("Subscription dropped, signalling shutdown");
-                        supervisor_cancel.cancel();
-                        Err(Break::Cancel)
+                        Err(Break::Break)
                     } else {
                         metrics.total_partitions_broadcast.inc();
                         Ok(())
@@ -140,14 +132,14 @@ pub(super) fn broadcaster(
                 Ok(())
             }
 
-            Err(Break::Cancel) => {
-                info!("Shutdown received, stopping broadcaster");
-                Err(())
+            Err(Break::Break) => {
+                info!("Channel closed, stopping broadcaster");
+                Ok(())
             }
 
             Err(Break::Err(e)) => {
                 error!("Error from broadcaster: {e:#}");
-                Err(())
+                Err(e)
             }
         }
     })

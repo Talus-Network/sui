@@ -28,6 +28,10 @@ const EInvalidSubLimit: vector<u8> = b"Sub-limit exceeds current withdrawal limi
 #[error(code = 2)]
 const EOwnerMismatch: vector<u8> = b"Withdrawal owners do not match";
 
+/// Attempted to withdraw funds from an object when the feature flag is not enabled.
+#[error(code = 3)]
+const EObjectFundsWithdrawNotEnabled: vector<u8> = b"Object funds withdraw is not enabled";
+
 /// Allows for withdrawing funds from a given address. The `Withdrawal` can be created in PTBs for
 /// the transaction sender, or dynamically from an object via `withdraw_from_object`.
 /// The redemption of the funds must be initiated from the module that defines `T`.
@@ -70,8 +74,7 @@ public fun withdrawal_join<T: store>(withdrawal: &mut Withdrawal<T>, other: With
 
 // TODO When this becomes `public` we need
 // - custom verifier rules for `T`
-// - private generic rules for `T`
-public(package) fun redeem</* internal */ T: store>(withdrawal: Withdrawal<T>): T {
+public(package) fun redeem<T: store>(withdrawal: Withdrawal<T>, _: internal::Permit<T>): T {
     let Withdrawal { owner, limit: value } = withdrawal;
     withdraw_impl(owner, value)
 }
@@ -84,6 +87,10 @@ public(package) fun redeem</* internal */ T: store>(withdrawal: Withdrawal<T>): 
 // - custom verifier rules for `T`
 #[allow(unused_mut_parameter)]
 public(package) fun withdraw_from_object<T: store>(obj: &mut UID, limit: u256): Withdrawal<T> {
+    assert!(
+        sui::protocol_config::is_feature_enabled(b"enable_object_funds_withdraw"),
+        EObjectFundsWithdrawNotEnabled,
+    );
     let owner = obj.to_address();
     Withdrawal { owner, limit }
 }

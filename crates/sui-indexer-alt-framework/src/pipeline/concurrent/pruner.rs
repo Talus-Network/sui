@@ -1,25 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use tokio::{
-    sync::Semaphore,
-    task::JoinHandle,
-    time::{MissedTickBehavior, interval},
-};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use sui_futures::service::Service;
+use tokio::sync::Semaphore;
+use tokio::time::MissedTickBehavior;
+use tokio::time::interval;
+use tracing::debug;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 
-use crate::{
-    metrics::IndexerMetrics,
-    pipeline::logging::{LoggerWatermark, WatermarkLogger},
-    store::{Connection, Store},
-};
-
-use super::{Handler, PrunerConfig};
+use crate::metrics::IndexerMetrics;
+use crate::pipeline::concurrent::Handler;
+use crate::pipeline::concurrent::PrunerConfig;
+use crate::pipeline::logging::LoggerWatermark;
+use crate::pipeline::logging::WatermarkLogger;
+use crate::store::Connection;
+use crate::store::Store;
 
 #[derive(Default)]
 struct PendingRanges {
@@ -92,19 +94,17 @@ impl PendingRanges {
 /// The task regularly traces its progress, outputting at a higher log level every
 /// [LOUD_WATERMARK_UPDATE_INTERVAL]-many checkpoints.
 ///
-/// The task will shutdown if the `cancel` token is signalled. If the `config` is `None`, the task
-/// will shutdown immediately.
+/// If the `config` is `None`, the task will shutdown immediately.
 pub(super) fn pruner<H: Handler + Send + Sync + 'static>(
     handler: Arc<H>,
     config: Option<PrunerConfig>,
     store: H::Store,
     metrics: Arc<IndexerMetrics>,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Service {
+    Service::new().spawn_aborting(async move {
         let Some(config) = config else {
             info!(pipeline = H::NAME, "Skipping pruner task");
-            return;
+            return Ok(());
         };
 
         info!(
@@ -128,41 +128,39 @@ pub(super) fn pruner<H: Handler + Send + Sync + 'static>(
         let mut pending_prune_ranges = PendingRanges::default();
 
         loop {
+            poll.tick().await;
+
             // (1) Get the latest pruning bounds from the database.
-            let mut watermark = tokio::select! {
-                _ = cancel.cancelled() => {
-                    info!(pipeline = H::NAME, "Shutdown received");
-                    break;
-                }
+            let mut watermark = {
+                let guard = metrics
+                    .watermark_pruner_read_latency
+                    .with_label_values(&[H::NAME])
+                    .start_timer();
 
-                _ = poll.tick() => {
-                    let guard = metrics
-                        .watermark_pruner_read_latency
-                        .with_label_values(&[H::NAME])
-                        .start_timer();
+                let Ok(mut conn) = store.connect().await else {
+                    warn!(
+                        pipeline = H::NAME,
+                        "Pruner failed to connect, while fetching watermark"
+                    );
+                    continue;
+                };
 
-                    let Ok(mut conn) = store.connect().await else {
-                        warn!(pipeline = H::NAME, "Pruner failed to connect, while fetching watermark");
+                match conn.pruner_watermark(H::NAME, config.delay()).await {
+                    Ok(Some(current)) => {
+                        guard.stop_and_record();
+                        current
+                    }
+
+                    Ok(None) => {
+                        guard.stop_and_record();
+                        warn!(pipeline = H::NAME, "No watermark for pipeline, skipping");
                         continue;
-                    };
+                    }
 
-                    match conn.pruner_watermark(H::NAME, config.delay()).await {
-                        Ok(Some(current)) => {
-                            guard.stop_and_record();
-                            current
-                        }
-
-                        Ok(None) => {
-                            guard.stop_and_record();
-                            warn!(pipeline = H::NAME, "No watermark for pipeline, skipping");
-                            continue;
-                        }
-
-                        Err(e) => {
-                            guard.stop_and_record();
-                            warn!(pipeline = H::NAME, "Failed to get watermark: {e}");
-                            continue;
-                        }
+                    Err(e) => {
+                        guard.stop_and_record();
+                        warn!(pipeline = H::NAME, "Failed to get watermark: {e}");
+                        continue;
                     }
                 }
             };
@@ -170,13 +168,7 @@ pub(super) fn pruner<H: Handler + Send + Sync + 'static>(
             // (2) Wait until this information can be acted upon.
             if let Some(wait_for) = watermark.wait_for() {
                 debug!(pipeline = H::NAME, ?wait_for, "Waiting to prune");
-                tokio::select! {
-                    _ = tokio::time::sleep(wait_for) => {}
-                    _ = cancel.cancelled() => {
-                        info!(pipeline = H::NAME, "Shutdown received");
-                        break;
-                    }
-                }
+                tokio::time::sleep(wait_for).await;
             }
 
             // Tracks the current highest `pruner_hi` not yet written to db. This is updated as
@@ -204,21 +196,13 @@ pub(super) fn pruner<H: Handler + Send + Sync + 'static>(
             let mut tasks = FuturesUnordered::new();
             for (from, to_exclusive) in pending_prune_ranges.iter() {
                 let semaphore = semaphore.clone();
-                let cancel = cancel.child_token();
                 let metrics = metrics.clone();
                 let handler = handler.clone();
 
                 let db = store.clone();
 
                 tasks.push(tokio::spawn(async move {
-                    let _permit = tokio::select! {
-                        permit = semaphore.acquire() => {
-                            permit.unwrap()
-                        }
-                        _ = cancel.cancelled() => {
-                            return ((from, to_exclusive), Err(anyhow::anyhow!("Cancelled")));
-                        }
-                    };
+                    let _permit = semaphore.acquire().await.unwrap();
                     let result = prune_task_impl(metrics, db, handler, from, to_exclusive).await;
                     ((from, to_exclusive), result)
                 }));
@@ -291,8 +275,6 @@ pub(super) fn pruner<H: Handler + Send + Sync + 'static>(
                 }
             }
         }
-
-        info!(pipeline = H::NAME, "Stopping pruner");
     })
 }
 
@@ -344,24 +326,21 @@ async fn prune_task_impl<H: Handler + Send + Sync + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
-    use std::{
-        collections::HashMap,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
     use async_trait::async_trait;
     use prometheus::Registry;
     use sui_types::full_checkpoint_content::Checkpoint;
     use tokio::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
-    use crate::{
-        FieldCount,
-        metrics::IndexerMetrics,
-        mocks::store::*,
-        pipeline::{Processor, concurrent::BatchStatus},
-    };
+    use crate::FieldCount;
+    use crate::metrics::IndexerMetrics;
+    use crate::mocks::store::*;
+    use crate::pipeline::Processor;
+    use crate::pipeline::concurrent::BatchStatus;
 
     use super::*;
 
@@ -545,7 +524,6 @@ mod tests {
         };
         let registry = Registry::new_custom(Some("test".to_string()), None).unwrap();
         let metrics = IndexerMetrics::new(None, &registry);
-        let cancel = CancellationToken::new();
 
         // Update data
         let test_data = HashMap::from([(1, vec![1, 2, 3]), (2, vec![4, 5, 6]), (3, vec![7, 8, 9])]);
@@ -570,17 +548,7 @@ mod tests {
 
         // Start the pruner
         let store_clone = store.clone();
-        let cancel_clone = cancel.clone();
-        let pruner_handle = tokio::spawn(async move {
-            pruner(
-                handler,
-                Some(pruner_config),
-                store_clone,
-                metrics,
-                cancel_clone,
-            )
-            .await
-        });
+        let _pruner = pruner(handler, Some(pruner_config), store_clone, metrics);
 
         // Wait a short time within delay_ms
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -621,10 +589,6 @@ mod tests {
                 "Pruner watermark should be updated"
             );
         }
-
-        // Clean up
-        cancel.cancel();
-        let _ = pruner_handle.await;
     }
 
     #[tokio::test]
@@ -639,7 +603,6 @@ mod tests {
         };
         let registry = Registry::new_custom(Some("test".to_string()), None).unwrap();
         let metrics = IndexerMetrics::new(None, &registry);
-        let cancel = CancellationToken::new();
 
         // Update data
         let test_data = HashMap::from([(1, vec![1, 2, 3]), (2, vec![4, 5, 6]), (3, vec![7, 8, 9])]);
@@ -664,17 +627,7 @@ mod tests {
 
         // Start the pruner
         let store_clone = store.clone();
-        let cancel_clone = cancel.clone();
-        let pruner_handle = tokio::spawn(async move {
-            pruner(
-                handler,
-                Some(pruner_config),
-                store_clone,
-                metrics,
-                cancel_clone,
-            )
-            .await
-        });
+        let _pruner = pruner(handler, Some(pruner_config), store_clone, metrics);
 
         // Because the `pruner_timestamp` is in the past, even with the delay_ms it should be pruned
         // close to immediately. To be safe, sleep for 1000ms before checking, which is well under
@@ -697,10 +650,6 @@ mod tests {
                 "Pruner watermark should be updated"
             );
         }
-
-        // Clean up
-        cancel.cancel();
-        let _ = pruner_handle.await;
     }
 
     #[tokio::test]
@@ -715,7 +664,6 @@ mod tests {
         };
         let registry = Registry::new_custom(Some("test".to_string()), None).unwrap();
         let metrics = IndexerMetrics::new(None, &registry);
-        let cancel = CancellationToken::new();
 
         // Set up test data for checkpoints 1-4
         let test_data = HashMap::from([
@@ -748,17 +696,7 @@ mod tests {
 
         // Start the pruner
         let store_clone = store.clone();
-        let cancel_clone = cancel.clone();
-        let pruner_handle = tokio::spawn(async move {
-            pruner(
-                handler,
-                Some(pruner_config),
-                store_clone,
-                metrics,
-                cancel_clone,
-            )
-            .await
-        });
+        let _pruner = pruner(handler, Some(pruner_config), store_clone, metrics);
 
         // Wait for first pruning cycle - ranges [2,3) and [3,4) should succeed, [1,2) should fail
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -793,9 +731,5 @@ mod tests {
             assert!(!data.contains_key(&3), "Checkpoint 3 should be pruned");
             assert!(data.contains_key(&4), "Checkpoint 4 should be preserved");
         }
-
-        // Clean up
-        cancel.cancel();
-        let _ = pruner_handle.await;
     }
 }

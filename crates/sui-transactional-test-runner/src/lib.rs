@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 use sui_core::authority::AuthorityState;
 use sui_core::authority::authority_per_epoch_store::CertLockGuard;
-use sui_core::authority::authority_test_utils::send_and_confirm_transaction_with_execution_error;
+use sui_core::authority::authority_test_utils::submit_and_execute_with_error;
 use sui_core::authority::shared_object_version_manager::AssignedVersions;
 use sui_json_rpc::authority_state::StateRead;
 use sui_json_rpc_types::EventFilter;
@@ -136,12 +136,11 @@ impl TransactionalAdapter for ValidatorWithFullnode {
         transaction: Transaction,
     ) -> anyhow::Result<(TransactionEffects, Option<ExecutionError>)> {
         let is_consensus_tx = transaction.is_consensus_tx();
-        let (_, effects, execution_error) = send_and_confirm_transaction_with_execution_error(
+        let (_, effects, execution_error) = submit_and_execute_with_error(
             &self.validator,
             Some(&self.fullnode),
             transaction,
             is_consensus_tx,
-            false,
         )
         .await?;
         Ok((effects.into_data(), execution_error))
@@ -163,7 +162,7 @@ impl TransactionalAdapter for ValidatorWithFullnode {
         self.validator.read_objects_for_execution(
             &CertLockGuard::dummy_for_tests(),
             &tx,
-            assigned_versions,
+            &assigned_versions,
             &epoch_store,
         )
     }
@@ -386,7 +385,7 @@ impl ReadStore for ValidatorWithFullnode {
         &self,
         _sequence_number: Option<sui_types::messages_checkpoint::CheckpointSequenceNumber>,
         _digest: &CheckpointContentsDigest,
-    ) -> Option<sui_types::messages_checkpoint::FullCheckpointContents> {
+    ) -> Option<sui_types::messages_checkpoint::VersionedFullCheckpointContents> {
         todo!()
     }
 

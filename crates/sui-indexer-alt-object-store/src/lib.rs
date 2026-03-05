@@ -4,15 +4,22 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
+use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
+use object_store::Error as ObjectStoreError;
+use object_store::ObjectStoreExt as _;
+use object_store::PutMode;
+use object_store::PutPayload;
 use object_store::path::Path as ObjectPath;
-use object_store::{Error as ObjectStoreError, PutMode, PutPayload};
-use serde::{Deserialize, Serialize};
-use sui_indexer_alt_framework_store_traits::{
-    self as framework_traits, Connection, PrunerWatermark, ReaderWatermark, Store,
-};
+use serde::Deserialize;
+use serde::Serialize;
+use sui_indexer_alt_framework_store_traits::Connection;
+use sui_indexer_alt_framework_store_traits::PrunerWatermark;
+use sui_indexer_alt_framework_store_traits::ReaderWatermark;
+use sui_indexer_alt_framework_store_traits::Store;
+use sui_indexer_alt_framework_store_traits::{self as framework_traits};
 use tracing::info;
 
 #[derive(Clone)]
@@ -79,6 +86,13 @@ impl Store for ObjectStore {
 
 #[async_trait]
 impl Connection for ObjectStoreConnection {
+    async fn init_watermark(&mut self, pipeline_task: &str, _: u64) -> anyhow::Result<Option<u64>> {
+        Ok(self
+            .committer_watermark(pipeline_task)
+            .await?
+            .map(|w| w.checkpoint_hi_inclusive))
+    }
+
     async fn committer_watermark(
         &mut self,
         pipeline_task: &str,
@@ -184,8 +198,9 @@ impl Connection for ObjectStoreConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use object_store::memory::InMemory;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_watermark_operations() {

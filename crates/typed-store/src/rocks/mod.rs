@@ -25,6 +25,7 @@ use crate::{
 use backoff::backoff::Backoff;
 use fastcrypto::hash::{Digest, HashFunction};
 use mysten_common::debug_fatal;
+use mysten_metrics::RegistryID;
 use prometheus::{Histogram, HistogramTimer};
 use rocksdb::properties::num_files_at_level;
 use rocksdb::{
@@ -39,7 +40,7 @@ use std::{
     marker::PhantomData,
     ops::RangeBounds,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use std::{collections::HashSet, ffi::CStr};
@@ -53,6 +54,21 @@ use tracing::{debug, error, instrument, warn};
 // From https://github.com/facebook/rocksdb/blob/bd80433c73691031ba7baa65c16c63a83aef201a/include/rocksdb/db.h#L1169
 const ROCKSDB_PROPERTY_TOTAL_BLOB_FILES_SIZE: &CStr =
     unsafe { CStr::from_bytes_with_nul_unchecked("rocksdb.total-blob-file-size\0".as_bytes()) };
+
+static WRITE_SYNC_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn write_sync_enabled() -> bool {
+    *WRITE_SYNC_ENABLED
+        .get_or_init(|| std::env::var("SUI_DB_SYNC_TO_DISK").is_ok_and(|v| v == "1" || v == "true"))
+}
+
+/// Initialize the write sync setting from config.
+/// Must be called before any database writes occur.
+pub fn init_write_sync(enabled: Option<bool>) {
+    if let Some(value) = enabled {
+        let _ = WRITE_SYNC_ENABLED.set(value);
+    }
+}
 
 #[cfg(test)]
 mod tests;
@@ -121,11 +137,16 @@ impl std::fmt::Debug for Storage {
 pub struct Database {
     storage: Storage,
     metric_conf: MetricConf,
+    registry_id: Option<RegistryID>,
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
-        DBMetrics::get().decrement_num_active_dbs(&self.metric_conf.db_name);
+        let metrics = DBMetrics::get();
+        metrics.decrement_num_active_dbs(&self.metric_conf.db_name);
+        if let Some(registry_id) = self.registry_id {
+            metrics.registry_serivce.remove(registry_id);
+        }
     }
 }
 
@@ -149,11 +170,12 @@ impl Deref for GetResult<'_> {
 }
 
 impl Database {
-    pub fn new(storage: Storage, metric_conf: MetricConf) -> Self {
+    pub fn new(storage: Storage, metric_conf: MetricConf, registry_id: Option<RegistryID>) -> Self {
         DBMetrics::get().increment_num_active_dbs(&metric_conf.db_name);
         Self {
             storage,
             metric_conf,
+            registry_id,
         }
     }
 
@@ -351,11 +373,7 @@ impl Database {
         }
     }
 
-    pub fn write(&self, batch: StorageWriteBatch) -> Result<(), TypedStoreError> {
-        self.write_opt(batch, &rocksdb::WriteOptions::default())
-    }
-
-    pub fn write_opt(
+    pub(crate) fn write_opt_internal(
         &self,
         batch: StorageWriteBatch,
         write_options: &rocksdb::WriteOptions,
@@ -1204,12 +1222,18 @@ impl DBBatch {
     /// Consume the batch and write its operations to the database
     #[instrument(level = "trace", skip_all, err)]
     pub fn write(self) -> Result<(), TypedStoreError> {
-        self.write_opt(&rocksdb::WriteOptions::default())
+        let mut write_options = rocksdb::WriteOptions::default();
+
+        if write_sync_enabled() {
+            write_options.set_sync(true);
+        }
+
+        self.write_opt(write_options)
     }
 
     /// Consume the batch and write its operations to the database with custom write options
     #[instrument(level = "trace", skip_all, err)]
-    pub fn write_opt(self, write_options: &rocksdb::WriteOptions) -> Result<(), TypedStoreError> {
+    pub fn write_opt(self, write_options: rocksdb::WriteOptions) -> Result<(), TypedStoreError> {
         let db_name = self.database.db_name();
         let timer = self
             .db_metrics
@@ -1224,7 +1248,10 @@ impl DBBatch {
         } else {
             None
         };
-        self.database.write_opt(self.batch, write_options)?;
+
+        self.database
+            .write_opt_internal(self.batch, &write_options)?;
+
         self.db_metrics
             .op_metrics
             .rocksdb_batch_commit_bytes
@@ -1782,6 +1809,7 @@ pub fn open_cf_opts<P: AsRef<Path>>(
                 underlying: rocksdb,
             }),
             metric_conf,
+            None,
         )))
     })
 }
@@ -1847,6 +1875,7 @@ pub fn open_cf_opts_secondary<P: AsRef<Path>>(
                 underlying: rocksdb,
             }),
             metric_conf,
+            None,
         )))
     })
 }

@@ -56,7 +56,7 @@ use crate::{
         DefMap, find_datatype, parsing_analysis::parsing_mod_def_to_map_key, run_parsing_analysis,
         run_typing_analysis,
     },
-    compiler_info::CompilerAutocompleteInfo,
+    compiler_info::{CompilerAnalysisInfo, CompilerAutocompleteInfo},
     symbols::{
         compilation::{
             CachedPackages, CachedPkgInfo, CompiledPkgInfo, CompiledProgram, ParsedDefinitions,
@@ -87,7 +87,7 @@ use move_compiler::{
     editions::{Edition, FeatureGate, Flavor},
     expansion::ast::{self as E, ModuleIdent, ModuleIdent_, Visibility},
     linters::LintLevel,
-    naming::ast::{DatatypeTypeParameter, StructFields, Type, Type_, TypeName_, VariantFields},
+    naming::ast::{DatatypeTypeParameter, StructFields, Type, TypeInner, TypeName_, VariantFields},
     parser::ast::{self as P, DocComment},
     shared::{
         Identifier, NamedAddressMap, files::MappedFiles,
@@ -96,7 +96,7 @@ use move_compiler::{
     typing::ast::ModuleDefinition,
 };
 use move_ir_types::location::*;
-use move_package::source_package::parsed_manifest::Dependencies;
+use move_package_alt::MoveFlavor;
 use move_symbol_pool::Symbol;
 
 pub mod compilation;
@@ -149,13 +149,18 @@ pub type FileModules = BTreeMap<PathBuf, BTreeSet<ModuleDefs>>;
 /// correctly computed symbols should be a replacement for the old set - if symbols are not
 /// actually (re)computed and the diagnostics are returned, the old symbolic information should
 /// be retained even if it's getting out-of-date.
-pub fn get_symbols(
+///
+/// Takes `modified_files` as an argument to indicate if we can retain (portion of) the cached
+/// user code. If `modified_files` is `None`, we can't retain any cached user code (need to recompute)
+/// everything. If `modified_files` is `Some`, we can retain cached user code for all Move files other than
+/// the ones in `modified_files` (if `modified_paths` contains a path not representing
+/// a Move file but rather a directory, then we conservatively do not re-use any cached info).
+pub fn get_symbols<F: MoveFlavor>(
     packages_info: Arc<Mutex<CachedPackages>>,
     ide_files_root: VfsPath,
     pkg_path: &Path,
     lint: LintLevel,
     cursor_info: Option<(&PathBuf, Position)>,
-    implicit_deps: Dependencies,
     flavor: Option<Flavor>,
 ) -> Result<(Option<Symbols>, BTreeMap<PathBuf, Vec<Diagnostic>>)> {
     // helper function to avoid holding the lock for too long
@@ -180,12 +185,11 @@ pub fn get_symbols(
 
     loop {
         let compilation_start = Instant::now();
-        let (compiled_pkg_info_opt, ide_diagnostics) = get_compiled_pkg(
+        let (compiled_pkg_info_opt, ide_diagnostics) = get_compiled_pkg::<F>(
             packages_info.clone(),
             ide_files_root.clone(),
             pkg_path,
             lint,
-            implicit_deps.clone(),
             flavor,
             cursor_info.map(|(path, _)| path),
         )?;
@@ -315,6 +319,7 @@ pub fn compute_symbols_pre_process(
         &mut computation_data.def_info,
         &compiled_pkg_info.edition,
         cursor_context.as_mut(),
+        &compiled_pkg_info.compiler_analysis_info,
     );
 
     if let Some(cached_deps) = compiled_pkg_info.cached_deps.clone()
@@ -364,12 +369,12 @@ pub fn compute_symbols_typed_program(
     CompiledProgram,
 ) {
     // run typing analysis for the main user program
-    let compiler_analysis_info = compiled_pkg_info.compiler_analysis_info.as_ref().unwrap();
+    let compiler_analysis_info = compiled_pkg_info.compiler_analysis_info;
     let mapped_files = &compiled_pkg_info.mapped_files;
     let mut computation_data = run_typing_analysis(
         computation_data,
         mapped_files,
-        compiler_analysis_info,
+        &compiler_analysis_info,
         &compiled_pkg_info.program.typed_modules,
     );
     let mut file_use_defs = BTreeMap::new();
@@ -634,6 +639,7 @@ fn pre_process_typed_modules(
     def_info: &mut DefMap,
     edition: &Option<Edition>,
     mut cursor_context: Option<&mut CursorContext>,
+    compiler_analysis_info: &CompilerAnalysisInfo,
 ) {
     for (pos, module_ident, module_def) in typed_modules {
         // If the cursor is in this module, mark that down.
@@ -654,6 +660,7 @@ fn pre_process_typed_modules(
             references,
             def_info,
             edition,
+            compiler_analysis_info,
         );
         mod_outer_defs.insert(mod_ident_str.clone(), defs);
 
@@ -746,7 +753,7 @@ fn datatype_type_params(data_tparams: &[DatatypeTypeParameter]) -> Vec<(Type, /*
             (
                 sp(
                     t.param.user_specified_name.loc,
-                    Type_::Param(t.param.clone()),
+                    TypeInner::Param(t.param.clone()).into(),
                 ),
                 t.is_phantom,
             )
@@ -774,6 +781,7 @@ fn get_mod_outer_defs(
     references: &mut References,
     def_info: &mut DefMap,
     edition: &Option<Edition>,
+    compiler_analysis_info: &CompilerAnalysisInfo,
 ) -> (ModuleDefs, UseDefMap) {
     let mut structs = BTreeMap::new();
     let mut enums = BTreeMap::new();
@@ -911,7 +919,7 @@ fn get_mod_outer_defs(
                 mod_ident.value,
                 *name,
                 c.signature.clone(),
-                const_val_to_ide_string(&c.value),
+                const_val_to_ide_string(&c.value, compiler_analysis_info),
                 doc_string,
             ),
         );
@@ -937,7 +945,12 @@ fn get_mod_outer_defs(
             fun.signature
                 .type_parameters
                 .iter()
-                .map(|t| sp(t.user_specified_name.loc, Type_::Param(t.clone())))
+                .map(|t| {
+                    sp(
+                        t.user_specified_name.loc,
+                        TypeInner::Param(t.clone()).into(),
+                    )
+                })
                 .collect(),
             fun.signature
                 .parameters
@@ -1016,9 +1029,10 @@ pub fn type_def_loc(
     mod_outer_defs: &BTreeMap<String, ModuleDefs>,
     sp!(_, t): &Type,
 ) -> Option<Loc> {
-    match t {
-        Type_::Ref(_, r) => type_def_loc(mod_outer_defs, r),
-        Type_::Apply(_, sp!(_, TypeName_::ModuleType(sp!(_, mod_ident), struct_name)), _) => {
+    match t.inner() {
+        TypeInner::Ref(_, r) => type_def_loc(mod_outer_defs, r),
+        TypeInner::Apply(_, sp!(_, TypeName_::ModuleType(mod_ident, struct_name)), _) => {
+            let mod_ident = &mod_ident.value;
             let mod_ident_str = expansion_mod_ident_to_map_key(mod_ident);
             mod_outer_defs
                 .get(&mod_ident_str)

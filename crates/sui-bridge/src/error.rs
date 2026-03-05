@@ -9,7 +9,7 @@ pub enum BridgeError {
     InvalidTxHash,
     // The referenced transaction failed
     OriginTxFailed,
-    // The referenced transction does not exist
+    // The referenced transaction does not exist
     TxNotFound,
     // Tx is not yet finalized
     TxNotFinalized,
@@ -52,8 +52,8 @@ pub enum BridgeError {
     // Signature is over a mismatched action
     MismatchedAction,
     // Action is not a governance action
-    ActionIsNotGovernanceAction(BridgeAction),
-    // Client requested a non-approved governace action
+    ActionIsNotGovernanceAction(Box<BridgeAction>),
+    // Client requested a non-approved governance action
     GovernanceActionIsNotApproved,
     // Authority has invalid url
     AuthoirtyUrlInvalid,

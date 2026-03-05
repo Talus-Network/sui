@@ -124,24 +124,26 @@ fn all_uid_holders(
         uid_holders: &mut BTreeMap<ModuleIdent, BTreeMap<DatatypeName, UIDHolder>>,
         sp!(_, ty_): &N::Type,
     ) -> Option<UIDHolder> {
-        match ty_ {
-            N::Type_::Unit
-            | N::Type_::Param(_)
-            | N::Type_::Var(_)
-            | N::Type_::Fun(_, _)
-            | N::Type_::Anything
-            | N::Type_::UnresolvedError
-            | N::Type_::Void => None,
+        use N::TypeInner as TI;
 
-            N::Type_::Ref(_, inner) => visit_ty(info, visited, uid_holders, inner),
+        match ty_.inner() {
+            TI::Unit
+            | TI::Param(_)
+            | TI::Var(_)
+            | TI::Fun(_, _)
+            | TI::Anything
+            | TI::UnresolvedError
+            | TI::Void => None,
 
-            N::Type_::Apply(_, sp!(_, tn_), _)
+            TI::Ref(_, inner) => visit_ty(info, visited, uid_holders, inner),
+
+            TI::Apply(_, sp!(_, tn_), _)
                 if tn_.is(&SUI_ADDR_VALUE, OBJECT_MODULE_NAME, UID_TYPE_NAME) =>
             {
                 Some(UIDHolder::IsUID)
             }
 
-            N::Type_::Apply(_, tn, tys) => {
+            TI::Apply(_, tn, tys) => {
                 let phantom_positions = phantom_positions(info, tn);
                 let ty_args_holder = tys
                     .iter()
@@ -149,11 +151,11 @@ fn all_uid_holders(
                     .filter(|(_t, is_phantom)| *is_phantom)
                     .map(|(t, _is_phantom)| visit_ty(info, visited, uid_holders, t))
                     .fold(None, merge_uid_holder_opt);
-                let tn_holder = if let N::TypeName_::ModuleType(m, n) = tn.value {
-                    visit_decl(info, visited, uid_holders, m, n);
+                let tn_holder = if let N::TypeName_::ModuleType(m, n) = &tn.value {
+                    visit_decl(info, visited, uid_holders, *m.as_ref(), *n);
                     uid_holders
-                        .get(&m)
-                        .and_then(|m_uid_holders| m_uid_holders.get(&n).copied())
+                        .get(m)
+                        .and_then(|m_uid_holders| m_uid_holders.get(n).copied())
                 } else {
                     None
                 };

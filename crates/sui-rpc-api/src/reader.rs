@@ -1,17 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use sui_sdk_types::{Address, Object, Version};
-use sui_sdk_types::{CheckpointSequenceNumber, EpochId, SignedTransaction, ValidatorCommittee};
-use sui_types::balance_change::BalanceChange;
-use sui_types::base_types::{ObjectID, ObjectType};
+use sui_sdk_types::{CheckpointSequenceNumber, EpochId, ValidatorCommittee};
 use sui_types::storage::ObjectKey;
+use sui_types::storage::ObjectStore;
 use sui_types::storage::RpcStateReader;
 use sui_types::storage::error::{Error as StorageError, Result};
-use sui_types::storage::{ObjectStore, TransactionInfo};
 use tap::Pipe;
 
 use crate::Direction;
@@ -30,6 +27,7 @@ impl StateReader {
         &self.inner
     }
 
+    #[allow(unused)]
     #[tracing::instrument(skip(self))]
     pub fn get_object(&self, object_id: Address) -> crate::Result<Option<Object>> {
         self.inner
@@ -39,6 +37,7 @@ impl StateReader {
             .map_err(Into::into)
     }
 
+    #[allow(unused)]
     #[tracing::instrument(skip(self))]
     pub fn get_object_with_version(
         &self,
@@ -90,9 +89,10 @@ impl StateReader {
         &self,
         digest: sui_sdk_types::Digest,
     ) -> crate::Result<(
-        sui_sdk_types::SignedTransaction,
-        sui_sdk_types::TransactionEffects,
-        Option<sui_sdk_types::TransactionEvents>,
+        sui_types::transaction::TransactionData,
+        Vec<sui_types::signature::GenericSignature>,
+        sui_types::effects::TransactionEffects,
+        Option<sui_types::effects::TransactionEvents>,
     )> {
         use sui_types::effects::TransactionEffectsAPI;
 
@@ -117,23 +117,11 @@ impl StateReader {
             None
         };
 
-        Ok((
-            transaction.try_into()?,
-            effects.try_into()?,
-            events.map(TryInto::try_into).transpose()?,
-        ))
-    }
+        let transaction = transaction.into_data().into_inner();
+        let signatures = transaction.tx_signatures;
+        let transaction = transaction.intent_message.value;
 
-    #[tracing::instrument(skip(self))]
-    pub fn get_transaction_info(
-        &self,
-        digest: &sui_types::digests::TransactionDigest,
-    ) -> Option<TransactionInfo> {
-        self.inner()
-            .indexes()?
-            .get_transaction_info(digest)
-            .ok()
-            .flatten()
+        Ok((transaction, signatures, effects, events))
     }
 
     #[tracing::instrument(skip(self))]
@@ -141,26 +129,10 @@ impl StateReader {
         &self,
         digest: sui_sdk_types::Digest,
     ) -> crate::Result<TransactionRead> {
-        let (
-            SignedTransaction {
-                transaction,
-                signatures,
-            },
-            effects,
-            events,
-        ) = self.get_transaction(digest)?;
+        let (transaction, signatures, effects, events) = self.get_transaction(digest)?;
 
-        let (checkpoint, balance_changes, object_types) =
-            if let Some(info) = self.get_transaction_info(&(digest.into())) {
-                (
-                    Some(info.checkpoint),
-                    Some(info.balance_changes),
-                    Some(info.object_types),
-                )
-            } else {
-                let checkpoint = self.inner().get_transaction_checkpoint(&(digest.into()));
-                (checkpoint, None, None)
-            };
+        let checkpoint = self.inner().get_transaction_checkpoint(&(digest.into()));
+
         let timestamp_ms = if let Some(checkpoint) = checkpoint {
             self.inner()
                 .get_checkpoint_by_sequence_number(checkpoint)
@@ -174,15 +146,13 @@ impl StateReader {
             .get_unchanged_loaded_runtime_objects(&(digest.into()));
 
         Ok(TransactionRead {
-            digest: transaction.digest(),
+            digest,
             transaction,
             signatures,
             effects,
             events,
             checkpoint,
             timestamp_ms,
-            balance_changes,
-            object_types,
             unchanged_loaded_runtime_objects,
         })
     }
@@ -204,19 +174,41 @@ impl StateReader {
     ) -> CheckpointTransactionsIter {
         CheckpointTransactionsIter::new(self.clone(), direction, cursor)
     }
+
+    pub fn lookup_address_balance(
+        &self,
+        owner: sui_types::base_types::SuiAddress,
+        coin_type: move_core_types::language_storage::StructTag,
+    ) -> Option<u64> {
+        use sui_types::MoveTypeTagTraitGeneric;
+        use sui_types::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
+        use sui_types::accumulator_root::AccumulatorKey;
+        use sui_types::dynamic_field::DynamicFieldKey;
+
+        let balance_type = sui_types::balance::Balance::type_tag(coin_type.into());
+
+        let key = AccumulatorKey { owner };
+        let key_type_tag = AccumulatorKey::get_type_tag(&[balance_type]);
+
+        DynamicFieldKey(SUI_ACCUMULATOR_ROOT_OBJECT_ID, key, key_type_tag)
+            .into_unbounded_id()
+            .unwrap()
+            .load_object(self.inner())
+            .and_then(|o| o.load_value::<u128>().ok())
+            .map(|balance| balance as u64)
+    }
 }
 
 #[derive(Debug)]
 pub struct TransactionRead {
     pub digest: sui_sdk_types::Digest,
-    pub transaction: sui_sdk_types::Transaction,
-    pub signatures: Vec<sui_sdk_types::UserSignature>,
-    pub effects: sui_sdk_types::TransactionEffects,
-    pub events: Option<sui_sdk_types::TransactionEvents>,
+    pub transaction: sui_types::transaction::TransactionData,
+    pub signatures: Vec<sui_types::signature::GenericSignature>,
+    pub effects: sui_types::effects::TransactionEffects,
+    pub events: Option<sui_types::effects::TransactionEvents>,
+    #[allow(unused)]
     pub checkpoint: Option<u64>,
     pub timestamp_ms: Option<u64>,
-    pub balance_changes: Option<Vec<BalanceChange>>,
-    pub object_types: Option<HashMap<ObjectID, ObjectType>>,
     pub unchanged_loaded_runtime_objects: Option<Vec<ObjectKey>>,
 }
 

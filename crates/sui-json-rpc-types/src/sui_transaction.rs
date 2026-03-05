@@ -45,7 +45,6 @@ use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::messages_consensus::ConsensusDeterminedVersionAssignments;
 use sui_types::object::Owner;
 use sui_types::parse_sui_type_tag;
-use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 use sui_types::signature::GenericSignature;
 use sui_types::storage::{DeleteKind, WriteKind};
 use sui_types::sui_serde::Readable;
@@ -58,6 +57,7 @@ use sui_types::transaction::{
     SenderSignedData, TransactionData, TransactionDataAPI, TransactionKind, WithdrawFrom,
     WithdrawalTypeArg,
 };
+use sui_types::transaction_driver_types::ExecuteTransactionRequestType;
 use sui_types::{authenticator_state::ActiveJwk, transaction::SharedObjectMutability};
 
 use crate::balance_changes::BalanceChange;
@@ -620,6 +620,12 @@ impl SuiTransactionBlockKind {
                             EndOfEpochTransactionKind::DisplayRegistryCreate => {
                                 SuiEndOfEpochTransactionKind::DisplayRegistryCreate
                             }
+                            EndOfEpochTransactionKind::AddressAliasStateCreate => {
+                                SuiEndOfEpochTransactionKind::AddressAliasStateCreate
+                            }
+                            EndOfEpochTransactionKind::WriteAccumulatorStorageCost(_) => {
+                                SuiEndOfEpochTransactionKind::WriteAccumulatorStorageCost
+                            }
                         })
                         .collect(),
                 })
@@ -632,9 +638,12 @@ impl SuiTransactionBlockKind {
         module_cache: &impl GetModule,
     ) -> Result<Self, anyhow::Error> {
         match tx {
-            TransactionKind::ProgrammableTransaction(p) => Ok(Self::ProgrammableTransaction(
-                SuiProgrammableTransactionBlock::try_from_with_module_cache(p, module_cache)?,
-            )),
+            TransactionKind::ProgrammableTransaction(p)
+            | TransactionKind::ProgrammableSystemTransaction(p) => {
+                Ok(Self::ProgrammableTransaction(
+                    SuiProgrammableTransactionBlock::try_from_with_module_cache(p, module_cache)?,
+                ))
+            }
             tx => Self::try_from_inner(tx),
         }
     }
@@ -1784,6 +1793,8 @@ pub enum SuiEndOfEpochTransactionKind {
     AccumulatorRootCreate,
     CoinRegistryCreate,
     DisplayRegistryCreate,
+    AddressAliasStateCreate,
+    WriteAccumulatorStorageCost,
 }
 
 #[serde_as]
@@ -2380,12 +2391,11 @@ impl SuiCallArg {
             }
             CallArg::FundsWithdrawal(arg) => SuiCallArg::FundsWithdrawal(SuiFundsWithdrawalArg {
                 reservation: match arg.reservation {
-                    Reservation::EntireBalance => SuiReservation::EntireBalance,
                     Reservation::MaxAmountU64(amount) => SuiReservation::MaxAmountU64(amount),
                 },
                 type_arg: match arg.type_arg {
                     WithdrawalTypeArg::Balance(type_input) => {
-                        SuiWithdrawalTypeArg::Balance(type_input.to_type_tag()?.into())
+                        SuiWithdrawalTypeArg::Balance(type_input.into())
                     }
                 },
                 withdraw_from: match arg.withdraw_from {
@@ -2471,7 +2481,6 @@ pub enum SuiObjectArg {
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SuiReservation {
-    EntireBalance,
     MaxAmountU64(
         #[schemars(with = "BigInt<u64>")]
         #[serde_as(as = "BigInt<u64>")]
@@ -2588,11 +2597,16 @@ impl Filter<EffectsWithInput> for TransactionFilter {
                 package,
                 module,
                 function,
-            } => item.input.move_calls().into_iter().any(|(p, m, f)| {
-                p == package
-                    && (module.is_none() || matches!(module,  Some(m2) if m2 == &m.to_string()))
-                    && (function.is_none() || matches!(function, Some(f2) if f2 == &f.to_string()))
-            }),
+            } => item
+                .input
+                .move_calls()
+                .into_iter()
+                .any(|(_cmd_idx, p, m, f)| {
+                    p == package
+                        && (module.is_none() || matches!(module,  Some(m2) if m2 == &m.to_string()))
+                        && (function.is_none()
+                            || matches!(function, Some(f2) if f2 == &f.to_string()))
+                }),
             TransactionFilter::TransactionKind(kind) => item.input.kind().to_string() == *kind,
             TransactionFilter::TransactionKindIn(kinds) => {
                 kinds.contains(&item.input.kind().to_string())

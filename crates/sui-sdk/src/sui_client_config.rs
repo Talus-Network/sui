@@ -7,10 +7,18 @@ use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::{SUI_DEVNET_URL, SUI_LOCAL_NETWORK_URL, SUI_TESTNET_URL, SuiClient, SuiClientBuilder};
+use crate::{
+    SUI_DEVNET_URL, SUI_LOCAL_NETWORK_URL, SUI_MAINNET_URL, SUI_TESTNET_URL, SuiClient,
+    SuiClientBuilder,
+};
 use sui_config::Config;
 use sui_keys::keystore::{AccountKeystore, Keystore};
-use sui_types::base_types::*;
+use sui_rpc_api::Client;
+use sui_rpc_api::client::HeadersInterceptor;
+use sui_types::{
+    base_types::*,
+    digests::{get_mainnet_chain_identifier, get_testnet_chain_identifier},
+};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
@@ -122,6 +130,24 @@ impl SuiEnv {
         Ok(builder.build(&self.rpc).await?)
     }
 
+    pub fn create_grpc_client(&self) -> Result<Client, anyhow::Error> {
+        let mut client = Client::new(&self.rpc)?;
+
+        if let Some(basic_auth) = &self.basic_auth {
+            let fields: Vec<_> = basic_auth.split(':').collect();
+            if fields.len() != 2 {
+                return Err(anyhow!(
+                    "Basic auth should be in the format `username:password`"
+                ));
+            }
+            let mut headers = HeadersInterceptor::new();
+            headers.basic_auth(fields[0], Some(fields[1]));
+            client = client.with_headers(headers);
+        }
+
+        Ok(client)
+    }
+
     pub fn devnet() -> Self {
         Self {
             alias: "devnet".to_string(),
@@ -137,7 +163,7 @@ impl SuiEnv {
             rpc: SUI_TESTNET_URL.into(),
             ws: None,
             basic_auth: None,
-            chain_id: None,
+            chain_id: Some(get_testnet_chain_identifier().to_string()),
         }
     }
 
@@ -148,6 +174,16 @@ impl SuiEnv {
             ws: None,
             basic_auth: None,
             chain_id: None,
+        }
+    }
+
+    pub fn mainnet() -> Self {
+        Self {
+            alias: "mainnet".to_string(),
+            rpc: SUI_MAINNET_URL.into(),
+            ws: None,
+            basic_auth: None,
+            chain_id: Some(get_mainnet_chain_identifier().to_string()),
         }
     }
 }

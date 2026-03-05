@@ -58,13 +58,20 @@ impl BridgeClient {
                 "sign/bridge_tx/sui/eth/{}/{}",
                 e.sui_tx_digest, e.sui_tx_event_index
             ),
-            BridgeAction::SuiToEthTokenTransfer(_action) => format!(
-                "/sign/bridge_action/sui/eth/{source_chain}/{message_type}/{bridge_seq_num}",
-                source_chain = event.chain_id() as u8,
-                message_type = event.action_type() as u8,
-                bridge_seq_num = event.seq_number(),
-            ),
+            BridgeAction::SuiToEthTokenTransfer(_) | BridgeAction::SuiToEthTokenTransferV2(_) => {
+                format!(
+                    "/sign/bridge_action/sui/eth/{source_chain}/{message_type}/{bridge_seq_num}",
+                    source_chain = event.chain_id() as u8,
+                    message_type = event.action_type() as u8,
+                    bridge_seq_num = event.seq_number(),
+                )
+            }
             BridgeAction::EthToSuiBridgeAction(e) => format!(
+                "sign/bridge_tx/eth/sui/{}/{}",
+                Hex::encode(e.eth_tx_hash.0),
+                e.eth_event_index
+            ),
+            BridgeAction::EthToSuiTokenTransferV2(e) => format!(
                 "sign/bridge_tx/eth/sui/{}/{}",
                 Hex::encode(e.eth_tx_hash.0),
                 e.eth_event_index
@@ -104,8 +111,8 @@ impl BridgeClient {
             BridgeAction::EvmContractUpgradeAction(a) => {
                 let chain_id = (a.chain_id as u8).to_string();
                 let nonce = a.nonce.to_string();
-                let proxy_address = Hex::encode(a.proxy_address.as_bytes());
-                let new_impl_address = Hex::encode(a.new_impl_address.as_bytes());
+                let proxy_address = Hex::encode(a.proxy_address.as_slice());
+                let new_impl_address = Hex::encode(a.new_impl_address.as_slice());
                 let path = format!(
                     "sign/upgrade_evm_contract/{chain_id}/{nonce}/{proxy_address}/{new_impl_address}"
                 );
@@ -248,8 +255,8 @@ mod tests {
         test_utils::{get_test_authority_and_key, get_test_sui_to_eth_bridge_action},
         types::SignedBridgeAction,
     };
-    use ethers::types::Address as EthAddress;
-    use ethers::types::TxHash;
+    use alloy::primitives::{Address as EthAddress, TxHash};
+    use alloy::sol_types::SolValue;
     use fastcrypto::hash::{HashFunction, Keccak256};
     use fastcrypto::traits::KeyPair;
     use prometheus::Registry;
@@ -582,7 +589,7 @@ mod tests {
             "sign/upgrade_evm_contract/12/123/0606060606060606060606060606060606060606/0909090909090909090909090909090909090909/5cd8a76b",
         );
 
-        call_data.extend(ethers::abi::encode(&[ethers::abi::Token::Uint(42.into())]));
+        call_data.extend(alloy::primitives::U256::from(42).abi_encode());
         let action =
             BridgeAction::EvmContractUpgradeAction(crate::types::EvmContractUpgradeAction {
                 nonce: 123,
