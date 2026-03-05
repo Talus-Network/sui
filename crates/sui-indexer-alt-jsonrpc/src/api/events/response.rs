@@ -6,10 +6,7 @@ use std::collections::HashMap;
 use anyhow::Context as _;
 use move_core_types::annotated_value::{MoveDatatypeLayout, MoveTypeLayout};
 use sui_json_rpc_types::{EventFilter, EventPage, SuiEvent};
-use sui_types::{
-    digests::TransactionDigest,
-    event::Event,
-};
+use sui_types::{digests::TransactionDigest, event::Event};
 
 use sui_indexer_alt_reader::{kv_loader::TransactionContents, tx_digests::TxDigestKey};
 
@@ -144,14 +141,9 @@ pub(super) async fn build_event_page(
                 ),
             };
 
-            let sui_event = SuiEvent::try_from(
-                event,
-                digest,
-                event_seq as u64,
-                Some(timestamp_ms),
-                layout,
-            )
-            .context("Failed to convert event to SuiEvent")?;
+            let sui_event =
+                SuiEvent::try_from(event, digest, event_seq as u64, timestamp_ms, layout)
+                    .context("Failed to convert event to SuiEvent")?;
 
             events.push(sui_event);
         }

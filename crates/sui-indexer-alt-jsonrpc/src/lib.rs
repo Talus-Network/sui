@@ -27,6 +27,7 @@ use url::Url;
 use crate::api::checkpoints::Checkpoints;
 use crate::api::coin::Coins;
 use crate::api::dynamic_fields::DynamicFields;
+use crate::api::events::Events;
 use crate::api::governance::DelegationGovernance;
 use crate::api::governance::Governance;
 use crate::api::move_utils::MoveUtils;
@@ -40,8 +41,8 @@ use crate::api::write::Write;
 use crate::config::RpcConfig;
 use crate::context::Context;
 use crate::error::PanicHandler;
-use crate::metrics::RpcMetrics;
 use crate::metrics::middleware::MetricsLayer;
+use crate::metrics::RpcMetrics;
 use crate::timeout::TimeoutLayer;
 
 pub mod api;
@@ -330,8 +331,8 @@ mod tests {
     use jsonrpsee::types::error::INTERNAL_ERROR_CODE;
     use jsonrpsee::types::error::METHOD_NOT_FOUND_CODE;
     use reqwest::Client;
-    use serde_json::Value;
     use serde_json::json;
+    use serde_json::Value;
     use sui_open_rpc::Module;
     use sui_open_rpc_macros::open_rpc;
     use sui_pg_db::temp::get_available_port;
