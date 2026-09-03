@@ -7,7 +7,7 @@ use crate::{
     },
     causal_state::{CausalObject, CausalState},
     execution_cache::ObjectCacheRead,
-    transaction_simulation::SimulationInputLoader,
+    transaction_simulation::{CausalSimulationView, SimulationInputLoader},
 };
 use mysten_common::{ZipDebugEqIteratorExt, izip_debug_eq};
 use std::collections::BTreeMap;
@@ -326,13 +326,13 @@ impl SimulationInputLoader for TransactionInputLoader {
         input_object_kinds: &[InputObjectKind],
         receiving_object_refs: &[ObjectRef],
         epoch_id: EpochId,
-        causal_state: Option<&CausalState>,
+        causal_view: Option<&CausalSimulationView<'_>>,
     ) -> SuiResult<(InputObjects, ReceivingObjects)> {
         self.read_objects_for_signing_with_causal_state(
             input_object_kinds,
             receiving_object_refs,
             epoch_id,
-            causal_state,
+            causal_view.map(CausalSimulationView::state),
         )
     }
 }

@@ -1,7 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::base_types::{ObjectID, TransactionDigest};
+use crate::accumulator_root::AccumulatorObjId;
+use crate::base_types::{ObjectID, SuiAddress, TransactionDigest};
 use crate::effects::TransactionEffects;
 use crate::effects::TransactionEvents;
 use crate::error::ExecutionError;
@@ -28,6 +29,12 @@ pub enum CausalObjectRead {
     Removed,
 }
 
+pub struct CausalExecutionResult {
+    pub response: ExecuteTransactionResponseV3,
+    pub applied: bool,
+    pub retained: bool,
+}
+
 /// Trait to define the interface for how the gRPC service interacts with a  QuorumDriver or a
 /// simulated transaction executor.
 #[async_trait::async_trait]
@@ -44,10 +51,24 @@ pub trait TransactionExecutor: Send + Sync {
         _request: ExecuteTransactionRequestV3,
         _client_addr: Option<std::net::SocketAddr>,
         _causal_parent: Option<TransactionDigest>,
-    ) -> Result<ExecuteTransactionResponseV3, TransactionSubmissionError> {
+    ) -> Result<CausalExecutionResult, TransactionSubmissionError> {
         Err(TransactionSubmissionError::CausalViewUnavailable(
             "causal transaction execution is not supported by this node".to_string(),
         ))
+    }
+
+    /// Return whether this node still retains the requested parent.
+    ///
+    /// `false` means the parent is visible in canonical state and no retained
+    /// overlay is needed. An unavailable parent returns an error.
+    fn causal_parent_is_retained(
+        &self,
+        _causal_parent: TransactionDigest,
+    ) -> Result<bool, SuiError> {
+        Err(crate::error::SuiErrorKind::UnsupportedFeatureError {
+            error: "causal parent lookup is not supported by this node".to_string(),
+        }
+        .into())
     }
 
     /// Return whether execution can wait for local checkpoint visibility.
@@ -75,10 +96,10 @@ pub trait TransactionExecutor: Send + Sync {
     ///
     /// Implementations which do not retain causal views return `None`. The
     /// receipt is read only and never changes canonical node state.
-    fn retained_causal_transaction(
+    fn retained_causal_transactions(
         &self,
         _transaction: &TransactionDigest,
-    ) -> Option<ExecuteTransactionResponseV3> {
+    ) -> Option<Vec<ExecuteTransactionResponseV3>> {
         None
     }
 
@@ -94,6 +115,31 @@ pub trait TransactionExecutor: Send + Sync {
     ) -> Result<CausalObjectRead, SuiError> {
         Err(crate::error::SuiErrorKind::UnsupportedFeatureError {
             error: "causal object resolution is not supported by this node".to_string(),
+        }
+        .into())
+    }
+
+    /// Return live objects in the retained view owned by `owner`.
+    fn read_owned_objects_at_causal_parent(
+        &self,
+        _causal_parent: TransactionDigest,
+        _owner: SuiAddress,
+    ) -> Result<Vec<Object>, SuiError> {
+        Err(crate::error::SuiErrorKind::UnsupportedFeatureError {
+            error: "causal owned object reads are not supported by this node".to_string(),
+        }
+        .into())
+    }
+
+    /// Apply retained account changes that are not visible in canonical state.
+    fn account_amount_at_causal_parent(
+        &self,
+        _causal_parent: TransactionDigest,
+        _account: AccumulatorObjId,
+        _visible_amount: u128,
+    ) -> Result<u128, SuiError> {
+        Err(crate::error::SuiErrorKind::UnsupportedFeatureError {
+            error: "causal account reads are not supported by this node".to_string(),
         }
         .into())
     }

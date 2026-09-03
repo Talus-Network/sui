@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +22,8 @@ use prometheus::{
 use rand::Rng;
 use sui_config::NodeConfig;
 use sui_storage::write_path_pending_tx_log::WritePathPendingTransactionLog;
-use sui_types::base_types::TransactionDigest;
+use sui_types::accumulator_root::AccumulatorObjId;
+use sui_types::base_types::{SuiAddress, TransactionDigest};
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::error::{ErrorCategory, SuiError, SuiErrorKind, SuiResult};
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
@@ -34,7 +36,7 @@ use sui_types::transaction_driver_types::{
     TransactionSubmissionError,
 };
 use sui_types::transaction_executor::{
-    CausalObjectRead, SimulateTransactionResult, TransactionChecks,
+    CausalExecutionResult, CausalObjectRead, SimulateTransactionResult, TransactionChecks,
 };
 use tokio::sync::broadcast::Receiver;
 use tokio::time::{Instant, sleep, timeout};
@@ -43,7 +45,7 @@ use tracing::{Instrument, debug, error_span, info, instrument, warn};
 use crate::authority::AuthorityState;
 use crate::authority_aggregator::AuthorityAggregator;
 use crate::authority_client::{AuthorityAPI, NetworkAuthorityClient};
-use crate::causal_state::{CausalObject, CausalStateCache};
+use crate::causal_state::{CausalObject, CausalState, CausalStateCache};
 use crate::transaction_driver::{OnsiteReconfigObserver, ReconfigObserver};
 use crate::transaction_driver::{
     QuorumTransactionResponse, SubmitTransactionOptions, TransactionDriver, TransactionDriverError,
@@ -176,6 +178,14 @@ impl<A> TransactionOrchestrator<A>
 where
     A: AuthorityAPI + Send + Sync + 'static + Clone,
 {
+    fn parent_is_checkpointed(&self, parent: &TransactionDigest) -> bool {
+        self.inner
+            .validator_state
+            .get_checkpoint_cache()
+            .deprecated_get_transaction_checkpoint(parent)
+            .is_some()
+    }
+
     #[instrument(name = "tx_orchestrator_execute_transaction", level = "debug", skip_all,
     fields(
         tx_digest = ?request.transaction.digest(),
@@ -1194,6 +1204,43 @@ impl TransactionOrchestratorMetrics {
     }
 }
 
+enum CausalParentState {
+    Retained(Arc<CausalState>),
+    Canonical,
+}
+
+impl<A> TransactionOrchestrator<A>
+where
+    A: AuthorityAPI + Send + Sync + 'static + Clone,
+{
+    fn causal_parent_state(&self, parent: TransactionDigest) -> SuiResult<CausalParentState> {
+        if self.parent_is_checkpointed(&parent) {
+            return Ok(CausalParentState::Canonical);
+        }
+        let epoch = self
+            .inner
+            .validator_state
+            .load_epoch_store_one_call_per_task()
+            .epoch();
+        if let Some(state) = self.inner.causal_states.get(&parent)
+            && state.epoch() == epoch
+        {
+            return Ok(CausalParentState::Retained(state));
+        }
+        if self.parent_is_checkpointed(&parent) {
+            return Ok(CausalParentState::Canonical);
+        }
+        Err(SuiErrorKind::UnsupportedFeatureError {
+            error: format!("causal parent {parent} is unavailable on this node"),
+        }
+        .into())
+    }
+
+    fn transaction_is_checkpointed(&self, transaction: &TransactionDigest) -> bool {
+        self.parent_is_checkpointed(transaction)
+    }
+}
+
 #[async_trait::async_trait]
 impl<A> sui_types::transaction_executor::TransactionExecutor for TransactionOrchestrator<A>
 where
@@ -1212,37 +1259,83 @@ where
         mut request: ExecuteTransactionRequestV3,
         client_addr: Option<std::net::SocketAddr>,
         causal_parent: Option<TransactionDigest>,
-    ) -> Result<ExecuteTransactionResponseV3, TransactionSubmissionError> {
-        let _parent_pin = match causal_parent {
-            Some(parent) => Some(self.inner.causal_states.pin(parent).ok_or_else(|| {
+    ) -> Result<CausalExecutionResult, TransactionSubmissionError> {
+        let current_epoch = self
+            .inner
+            .validator_state
+            .load_epoch_store_one_call_per_task()
+            .epoch();
+        let mut parent_pin = None;
+        let retained_parent = match causal_parent {
+            Some(parent) if self.parent_is_checkpointed(&parent) => {
                 self.inner
                     .metrics
                     .causal_requests
-                    .with_label_values(&["execute", "parent_unavailable"])
+                    .with_label_values(&["execute", "canonical"])
                     .inc();
-                TransactionSubmissionError::CausalViewUnavailable(format!(
-                    "causal parent {parent} is unavailable on this node"
-                ))
-            })?),
+                None
+            }
+            Some(parent) => match self.inner.causal_states.pin(parent) {
+                Some(pin) if pin.state().can_accept_child(current_epoch) => {
+                    parent_pin = Some(pin);
+                    Some(parent)
+                }
+                Some(_) | None if self.parent_is_checkpointed(&parent) => {
+                    self.inner
+                        .metrics
+                        .causal_requests
+                        .with_label_values(&["execute", "canonical"])
+                        .inc();
+                    None
+                }
+                Some(_) => {
+                    return Err(TransactionSubmissionError::CausalViewUnavailable(format!(
+                        "causal parent {parent} cannot accept another child"
+                    )));
+                }
+                None => {
+                    self.inner
+                        .metrics
+                        .causal_requests
+                        .with_label_values(&["execute", "parent_unavailable"])
+                        .inc();
+                    return Err(TransactionSubmissionError::CausalViewUnavailable(format!(
+                        "causal parent {parent} is unavailable on this node"
+                    )));
+                }
+            },
             None => None,
         };
+        let applied = causal_parent.is_none() || retained_parent.is_some();
 
         request.include_input_objects = true;
         request.include_output_objects = true;
         let response = self.execute_transaction_v3(request, client_addr).await?;
-        let recorded = match self.inner.causal_states.record(causal_parent, &response) {
-            Ok(recorded) => recorded,
-            Err(error) => {
-                self.inner
-                    .metrics
-                    .causal_requests
-                    .with_label_values(&["execute", "invalid_receipt"])
-                    .inc();
-                return Err(TransactionSubmissionError::TransactionDriverInternalError(
-                    error,
-                ));
-            }
-        };
+        let visible_dependencies = response
+            .effects
+            .data()
+            .dependencies()
+            .iter()
+            .copied()
+            .filter(|dependency| self.transaction_is_checkpointed(dependency))
+            .collect::<BTreeSet<_>>();
+        let recorded =
+            match self
+                .inner
+                .causal_states
+                .record(retained_parent, &response, &visible_dependencies)
+            {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    self.inner
+                        .metrics
+                        .causal_requests
+                        .with_label_values(&["execute", "invalid_receipt"])
+                        .inc();
+                    warn!(?error, "Finalized causal receipt could not be retained");
+                    false
+                }
+            };
         let cache = self.inner.causal_states.stats();
         self.inner
             .metrics
@@ -1262,18 +1355,19 @@ where
                 .causal_requests
                 .with_label_values(&["execute", "record_rejected"])
                 .inc();
-            // Execution is already final. An internal error keeps clients from
-            // treating this as a safe rejection and submitting another digest.
-            return Err(TransactionSubmissionError::TransactionDriverInternalError(
-                SuiError::from("finalized causal state could not be retained"),
-            ));
+        } else {
+            self.inner
+                .metrics
+                .causal_requests
+                .with_label_values(&["execute", "recorded"])
+                .inc();
         }
-        self.inner
-            .metrics
-            .causal_requests
-            .with_label_values(&["execute", "recorded"])
-            .inc();
-        Ok(response)
+        drop(parent_pin);
+        Ok(CausalExecutionResult {
+            response,
+            applied,
+            retained: recorded,
+        })
     }
 
     fn supports_checkpoint_wait(&self) -> bool {
@@ -1299,14 +1393,24 @@ where
         .await
     }
 
-    fn retained_causal_transaction(
+    fn causal_parent_is_retained(
+        &self,
+        causal_parent: TransactionDigest,
+    ) -> Result<bool, SuiError> {
+        Ok(matches!(
+            self.causal_parent_state(causal_parent)?,
+            CausalParentState::Retained(_)
+        ))
+    }
+
+    fn retained_causal_transactions(
         &self,
         transaction: &TransactionDigest,
-    ) -> Option<ExecuteTransactionResponseV3> {
+    ) -> Option<Vec<ExecuteTransactionResponseV3>> {
         self.inner
             .causal_states
             .get(transaction)
-            .map(|state| state.receipt())
+            .map(|state| state.receipts())
     }
 
     fn read_object_at_causal_parent(
@@ -1314,27 +1418,70 @@ where
         causal_parent: TransactionDigest,
         object_id: sui_types::base_types::ObjectID,
     ) -> Result<CausalObjectRead, SuiError> {
-        if let Some(state) = self.inner.causal_states.get(&causal_parent) {
-            self.inner
-                .metrics
-                .causal_requests
-                .with_label_values(&["resolve", "retained"])
-                .inc();
-            return Ok(match state.object(&object_id) {
-                Some(CausalObject::Live(object)) => CausalObjectRead::Live(object.clone()),
-                Some(CausalObject::Removed(_)) => CausalObjectRead::Removed,
-                None => CausalObjectRead::Unchanged,
-            });
+        match self.causal_parent_state(causal_parent) {
+            Ok(CausalParentState::Retained(state)) => {
+                self.inner
+                    .metrics
+                    .causal_requests
+                    .with_label_values(&["resolve", "retained"])
+                    .inc();
+                Ok(match state.object(&object_id) {
+                    Some(CausalObject::Live(object)) => CausalObjectRead::Live(object.clone()),
+                    Some(CausalObject::Removed(_)) => CausalObjectRead::Removed,
+                    None => CausalObjectRead::Unchanged,
+                })
+            }
+            Ok(CausalParentState::Canonical) => {
+                self.inner
+                    .metrics
+                    .causal_requests
+                    .with_label_values(&["resolve", "canonical"])
+                    .inc();
+                Ok(CausalObjectRead::Unchanged)
+            }
+            Err(error) => {
+                self.inner
+                    .metrics
+                    .causal_requests
+                    .with_label_values(&["resolve", "parent_unavailable"])
+                    .inc();
+                Err(error)
+            }
         }
-        self.inner
-            .metrics
-            .causal_requests
-            .with_label_values(&["resolve", "parent_unavailable"])
-            .inc();
-        Err(SuiErrorKind::UnsupportedFeatureError {
-            error: format!("causal parent {causal_parent} is unavailable on this node"),
+    }
+
+    fn read_owned_objects_at_causal_parent(
+        &self,
+        causal_parent: TransactionDigest,
+        owner: SuiAddress,
+    ) -> Result<Vec<sui_types::object::Object>, SuiError> {
+        match self.causal_parent_state(causal_parent)? {
+            CausalParentState::Retained(state) => Ok(state.owned_objects(owner)),
+            CausalParentState::Canonical => Ok(Vec::new()),
         }
-        .into())
+    }
+
+    fn account_amount_at_causal_parent(
+        &self,
+        causal_parent: TransactionDigest,
+        account: AccumulatorObjId,
+        visible_amount: u128,
+    ) -> Result<u128, SuiError> {
+        match self.causal_parent_state(causal_parent)? {
+            CausalParentState::Retained(state) => state
+                .account_amount(&account, visible_amount, |transaction| {
+                    self.transaction_is_checkpointed(transaction)
+                })
+                .ok_or_else(|| {
+                    SuiErrorKind::UnsupportedFeatureError {
+                        error: format!(
+                            "causal simulation cannot represent account update for {account}"
+                        ),
+                    }
+                    .into()
+                }),
+            CausalParentState::Canonical => Ok(visible_amount),
+        }
     }
 
     fn simulate_transaction(
@@ -1355,31 +1502,43 @@ where
         allow_mock_gas_coin: bool,
         causal_parent: TransactionDigest,
     ) -> Result<SimulateTransactionResult, SuiError> {
-        if let Some(state) = self.inner.causal_states.get(&causal_parent) {
-            self.inner
-                .metrics
-                .causal_requests
-                .with_label_values(&["simulate", "retained"])
-                .inc();
-            return self
-                .inner
-                .validator_state
-                .simulate_transaction_with_causal_state(
+        match self.causal_parent_state(causal_parent) {
+            Ok(CausalParentState::Retained(state)) => {
+                self.inner
+                    .metrics
+                    .causal_requests
+                    .with_label_values(&["simulate", "retained"])
+                    .inc();
+                self.inner
+                    .validator_state
+                    .simulate_transaction_with_causal_state(
+                        transaction,
+                        checks,
+                        allow_mock_gas_coin,
+                        state.as_ref(),
+                    )
+            }
+            Ok(CausalParentState::Canonical) => {
+                self.inner
+                    .metrics
+                    .causal_requests
+                    .with_label_values(&["simulate", "canonical"])
+                    .inc();
+                self.inner.validator_state.simulate_transaction(
                     transaction,
                     checks,
                     allow_mock_gas_coin,
-                    state.as_ref(),
-                );
+                )
+            }
+            Err(error) => {
+                self.inner
+                    .metrics
+                    .causal_requests
+                    .with_label_values(&["simulate", "parent_unavailable"])
+                    .inc();
+                Err(error)
+            }
         }
-        self.inner
-            .metrics
-            .causal_requests
-            .with_label_values(&["simulate", "parent_unavailable"])
-            .inc();
-        Err(SuiErrorKind::UnsupportedFeatureError {
-            error: format!("causal parent {causal_parent} is unavailable on this node"),
-        }
-        .into())
     }
 }
 

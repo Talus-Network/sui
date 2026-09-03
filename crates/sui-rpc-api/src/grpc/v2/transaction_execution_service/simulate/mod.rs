@@ -1,11 +1,12 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::ErrorReason;
 use crate::Result;
 use crate::RpcError;
 use crate::RpcService;
-use itertools::Itertools;
 use sui_protocol_config::ProtocolConfig;
 use sui_rpc::field::FieldMaskTree;
 use sui_rpc::field::FieldMaskUtil;
@@ -20,12 +21,13 @@ use sui_rpc::proto::sui::rpc::v2::SimulateTransactionRequest;
 use sui_rpc::proto::sui::rpc::v2::SimulateTransactionResponse;
 use sui_rpc::proto::sui::rpc::v2::Transaction;
 use sui_types::balance_change::derive_balance_changes_2;
-use sui_types::base_types::TransactionDigest;
+use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress, TransactionDigest};
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::error::SuiError;
 use sui_types::error::SuiErrorKind;
 use sui_types::execution_status::ExecutionFailure;
 use sui_types::execution_status::ExecutionStatus;
+use sui_types::object::{Object, Owner};
 use sui_types::transaction::AllowedProposers;
 use sui_types::transaction::InputObjectKind;
 use sui_types::transaction::InputObjects;
@@ -115,6 +117,7 @@ pub fn simulate_transaction(
             &protocol_config,
         )?,
     };
+    let object_view = resolve::ResolutionObjectView::new(service, executor.as_ref(), causal_parent);
 
     let perform_gas_selection = request.do_gas_selection() && checks.enabled();
     let simulation_result = 'simulate: {
@@ -132,7 +135,7 @@ pub fn simulate_transaction(
             // verified by running the tx. If that fails, we discard the gasless variant and
             // fall through to the priced flow. `payment` is already empty here, verified by
             // is_gasless_candidate.
-            if is_gasless_candidate(&request, &transaction, &protocol_config, service)? {
+            if is_gasless_candidate(&request, &transaction, &protocol_config, &object_view)? {
                 let mut gasless_tx = transaction.clone();
                 gasless_tx.gas_data_mut().price = 0;
                 gasless_tx.gas_data_mut().budget = 0;
@@ -208,6 +211,7 @@ pub fn simulate_transaction(
             if transaction.gas_data().payment.is_empty() {
                 select_gas(
                     service,
+                    &object_view,
                     &mut transaction,
                     // Only adjust the budget for actually-selected coins when we just
                     // computed the budget from estimation. A caller-supplied budget is
@@ -622,8 +626,26 @@ fn select_allowed_proposers(
         .filter(|allowed| allowed.epoch == current_epoch)
 }
 
+fn insert_gas_coin(
+    gas_coins: &mut BTreeMap<ObjectID, (ObjectRef, u64)>,
+    object: Object,
+    owner: SuiAddress,
+    input_objects: &BTreeSet<ObjectID>,
+) {
+    if input_objects.contains(&object.id()) || object.owner() != &Owner::AddressOwner(owner) {
+        return;
+    }
+    if let Ok(coin) = sui_types::gas_coin::GasCoin::try_from(&object) {
+        gas_coins.insert(
+            object.id(),
+            (object.compute_object_reference(), coin.value()),
+        );
+    }
+}
+
 fn select_gas(
     service: &RpcService,
+    object_view: &resolve::ResolutionObjectView<'_>,
     transaction: &mut sui_types::transaction::TransactionData,
     incremental_loading_rgp: Option<u64>,
     protocol_config: &ProtocolConfig,
@@ -648,37 +670,46 @@ fn select_gas(
         .kind()
         .iter_commands()
         .any(Command::is_gas_coin_used);
-    let address_balance = reader
+    let balance_type = Balance::type_tag(GAS::type_tag());
+    let accumulator_obj_id = AccumulatorValue::get_field_id(owner, &balance_type).map_err(|e| {
+        RpcError::new(
+            tonic::Code::Internal,
+            format!("Failed to get accumulator object ID: {e}"),
+        )
+    })?;
+    let visible_address_balance = reader
         .lookup_address_balance(owner, GAS::type_())
-        .map(|balance| {
-            // Sum up the explicit SUI reservations (excluding the implicit gas payment) for the
-            // `owner` so that we can deduct that from the available address balance. We use the
-            // estimation variant to avoid double-counting: the gas budget is what we're trying to
-            // satisfy, not a pre-existing reservation.
-            let coin_resolver = CoinReservationResolver::new(reader.inner().clone());
+        .unwrap_or(0);
+    let address_balance = u64::try_from(
+        object_view.account_amount(accumulator_obj_id, visible_address_balance as u128)?,
+    )
+    .map_err(|_| RpcError::new(tonic::Code::Internal, "address balance exceeds u64"))?;
+    let address_balance = {
+        // Sum up the explicit SUI reservations (excluding the implicit gas payment) for the
+        // `owner` so that we can deduct that from the available address balance. We use the
+        // estimation variant to avoid counting twice: the gas budget is what we're trying to
+        // satisfy, not an existing reservation.
+        let coin_resolver = CoinReservationResolver::new(reader.inner().clone());
 
-            let reserved_sui = transaction
-                .process_funds_withdrawals_for_estimation(service.chain_id, &coin_resolver)
-                .ok()
-                .and_then(|withdrawals| {
-                    let sui_type = Balance::type_tag(GAS::type_tag());
-                    let sui_account_id = AccumulatorValue::get_field_id(owner, &sui_type).ok()?;
-                    withdrawals
-                        .get(&sui_account_id)
-                        .map(|(amount, _, _)| *amount)
-                })
-                .unwrap_or(0);
+        let reserved_sui = transaction
+            .process_funds_withdrawals_for_estimation(service.chain_id, &coin_resolver)
+            .ok()
+            .and_then(|withdrawals| {
+                let sui_type = Balance::type_tag(GAS::type_tag());
+                let sui_account_id = AccumulatorValue::get_field_id(owner, &sui_type).ok()?;
+                withdrawals
+                    .get(&sui_account_id)
+                    .map(|(amount, _, _)| *amount)
+            })
+            .unwrap_or(0);
 
-            balance.saturating_sub(reserved_sui)
-        });
+        address_balance.saturating_sub(reserved_sui)
+    };
 
     // If the gas coin isn't used and there is sufficient address balance budget to satisfy the
     // required budget then we will use the `owner`s address balance to pay for gas. Otherwise we
     // fallback to doing coin selection
-    let selected_gas_value = if !gas_coin_used
-        && let Some(address_balance) = address_balance
-        && address_balance >= budget
-    {
+    let selected_gas_value = if !gas_coin_used && address_balance >= budget {
         // We probably don't need to do this, but explicitly clear out the payment to force using
         // Address balance
         transaction.gas_data_mut().payment.clear();
@@ -699,31 +730,35 @@ fn select_gas(
                 }
                 _ => None,
             })
-            .collect_vec();
+            .collect::<BTreeSet<_>>();
+        let max_gas_coins = protocol_config.max_gas_payment_objects() as usize;
+        let mut gas_coins = BTreeMap::new();
+        for object in object_view.owned_objects(owner)? {
+            insert_gas_coin(&mut gas_coins, object, owner, &input_objects);
+        }
 
-        let gas_coins = reader
+        let indexed_gas_coins = reader
             .inner()
             .indexes()
             .ok_or_else(RpcError::not_found)?
-            .owned_objects_iter(owner, Some(GasCoin::type_()), None)?
-            .filter_ok(|info| !input_objects.contains(&info.object_id))
-            .filter_map_ok(|info| reader.inner().get_object(&info.object_id))
-            // filter for objects which are not ConsensusAddress owned,
-            // since only Address owned can be used for gas payments today
-            .filter_ok(|object| !object.is_consensus())
-            .filter_map_ok(|object| {
-                GasCoin::try_from(&object)
-                    .ok()
-                    .map(|coin| (object.compute_object_reference(), coin.value()))
-            })
-            .take(protocol_config.max_gas_payment_objects() as usize);
+            .owned_objects_iter(owner, Some(GasCoin::type_()), None)?;
+        for object in indexed_gas_coins {
+            if gas_coins.len() >= max_gas_coins {
+                break;
+            }
+            let object = object.map_err(|e| RpcError::new(tonic::Code::Internal, e.to_string()))?;
+            if input_objects.contains(&object.object_id) {
+                continue;
+            }
+            if let Some(object) = object_view.get_object_by_id(object.object_id)? {
+                insert_gas_coin(&mut gas_coins, object, owner, &input_objects);
+            }
+        }
 
         let mut selected_gas = vec![];
         let mut selected_gas_value = 0;
 
-        for maybe_coin in gas_coins {
-            let (object_ref, value) =
-                maybe_coin.map_err(|e| RpcError::new(tonic::Code::Internal, e.to_string()))?;
+        for (_, (object_ref, value)) in gas_coins.into_iter().take(max_gas_coins) {
             selected_gas.push(object_ref);
             selected_gas_value += value;
         }
@@ -732,19 +767,10 @@ fn select_gas(
         // to make all SUI in the account available (coins + address balance)
         if protocol_config.enable_coin_reservation_obj_refs()
             && gas_coin_used
-            && let Some(ab_value) = address_balance
-            && ab_value > 0
+            && address_balance > 0
         {
+            let ab_value = address_balance;
             let current_epoch = service.reader.inner().get_latest_checkpoint()?.epoch();
-
-            let accumulator_obj_id =
-                AccumulatorValue::get_field_id(owner, &Balance::type_tag(GAS::type_tag()))
-                    .map_err(|e| {
-                        RpcError::new(
-                            tonic::Code::Internal,
-                            format!("Failed to get accumulator object ID: {e}"),
-                        )
-                    })?;
 
             let reservation = ParsedObjectRefWithdrawal::new(
                 *accumulator_obj_id.inner(),
@@ -813,7 +839,7 @@ fn is_gasless_candidate(
     request: &SimulateTransactionRequest,
     transaction: &sui_types::transaction::TransactionData,
     protocol_config: &ProtocolConfig,
-    service: &RpcService,
+    object_view: &resolve::ResolutionObjectView<'_>,
 ) -> Result<bool> {
     if !protocol_config.enable_gasless() {
         return Ok(false);
@@ -854,13 +880,16 @@ fn is_gasless_candidate(
         match kind {
             InputObjectKind::MovePackage(_) => continue,
             InputObjectKind::ImmOrOwnedMoveObject(object_ref) => {
-                let Some(object) = service.reader.inner().get_object(&object_ref.0) else {
+                let Some(object) = object_view.get_object_by_id(object_ref.0)? else {
                     return Ok(false);
                 };
+                if object.compute_object_reference() != object_ref {
+                    return Ok(false);
+                }
                 loaded.push(ObjectReadResult::new(kind, object.into()));
             }
             InputObjectKind::SharedMoveObject { id, .. } => {
-                let Some(object) = service.reader.inner().get_object(&id) else {
+                let Some(object) = object_view.get_object_by_id(id)? else {
                     return Ok(false);
                 };
                 loaded.push(ObjectReadResult::new(kind, object.into()));
@@ -893,7 +922,7 @@ fn is_gasless_post_execution_failure(status: &ExecutionStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sui_types::base_types::ObjectID;
+    use sui_types::base_types::{ObjectID, SuiAddress};
     use sui_types::error::UserInputError;
 
     #[test]
@@ -935,5 +964,33 @@ mod tests {
         let status = simulation_error_to_rpc_error(error).into_status_proto();
 
         assert_eq!(status.code, tonic::Code::Internal as i32);
+    }
+
+    #[test]
+    fn gas_candidates_require_the_owner_and_exclude_inputs() {
+        let owner = SuiAddress::random_for_testing_only();
+        let coin = Object::new_gas_with_balance_and_owner_for_testing(42, owner);
+        let coin_ref = coin.compute_object_reference();
+        let mut candidates = BTreeMap::new();
+
+        insert_gas_coin(&mut candidates, coin.clone(), owner, &BTreeSet::new());
+        assert_eq!(candidates.get(&coin.id()), Some(&(coin_ref, 42)));
+
+        candidates.clear();
+        insert_gas_coin(
+            &mut candidates,
+            coin.clone(),
+            owner,
+            &BTreeSet::from([coin.id()]),
+        );
+        assert!(candidates.is_empty());
+
+        insert_gas_coin(
+            &mut candidates,
+            coin,
+            SuiAddress::random_for_testing_only(),
+            &BTreeSet::new(),
+        );
+        assert!(candidates.is_empty());
     }
 }

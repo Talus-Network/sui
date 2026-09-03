@@ -2491,6 +2491,17 @@ impl AuthorityState {
         let suggested_gas_price = self
             .congestion_tracker
             .get_suggested_gas_prices(&transaction);
+        let transaction_is_checkpointed = |digest: &TransactionDigest| {
+            self.get_checkpoint_cache()
+                .deprecated_get_transaction_checkpoint(digest)
+                .is_some()
+        };
+        let causal_view = causal_state.map(|state| {
+            crate::transaction_simulation::CausalSimulationView::new(
+                state,
+                &transaction_is_checkpointed,
+            )
+        });
 
         crate::transaction_simulation::simulate_transaction(
             transaction,
@@ -2512,7 +2523,7 @@ impl AuthorityState {
             &self.config.verifier_signing_config,
             &self.metrics.bytecode_verifier_metrics,
             &self.metrics.execution_metrics,
-            causal_state,
+            causal_view,
         )
     }
 

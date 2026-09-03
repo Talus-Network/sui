@@ -21,6 +21,7 @@
 //! end: when the subscription actor drops a subscriber (lag or backpressure),
 //! the stream simply closes and the client reconnects, backfilling via List.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use mysten_common::ZipDebugEqIteratorExt;
@@ -168,6 +169,7 @@ impl SubscriptionService for RpcService {
             let mut receiver = self.subscribe_causal_finality();
             let response = Box::pin(async_stream::stream! {
                 let mut heartbeat = tokio::time::interval(CAUSAL_STREAM_HEARTBEAT);
+                let mut delivered = HashSet::new();
                 heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
@@ -180,21 +182,32 @@ impl SubscriptionService for RpcService {
                             let digest = match received {
                                 Ok(digest) => digest,
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                    tracing::warn!(skipped, "Causal finality subscriber lagged; checkpoint replay remains authoritative");
-                                    continue;
+                                    yield Err(tonic::Status::unavailable(format!(
+                                        "causal transaction stream skipped {skipped} updates"
+                                    )));
+                                    break;
                                 }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             };
-                            let Some(receipt) = executor.retained_causal_transaction(&digest) else {
-                                continue;
+                            let Some(receipts) = executor.retained_causal_transactions(&digest) else {
+                                yield Err(tonic::Status::unavailable(
+                                    "causal transaction receipt is unavailable"
+                                ));
+                                break;
                             };
-                            let mut response = SubscribeTransactionsResponse::default();
-                            response.transaction = Some(render_causal_transaction(
-                                &service,
-                                receipt,
-                                &read_mask,
-                            ));
-                            yield Ok(response);
+                            for receipt in receipts {
+                                let transaction = *receipt.effects.data().transaction_digest();
+                                if !delivered.insert(transaction) {
+                                    continue;
+                                }
+                                let mut response = SubscribeTransactionsResponse::default();
+                                response.transaction = Some(render_causal_transaction(
+                                    &service,
+                                    receipt,
+                                    &read_mask,
+                                ));
+                                yield Ok(response);
+                            }
                         }
                     }
                 }

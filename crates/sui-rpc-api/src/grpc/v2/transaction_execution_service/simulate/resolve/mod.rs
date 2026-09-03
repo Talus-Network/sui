@@ -40,36 +40,74 @@ mod literal;
 /// Objects changed by the causal chain come from the retained view. Objects
 /// untouched by that chain come from canonical storage. A retained removal
 /// never falls back to an older canonical value.
-struct ResolutionObjectView<'a> {
+pub(super) struct ResolutionObjectView<'a> {
     service: &'a RpcService,
     executor: &'a dyn TransactionExecutor,
     causal_parent: Option<TransactionDigest>,
 }
 
-impl ResolutionObjectView<'_> {
-    fn get_object(&self, object_id: Address) -> Result<sui_types::object::Object> {
+impl<'a> ResolutionObjectView<'a> {
+    pub(super) fn new(
+        service: &'a RpcService,
+        executor: &'a dyn TransactionExecutor,
+        causal_parent: Option<TransactionDigest>,
+    ) -> Self {
+        Self {
+            service,
+            executor,
+            causal_parent,
+        }
+    }
+
+    pub(super) fn get_object_by_id(
+        &self,
+        object_id: ObjectID,
+    ) -> Result<Option<sui_types::object::Object>> {
         if let Some(parent) = self.causal_parent {
-            let object_id_internal: ObjectID = object_id.into();
             let read = self
                 .executor
-                .read_object_at_causal_parent(parent, object_id_internal)
+                .read_object_at_causal_parent(parent, object_id)
                 .map_err(|error| {
                     RpcError::new(tonic::Code::FailedPrecondition, error.to_string())
                 })?;
             match read {
-                CausalObjectRead::Live(object) => return Ok(object),
-                CausalObjectRead::Removed => {
-                    return Err(ObjectNotFoundError::new(object_id).into());
-                }
+                CausalObjectRead::Live(object) => return Ok(Some(object)),
+                CausalObjectRead::Removed => return Ok(None),
                 CausalObjectRead::Unchanged => {}
             }
         }
 
-        self.service
-            .reader
-            .inner()
-            .get_object(&ObjectID::from(object_id))
+        Ok(self.service.reader.inner().get_object(&object_id))
+    }
+
+    fn get_object(&self, object_id: Address) -> Result<sui_types::object::Object> {
+        self.get_object_by_id(object_id.into())?
             .ok_or_else(|| ObjectNotFoundError::new(object_id).into())
+    }
+
+    pub(super) fn owned_objects(
+        &self,
+        owner: sui_types::base_types::SuiAddress,
+    ) -> Result<Vec<sui_types::object::Object>> {
+        let Some(parent) = self.causal_parent else {
+            return Ok(Vec::new());
+        };
+        self.executor
+            .read_owned_objects_at_causal_parent(parent, owner)
+            .map_err(|error| RpcError::new(tonic::Code::FailedPrecondition, error.to_string()))
+    }
+
+    pub(super) fn account_amount(
+        &self,
+        account: sui_types::accumulator_root::AccumulatorObjId,
+        visible_amount: u128,
+    ) -> Result<u128> {
+        let Some(parent) = self.causal_parent else {
+            return Ok(visible_amount);
+        };
+        self.executor
+            .account_amount_at_causal_parent(parent, account, visible_amount)
+            .map_err(|error| RpcError::new(tonic::Code::FailedPrecondition, error.to_string()))
     }
 }
 
@@ -81,11 +119,7 @@ pub fn resolve_transaction(
     reference_gas_price: u64,
     protocol_config: &ProtocolConfig,
 ) -> Result<TransactionData> {
-    let object_view = ResolutionObjectView {
-        service,
-        executor,
-        causal_parent,
-    };
+    let object_view = ResolutionObjectView::new(service, executor, causal_parent);
     let sender = unresolved_transaction.sender().parse().map_err(|e| {
         FieldViolation::new("transaction.sender")
             .with_description(format!("invalid sender: {e}"))

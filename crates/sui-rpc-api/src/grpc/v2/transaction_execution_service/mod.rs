@@ -33,10 +33,16 @@ mod simulate;
 const CAUSAL_PARENT_HEADER: &str = "x-sui-causal-parent";
 const CAUSAL_RECORD_HEADER: &str = "x-sui-causal-record";
 const CAUSAL_APPLIED_HEADER: &str = "x-sui-causal-applied";
+const CAUSAL_RETAINED_HEADER: &str = "x-sui-causal-retained";
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct CausalExecution {
+struct CausalExecution {
     parent: Option<TransactionDigest>,
+}
+
+struct CausalExecutionOutcome {
+    applied: bool,
+    retained: bool,
 }
 
 fn parse_causal_parent(
@@ -64,6 +70,20 @@ fn requests_causal_record(metadata: &tonic::metadata::MetadataMap) -> Result<boo
     }
 }
 
+fn usable_causal_parent(
+    executor: &dyn TransactionExecutor,
+    parent: Option<TransactionDigest>,
+) -> Result<(Option<TransactionDigest>, bool), tonic::Status> {
+    let Some(parent) = parent else {
+        return Ok((None, true));
+    };
+    match executor.causal_parent_is_retained(parent) {
+        Ok(true) => Ok((Some(parent), true)),
+        Ok(false) => Ok((None, false)),
+        Err(error) => Err(tonic::Status::failed_precondition(error.to_string())),
+    }
+}
+
 #[tonic::async_trait]
 impl TransactionExecutionService for RpcService {
     async fn execute_transaction(
@@ -81,10 +101,12 @@ impl TransactionExecutionService for RpcService {
                 "transaction checkpoint waiting is not supported by this node",
             ));
         }
-        let parent = parse_causal_parent(request.metadata())?;
-        let causal = (parent.is_some() || requests_causal_record(request.metadata())?)
-            .then_some(CausalExecution { parent });
-        let response = execute_transaction(
+        let requested_parent = parse_causal_parent(request.metadata())?;
+        let record = requests_causal_record(request.metadata())?;
+        let causal = (requested_parent.is_some() || record).then_some(CausalExecution {
+            parent: requested_parent,
+        });
+        let (response, causal_outcome) = execute_transaction(
             self,
             executor,
             request.into_inner(),
@@ -97,11 +119,23 @@ impl TransactionExecutionService for RpcService {
         if executor.supports_checkpoint_wait() {
             checkpoint_wait::mark_supported(&mut response);
         }
-        if causal.is_some() {
-            response.metadata_mut().insert(
-                CAUSAL_APPLIED_HEADER,
-                tonic::metadata::MetadataValue::from_static("true"),
-            );
+        if let Some(causal_outcome) = causal_outcome {
+            let applied = if causal_outcome.applied {
+                tonic::metadata::MetadataValue::from_static("true")
+            } else {
+                tonic::metadata::MetadataValue::from_static("false")
+            };
+            response
+                .metadata_mut()
+                .insert(CAUSAL_APPLIED_HEADER, applied);
+            let retained = if causal_outcome.retained {
+                tonic::metadata::MetadataValue::from_static("true")
+            } else {
+                tonic::metadata::MetadataValue::from_static("false")
+            };
+            response
+                .metadata_mut()
+                .insert(CAUSAL_RETAINED_HEADER, retained);
         }
         Ok(response)
     }
@@ -111,7 +145,17 @@ impl TransactionExecutionService for RpcService {
         request: tonic::Request<SimulateTransactionRequest>,
     ) -> Result<tonic::Response<SimulateTransactionResponse>, tonic::Status> {
         let service = self.clone();
-        let causal_parent = parse_causal_parent(request.metadata())?;
+        let requested_parent = parse_causal_parent(request.metadata())?;
+        let (causal_parent, applied) = match requested_parent {
+            Some(_) => {
+                let executor = self
+                    .executor
+                    .as_ref()
+                    .ok_or_else(|| tonic::Status::unimplemented("no transaction executor"))?;
+                usable_causal_parent(executor.as_ref(), requested_parent)?
+            }
+            None => (None, true),
+        };
         let request = request.into_inner();
         let response = tokio::task::spawn_blocking(move || {
             simulate::simulate_transaction(&service, request, causal_parent)
@@ -120,11 +164,15 @@ impl TransactionExecutionService for RpcService {
         .map_err(|e| tonic::Status::internal(format!("simulate_transaction task failed: {e}")))?
         .map_err(tonic::Status::from)?;
         let mut response = tonic::Response::new(response);
-        if causal_parent.is_some() {
-            response.metadata_mut().insert(
-                CAUSAL_APPLIED_HEADER,
-                tonic::metadata::MetadataValue::from_static("true"),
-            );
+        if requested_parent.is_some() {
+            let applied = if applied {
+                tonic::metadata::MetadataValue::from_static("true")
+            } else {
+                tonic::metadata::MetadataValue::from_static("false")
+            };
+            response
+                .metadata_mut()
+                .insert(CAUSAL_APPLIED_HEADER, applied);
         }
         Ok(response)
     }
@@ -137,13 +185,13 @@ pub const EXECUTE_TRANSACTION_READ_MASK_DEFAULT: &str =
 const MAX_NUMBER_OF_SIGNATURES: usize = 2;
 
 #[tracing::instrument(skip(service, executor))]
-pub async fn execute_transaction(
+async fn execute_transaction(
     service: &RpcService,
     executor: &std::sync::Arc<dyn TransactionExecutor>,
     request: ExecuteTransactionRequest,
     causal: Option<CausalExecution>,
     wait_for_checkpoint: bool,
-) -> Result<ExecuteTransactionResponse, RpcError> {
+) -> Result<(ExecuteTransactionResponse, Option<CausalExecutionOutcome>), RpcError> {
     let retain_causal_receipt = causal.is_some();
     let transaction = request
         .transaction
@@ -213,6 +261,19 @@ pub async fn execute_transaction(
     };
     let is_consensus_transaction = request.transaction.is_consensus_tx();
 
+    let (driver_response, causal_outcome) = match causal {
+        Some(causal) => {
+            let result = executor
+                .execute_transaction_with_causal_parent(request, None, causal.parent)
+                .await?;
+            let outcome = CausalExecutionOutcome {
+                applied: result.applied,
+                retained: result.retained,
+            };
+            (result.response, Some(outcome))
+        }
+        None => (executor.execute_transaction(request, None).await?, None),
+    };
     let sui_types::transaction_driver_types::ExecuteTransactionResponseV3 {
         effects:
             sui_types::transaction_driver_types::FinalizedEffects {
@@ -223,31 +284,26 @@ pub async fn execute_transaction(
         input_objects,
         output_objects,
         auxiliary_data: _,
-    } = match causal {
-        Some(causal) => {
-            executor
-                .execute_transaction_with_causal_parent(request, None, causal.parent)
-                .await?
-        }
-        None => executor.execute_transaction(request, None).await?,
-    };
+    } = driver_response;
 
     let checkpoint = if wait_for_checkpoint {
         let transaction_digest = *effects.transaction_digest();
-        match executor
-            .wait_for_transaction_checkpoint(transaction_digest, is_consensus_transaction)
-            .await
-        {
-            Ok(checkpoint) => Some(checkpoint),
-            Err(error) => {
-                warn!(
-                    ?transaction_digest,
-                    ?error,
-                    "transaction finalized but its local checkpoint wait failed"
-                );
-                None
-            }
-        }
+        Some(
+            executor
+                .wait_for_transaction_checkpoint(transaction_digest, is_consensus_transaction)
+                .await
+                .map_err(|error| {
+                    warn!(
+                        ?transaction_digest,
+                        ?error,
+                        "Transaction checkpoint wait failed"
+                    );
+                    RpcError::new(
+                        tonic::Code::Unavailable,
+                        format!("transaction checkpoint wait failed: {error}"),
+                    )
+                })?,
+        )
     } else {
         None
     };
@@ -290,10 +346,12 @@ pub async fn execute_transaction(
         message.digest = read_mask
             .contains(ExecutedTransaction::DIGEST_FIELD)
             .then(|| transaction.digest().to_string());
-        message.checkpoint = read_mask
-            .contains(ExecutedTransaction::CHECKPOINT_FIELD)
-            .then_some(checkpoint)
-            .flatten();
+        message.checkpoint =
+            if wait_for_checkpoint || read_mask.contains(ExecutedTransaction::CHECKPOINT_FIELD) {
+                checkpoint
+            } else {
+                None
+            };
         message.transaction = read_mask
             .subtree(ExecutedTransaction::TRANSACTION_FIELD)
             .map(|mask| Transaction::merge_from(transaction, &mask));
@@ -327,16 +385,57 @@ pub async fn execute_transaction(
         message
     };
 
-    if retain_causal_receipt {
+    if causal_outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.retained)
+    {
         service.publish_causal_finality(*effects.transaction_digest());
     }
 
-    Ok(ExecuteTransactionResponse::default().with_transaction(executed_transaction))
+    Ok((
+        ExecuteTransactionResponse::default().with_transaction(executed_transaction),
+        causal_outcome,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ParentStatus(bool);
+
+    #[async_trait::async_trait]
+    impl TransactionExecutor for ParentStatus {
+        async fn execute_transaction(
+            &self,
+            _request: sui_types::transaction_driver_types::ExecuteTransactionRequestV3,
+            _client_addr: Option<std::net::SocketAddr>,
+        ) -> Result<
+            sui_types::transaction_driver_types::ExecuteTransactionResponseV3,
+            sui_types::transaction_driver_types::TransactionSubmissionError,
+        > {
+            unreachable!()
+        }
+
+        fn causal_parent_is_retained(
+            &self,
+            _causal_parent: TransactionDigest,
+        ) -> Result<bool, sui_types::error::SuiError> {
+            Ok(self.0)
+        }
+
+        fn simulate_transaction(
+            &self,
+            _transaction: sui_types::transaction::TransactionData,
+            _checks: sui_types::transaction_executor::TransactionChecks,
+            _allow_mock_gas_coin: bool,
+        ) -> Result<
+            sui_types::transaction_executor::SimulateTransactionResult,
+            sui_types::error::SuiError,
+        > {
+            unreachable!()
+        }
+    }
 
     #[test]
     fn causal_parent_metadata_requires_a_transaction_digest() {
@@ -364,6 +463,19 @@ mod tests {
         assert_eq!(
             requests_causal_record(&metadata).unwrap_err().code(),
             tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn checkpointed_parent_uses_canonical_state() {
+        let parent = TransactionDigest::random();
+        assert_eq!(
+            usable_causal_parent(&ParentStatus(true), Some(parent)).unwrap(),
+            (Some(parent), true)
+        );
+        assert_eq!(
+            usable_causal_parent(&ParentStatus(false), Some(parent)).unwrap(),
+            (None, false)
         );
     }
 }

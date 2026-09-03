@@ -11,7 +11,7 @@ use std::{
 use parking_lot::{Mutex, MutexGuard};
 use sui_types::{
     accumulator_root::AccumulatorObjId,
-    base_types::{EpochId, ObjectID, ObjectRef, SequenceNumber, TransactionDigest},
+    base_types::{EpochId, ObjectID, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest},
     effects::{AccumulatorOperation, AccumulatorValue, AccumulatorWriteV1, TransactionEffectsAPI},
     error::{SuiError, SuiErrorKind, SuiResult},
     object::{Object, Owner},
@@ -51,6 +51,18 @@ pub(crate) struct CausalState {
 }
 
 impl CausalState {
+    fn flattened_objects(&self) -> BTreeMap<ObjectID, CausalObject> {
+        let mut objects = BTreeMap::new();
+        let mut state = Some(self);
+        while let Some(current) = state {
+            for (id, object) in &current.objects {
+                objects.entry(*id).or_insert_with(|| object.clone());
+            }
+            state = current.parent.as_deref();
+        }
+        objects
+    }
+
     pub(crate) fn object(&self, id: &ObjectID) -> Option<&CausalObject> {
         let mut state = Some(self);
         while let Some(current) = state {
@@ -74,21 +86,40 @@ impl CausalState {
         self.object_count
     }
 
-    /// Reconstruct the verified receipt and complete retained object view.
-    ///
-    /// The object set is the flattened causal view rather than only this
-    /// transaction's writes. A subscriber can therefore recover an exact
-    /// application snapshot without observing every ancestor receipt.
-    pub(crate) fn receipt(&self) -> ExecuteTransactionResponseV3 {
-        let mut objects = BTreeMap::new();
+    pub(crate) fn can_accept_child(&self, epoch: EpochId) -> bool {
+        self.epoch == epoch && self.depth < MAX_CAUSAL_DEPTH
+    }
+
+    fn contains_transaction(&self, transaction: &TransactionDigest) -> bool {
         let mut state = Some(self);
         while let Some(current) = state {
-            for (id, object) in &current.objects {
-                objects.entry(*id).or_insert_with(|| object.clone());
+            if &current.transaction == transaction {
+                return true;
             }
             state = current.parent.as_deref();
         }
-        let output_objects = objects
+        false
+    }
+
+    pub(crate) fn owned_objects(&self, owner: SuiAddress) -> Vec<Object> {
+        self.flattened_objects()
+            .into_values()
+            .filter_map(|object| match object {
+                CausalObject::Live(object) if object.owner() == &Owner::AddressOwner(owner) => {
+                    Some(object)
+                }
+                CausalObject::Live(_) | CausalObject::Removed(_) => None,
+            })
+            .collect()
+    }
+
+    /// Reconstruct the verified receipt and complete live object view.
+    ///
+    /// Ancestor receipts are replayed separately so their effects preserve
+    /// every removal.
+    pub(crate) fn receipt(&self) -> ExecuteTransactionResponseV3 {
+        let output_objects = self
+            .flattened_objects()
             .into_values()
             .filter_map(|object| match object {
                 CausalObject::Live(object) => Some(object),
@@ -104,52 +135,45 @@ impl CausalState {
         }
     }
 
-    /// Return a balance that never exceeds the amount available after this view.
-    ///
-    /// Checkpoint state may already contain some retained withdrawals, so this
-    /// calculation can subtract them twice. That is intentionally conservative.
-    /// Deposits are ignored because relying on an unsettled deposit could allow a
-    /// simulation that validators reject.
-    pub(crate) fn conservative_account_amount(
+    pub(crate) fn receipts(&self) -> Vec<ExecuteTransactionResponseV3> {
+        let mut states = Vec::with_capacity(self.depth as usize);
+        let mut state = Some(self);
+        while let Some(current) = state {
+            states.push(current);
+            state = current.parent.as_deref();
+        }
+        states.into_iter().rev().map(CausalState::receipt).collect()
+    }
+
+    pub(crate) fn account_amount(
         &self,
         account: &AccumulatorObjId,
         visible_amount: u128,
-    ) -> SuiResult<u128> {
-        let mut withdrawn = 0u128;
+        is_visible: impl Fn(&TransactionDigest) -> bool,
+    ) -> Option<u128> {
+        let mut states = Vec::with_capacity(self.depth as usize);
         let mut state = Some(self);
         while let Some(current) = state {
-            if let Some(update) = current.accumulator_updates.get(account) {
-                match (&update.operation, &update.value) {
-                    (AccumulatorOperation::Split, AccumulatorValue::Integer(amount)) => {
-                        withdrawn = withdrawn.checked_add(*amount as u128).ok_or_else(|| {
-                            SuiError::from("causal address balance withdrawal overflow")
-                        })?;
-                    }
-                    (AccumulatorOperation::Merge, AccumulatorValue::Integer(_)) => {}
-                    _ => {
-                        return Err(SuiErrorKind::UnsupportedFeatureError {
-                            error: format!(
-                                "causal simulation cannot represent accumulator update for {account}"
-                            ),
-                        }
-                        .into());
-                    }
-                }
-            }
+            states.push(current);
             state = current.parent.as_deref();
         }
-        Ok(visible_amount.saturating_sub(withdrawn))
-    }
 
-    pub(crate) fn has_account_update(&self, account: &AccumulatorObjId) -> bool {
-        let mut state = Some(self);
-        while let Some(current) = state {
-            if current.accumulator_updates.contains_key(account) {
-                return true;
-            }
-            state = current.parent.as_deref();
-        }
-        false
+        states
+            .into_iter()
+            .rev()
+            .filter(|state| !is_visible(&state.transaction))
+            .filter_map(|state| state.accumulator_updates.get(account))
+            .try_fold(visible_amount, |amount, update| {
+                match (&update.operation, &update.value) {
+                    (AccumulatorOperation::Merge, AccumulatorValue::Integer(value)) => {
+                        amount.checked_add(*value as u128)
+                    }
+                    (AccumulatorOperation::Split, AccumulatorValue::Integer(value)) => {
+                        amount.checked_sub(*value as u128)
+                    }
+                    _ => None,
+                }
+            })
     }
 }
 
@@ -295,14 +319,14 @@ impl CausalStateCache {
     pub(crate) fn pin(&self, transaction: TransactionDigest) -> Option<CausalStatePin<'_>> {
         let mut cache = self.lock();
         let access = cache.next_access();
-        let (was_leaf, previous_access) = {
+        let (was_leaf, previous_access, state) = {
             let entry = cache.states.get_mut(&transaction)?;
             let pins = entry.pins.checked_add(1)?;
             let was_leaf = entry.children == 0 && entry.pins == 0;
             let previous_access = entry.last_access;
             entry.pins = pins;
             entry.last_access = access;
-            (was_leaf, previous_access)
+            (was_leaf, previous_access, Arc::clone(&entry.state))
         };
         if was_leaf {
             cache.leaves.remove(&(previous_access, transaction));
@@ -310,6 +334,7 @@ impl CausalStateCache {
         Some(CausalStatePin {
             cache: self,
             transaction,
+            state,
         })
     }
 
@@ -352,6 +377,7 @@ impl CausalStateCache {
         &self,
         causal_parent: Option<TransactionDigest>,
         response: &ExecuteTransactionResponseV3,
+        visible_dependencies: &BTreeSet<TransactionDigest>,
     ) -> SuiResult<bool> {
         let effects = response.effects.data();
         let epoch = response.effects.epoch();
@@ -459,6 +485,35 @@ impl CausalStateCache {
             },
             None => None,
         };
+        if effects.dependencies().iter().any(|dependency| {
+            !visible_dependencies.contains(dependency)
+                && !parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.contains_transaction(dependency))
+        }) {
+            return Ok(false);
+        }
+        if let Some(parent) = &parent {
+            let input_objects = response.input_objects.as_deref().ok_or_else(|| {
+                SuiError::from(format!(
+                    "causal state for transaction {} has no input objects",
+                    effects.transaction_digest()
+                ))
+            })?;
+            let inputs_match = input_objects
+                .iter()
+                .all(|input| match parent.object(&input.id()) {
+                    Some(CausalObject::Live(object)) => {
+                        object.compute_object_reference() == input.compute_object_reference()
+                    }
+                    Some(CausalObject::Removed(_)) => false,
+                    None => true,
+                });
+            if !inputs_match {
+                return Ok(false);
+            }
+        }
+        let depth = parent.as_ref().map_or(1, |parent| parent.depth + 1);
         let object_count = parent.as_ref().map_or(objects.len(), |parent| {
             parent.object_count
                 + objects
@@ -471,9 +526,7 @@ impl CausalStateCache {
             transaction,
             causal_parent,
             parent,
-            depth: causal_parent
-                .and_then(|digest| cache.states.get(&digest))
-                .map_or(1, |parent| parent.state.depth + 1),
+            depth,
             effects: response.effects.clone(),
             events: response.events.clone(),
             objects,
@@ -520,6 +573,13 @@ impl CausalStateCache {
 pub(crate) struct CausalStatePin<'a> {
     cache: &'a CausalStateCache,
     transaction: TransactionDigest,
+    state: Arc<CausalState>,
+}
+
+impl CausalStatePin<'_> {
+    pub(crate) fn state(&self) -> &CausalState {
+        &self.state
+    }
 }
 
 impl Drop for CausalStatePin<'_> {
@@ -667,10 +727,21 @@ mod tests {
         removed: Vec<ObjectRef>,
         accumulator_updates: Vec<(ObjectID, AccumulatorWriteV1)>,
     ) -> ExecuteTransactionResponseV3 {
+        response_with_dependencies(epoch, outputs, removed, accumulator_updates, Vec::new())
+    }
+
+    fn response_with_dependencies(
+        epoch: EpochId,
+        outputs: Vec<Object>,
+        removed: Vec<ObjectRef>,
+        accumulator_updates: Vec<(ObjectID, AccumulatorWriteV1)>,
+        dependencies: Vec<TransactionDigest>,
+    ) -> ExecuteTransactionResponseV3 {
         let transaction = TransactionDigest::random();
         let lamport_version = outputs
             .iter()
             .map(|object| object.version())
+            .chain(removed.iter().map(|object_ref| object_ref.1.next()))
             .max()
             .unwrap_or_else(|| SequenceNumber::from_u64(1));
         let mut changes = BTreeMap::new();
@@ -707,7 +778,7 @@ mod tests {
             changes,
             None,
             None,
-            Vec::new(),
+            dependencies,
         );
         ExecuteTransactionResponseV3 {
             effects: FinalizedEffects {
@@ -715,7 +786,7 @@ mod tests {
                 finality_info: EffectsFinalityInfo::QuorumExecuted(epoch),
             },
             events: None,
-            input_objects: None,
+            input_objects: Some(Vec::new()),
             output_objects: Some(outputs),
             auxiliary_data: None,
         }
@@ -733,12 +804,12 @@ mod tests {
         let output = object(ObjectID::from_single_byte(1), 2, address(1));
         let mut missing = response(7, vec![output.clone()], Vec::new(), Vec::new());
         missing.output_objects = None;
-        assert!(cache.record(None, &missing).is_err());
+        assert!(cache.record(None, &missing, &BTreeSet::new()).is_err());
 
         let mut mismatched = response(7, vec![output], Vec::new(), Vec::new());
         mismatched.output_objects =
             Some(vec![object(ObjectID::from_single_byte(1), 2, address(2))]);
-        assert!(cache.record(None, &mismatched).is_err());
+        assert!(cache.record(None, &mismatched, &BTreeSet::new()).is_err());
     }
 
     #[test]
@@ -747,7 +818,11 @@ mod tests {
         let first = object(ObjectID::from_single_byte(1), 2, address(1));
         let first_response = response(7, vec![first.clone()], Vec::new(), Vec::new());
         let first_digest = *first_response.effects.data().transaction_digest();
-        assert!(cache.record(None, &first_response).unwrap());
+        assert!(
+            cache
+                .record(None, &first_response, &BTreeSet::new())
+                .unwrap()
+        );
 
         let second = object(ObjectID::from_single_byte(2), 3, address(1));
         let removed = object(ObjectID::from_single_byte(3), 1, address(1));
@@ -758,7 +833,11 @@ mod tests {
             Vec::new(),
         );
         let second_digest = *second_response.effects.data().transaction_digest();
-        assert!(cache.record(Some(first_digest), &second_response).unwrap());
+        assert!(
+            cache
+                .record(Some(first_digest), &second_response, &BTreeSet::new())
+                .unwrap()
+        );
 
         let state = cache.get(&second_digest).unwrap();
         assert!(!state.objects.contains_key(&first.id()));
@@ -784,17 +863,114 @@ mod tests {
     }
 
     #[test]
+    fn parent_must_cover_every_dependency_missing_from_canonical_state() {
+        let cache = CausalStateCache::new();
+        let first = response(7, Vec::new(), Vec::new(), Vec::new());
+        let first_digest = *first.effects.data().transaction_digest();
+        assert!(cache.record(None, &first, &BTreeSet::new()).unwrap());
+
+        let other = response(7, Vec::new(), Vec::new(), Vec::new());
+        let other_digest = *other.effects.data().transaction_digest();
+        assert!(cache.record(None, &other, &BTreeSet::new()).unwrap());
+
+        let child =
+            response_with_dependencies(7, Vec::new(), Vec::new(), Vec::new(), vec![first_digest]);
+        assert!(
+            !cache
+                .record(Some(other_digest), &child, &BTreeSet::new())
+                .unwrap()
+        );
+        assert!(
+            cache
+                .record(Some(first_digest), &child, &BTreeSet::new())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_dependencies_do_not_require_a_retained_parent() {
+        let cache = CausalStateCache::new();
+        let dependency = TransactionDigest::random();
+        let receipt =
+            response_with_dependencies(7, Vec::new(), Vec::new(), Vec::new(), vec![dependency]);
+
+        assert!(
+            cache
+                .record(None, &receipt, &BTreeSet::from([dependency]))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn child_inputs_must_match_the_selected_parent_view() {
+        let cache = CausalStateCache::new();
+        let id = ObjectID::from_single_byte(4);
+        let current = object(id, 2, address(1));
+        let parent = response(7, vec![current], Vec::new(), Vec::new());
+        let parent_digest = *parent.effects.data().transaction_digest();
+        assert!(cache.record(None, &parent, &BTreeSet::new()).unwrap());
+
+        let mut child = response(7, Vec::new(), Vec::new(), Vec::new());
+        child.input_objects = Some(vec![object(id, 1, address(1))]);
+        assert!(
+            !cache
+                .record(Some(parent_digest), &child, &BTreeSet::new())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn receipt_replay_preserves_ancestor_removals() {
+        let cache = CausalStateCache::new();
+        let removed = object(ObjectID::from_single_byte(5), 1, address(1));
+        let parent = response(
+            7,
+            Vec::new(),
+            vec![removed.compute_object_reference()],
+            Vec::new(),
+        );
+        let parent_digest = *parent.effects.data().transaction_digest();
+        assert!(cache.record(None, &parent, &BTreeSet::new()).unwrap());
+
+        let child = response(7, Vec::new(), Vec::new(), Vec::new());
+        let child_digest = *child.effects.data().transaction_digest();
+        assert!(
+            cache
+                .record(Some(parent_digest), &child, &BTreeSet::new())
+                .unwrap()
+        );
+
+        let receipts = cache.get(&child_digest).unwrap().receipts();
+        assert_eq!(receipts.len(), 2);
+        let deleted = receipts[0].effects.data().deleted();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].0, removed.id());
+        assert_eq!(
+            receipts[1].effects.data().transaction_digest(),
+            &child_digest
+        );
+    }
+
+    #[test]
     fn retained_receipt_contains_the_flattened_live_view() {
         let cache = CausalStateCache::new();
         let first = object(ObjectID::from_single_byte(1), 2, address(1));
         let first_response = response(7, vec![first.clone()], Vec::new(), Vec::new());
         let first_digest = *first_response.effects.data().transaction_digest();
-        assert!(cache.record(None, &first_response).unwrap());
+        assert!(
+            cache
+                .record(None, &first_response, &BTreeSet::new())
+                .unwrap()
+        );
 
         let second = object(ObjectID::from_single_byte(2), 3, address(1));
         let second_response = response(7, vec![second.clone()], Vec::new(), Vec::new());
         let second_digest = *second_response.effects.data().transaction_digest();
-        assert!(cache.record(Some(first_digest), &second_response).unwrap());
+        assert!(
+            cache
+                .record(Some(first_digest), &second_response, &BTreeSet::new())
+                .unwrap()
+        );
 
         let receipt = cache.get(&second_digest).unwrap().receipt();
         assert_eq!(receipt.effects.data().transaction_digest(), &second_digest);
@@ -812,6 +988,41 @@ mod tests {
     }
 
     #[test]
+    fn owned_objects_use_the_latest_causal_owner() {
+        let cache = CausalStateCache::new();
+        let first_owner = address(1);
+        let second_owner = address(2);
+        let mut transferred = object(ObjectID::from_single_byte(6), 2, first_owner);
+        let parent = response(7, vec![transferred.clone()], Vec::new(), Vec::new());
+        let parent_digest = *parent.effects.data().transaction_digest();
+        assert!(cache.record(None, &parent, &BTreeSet::new()).unwrap());
+
+        transferred.owner = Owner::AddressOwner(second_owner);
+        transferred
+            .data
+            .try_as_move_mut()
+            .unwrap()
+            .increment_version_to(SequenceNumber::from_u64(3));
+        let created = object(ObjectID::from_single_byte(7), 3, first_owner);
+        let child = response(
+            7,
+            vec![transferred.clone(), created.clone()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let child_digest = *child.effects.data().transaction_digest();
+        assert!(
+            cache
+                .record(Some(parent_digest), &child, &BTreeSet::new())
+                .unwrap()
+        );
+
+        let state = cache.get(&child_digest).unwrap();
+        assert_eq!(state.owned_objects(first_owner), vec![created]);
+        assert_eq!(state.owned_objects(second_owner), vec![transferred]);
+    }
+
+    #[test]
     fn each_state_accounts_for_only_its_own_delta() {
         let cache = CausalStateCache::new();
         let mut parent = None;
@@ -824,7 +1035,7 @@ mod tests {
             );
             let receipt = response(7, vec![output], Vec::new(), Vec::new());
             let digest = *receipt.effects.data().transaction_digest();
-            assert!(cache.record(parent, &receipt).unwrap());
+            assert!(cache.record(parent, &receipt, &BTreeSet::new()).unwrap());
             parent = Some(digest);
             last = cache.get(&digest);
         }
@@ -833,6 +1044,23 @@ mod tests {
         assert_eq!(last.objects.len(), 1);
         assert_eq!(last.object_count(), 8);
         assert_eq!(cache.stats().weight_bytes, 8 * MIN_CAUSAL_STATE_WEIGHT);
+    }
+
+    #[test]
+    fn depth_limit_is_visible_before_child_execution() {
+        let cache = CausalStateCache::new();
+        let mut parent = None;
+        let mut last = None;
+        for _ in 0..MAX_CAUSAL_DEPTH {
+            let receipt = response(7, Vec::new(), Vec::new(), Vec::new());
+            let digest = *receipt.effects.data().transaction_digest();
+            assert!(cache.record(parent, &receipt, &BTreeSet::new()).unwrap());
+            parent = Some(digest);
+            last = Some(digest);
+        }
+
+        let pin = cache.pin(last.unwrap()).unwrap();
+        assert!(!pin.state().can_accept_child(7));
     }
 
     #[test]
@@ -851,7 +1079,7 @@ mod tests {
                 Vec::new(),
             );
             let digest = *receipt.effects.data().transaction_digest();
-            assert!(cache.record(None, &receipt).unwrap());
+            assert!(cache.record(None, &receipt, &BTreeSet::new()).unwrap());
             digests.push(digest);
         }
 
@@ -868,7 +1096,7 @@ mod tests {
         let cache = CausalStateCache::new();
         let receipt = response(7, Vec::new(), Vec::new(), Vec::new());
         let digest = *receipt.effects.data().transaction_digest();
-        assert!(cache.record(None, &receipt).unwrap());
+        assert!(cache.record(None, &receipt, &BTreeSet::new()).unwrap());
         for _ in 0..1_000 {
             assert!(cache.get(&digest).is_some());
         }
@@ -883,19 +1111,19 @@ mod tests {
         let cache = CausalStateCache::with_capacity(2 * MIN_CAUSAL_STATE_WEIGHT);
         let parent = response(7, Vec::new(), Vec::new(), Vec::new());
         let parent_digest = *parent.effects.data().transaction_digest();
-        assert!(cache.record(None, &parent).unwrap());
+        assert!(cache.record(None, &parent, &BTreeSet::new()).unwrap());
 
         let pin = cache.pin(parent_digest).unwrap();
         for _ in 0..2 {
             let receipt = response(7, Vec::new(), Vec::new(), Vec::new());
-            assert!(cache.record(None, &receipt).unwrap());
+            assert!(cache.record(None, &receipt, &BTreeSet::new()).unwrap());
         }
         assert!(cache.lock().states.contains_key(&parent_digest));
         assert_eq!(cache.stats().weight_bytes, 2 * MIN_CAUSAL_STATE_WEIGHT);
 
         drop(pin);
         let receipt = response(7, Vec::new(), Vec::new(), Vec::new());
-        assert!(cache.record(None, &receipt).unwrap());
+        assert!(cache.record(None, &receipt, &BTreeSet::new()).unwrap());
         assert!(cache.get(&parent_digest).is_none());
         assert_eq!(cache.stats().weight_bytes, 2 * MIN_CAUSAL_STATE_WEIGHT);
     }
@@ -906,7 +1134,11 @@ mod tests {
         let parent = TransactionDigest::random();
         let receipt = response(7, Vec::new(), Vec::new(), Vec::new());
 
-        assert!(!cache.record(Some(parent), &receipt).unwrap());
+        assert!(
+            !cache
+                .record(Some(parent), &receipt, &BTreeSet::new())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -914,16 +1146,28 @@ mod tests {
         let cache = CausalStateCache::new();
         let first_parent = response(7, Vec::new(), Vec::new(), Vec::new());
         let first_parent_digest = *first_parent.effects.data().transaction_digest();
-        assert!(cache.record(None, &first_parent).unwrap());
+        assert!(cache.record(None, &first_parent, &BTreeSet::new()).unwrap());
 
         let second_parent = response(7, Vec::new(), Vec::new(), Vec::new());
         let second_parent_digest = *second_parent.effects.data().transaction_digest();
-        assert!(cache.record(None, &second_parent).unwrap());
+        assert!(
+            cache
+                .record(None, &second_parent, &BTreeSet::new())
+                .unwrap()
+        );
 
         let child = response(7, Vec::new(), Vec::new(), Vec::new());
         let child_digest = *child.effects.data().transaction_digest();
-        assert!(cache.record(Some(first_parent_digest), &child).unwrap());
-        assert!(!cache.record(Some(second_parent_digest), &child).unwrap());
+        assert!(
+            cache
+                .record(Some(first_parent_digest), &child, &BTreeSet::new())
+                .unwrap()
+        );
+        assert!(
+            !cache
+                .record(Some(second_parent_digest), &child, &BTreeSet::new())
+                .unwrap()
+        );
         assert_eq!(
             cache.get(&child_digest).unwrap().causal_parent,
             Some(first_parent_digest)
@@ -931,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn causal_balance_is_a_conservative_bound() {
+    fn causal_balance_applies_only_changes_missing_from_canonical_state() {
         let cache = CausalStateCache::new();
         let account = AccumulatorObjId::new_unchecked(ObjectID::from_single_byte(9));
         let address = AccumulatorAddress::new(SuiAddress::ZERO, sui_types::TypeTag::U64);
@@ -947,7 +1191,11 @@ mod tests {
             vec![(*account.inner(), withdrawal)],
         );
         let first_digest = *first_response.effects.data().transaction_digest();
-        assert!(cache.record(None, &first_response).unwrap());
+        assert!(
+            cache
+                .record(None, &first_response, &BTreeSet::new())
+                .unwrap()
+        );
 
         let deposit = AccumulatorWriteV1 {
             address,
@@ -957,14 +1205,24 @@ mod tests {
         let second_response =
             response(7, Vec::new(), Vec::new(), vec![(*account.inner(), deposit)]);
         let second_digest = *second_response.effects.data().transaction_digest();
-        assert!(cache.record(Some(first_digest), &second_response).unwrap());
+        assert!(
+            cache
+                .record(Some(first_digest), &second_response, &BTreeSet::new())
+                .unwrap()
+        );
 
         let state = cache.get(&second_digest).unwrap();
-        assert!(state.has_account_update(&account));
+        assert_eq!(state.account_amount(&account, 100, |_| false), Some(170));
+        assert_eq!(state.account_amount(&account, 20, |_| false), None);
         assert_eq!(
-            state.conservative_account_amount(&account, 100).unwrap(),
-            70
+            state.account_amount(&account, 70, |digest| digest == &first_digest),
+            Some(170)
         );
-        assert_eq!(state.conservative_account_amount(&account, 70).unwrap(), 40);
+        assert_eq!(
+            state.account_amount(&account, 170, |digest| {
+                digest == &first_digest || digest == &second_digest
+            }),
+            Some(170)
+        );
     }
 }
