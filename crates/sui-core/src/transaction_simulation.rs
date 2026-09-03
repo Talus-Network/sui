@@ -41,6 +41,7 @@ use crate::{
         transaction_rewriting::rewrite_transaction_for_coin_reservations,
     },
     authority::{DEV_INSPECT_GAS_COIN_VALUE, pre_object_load_checks},
+    causal_state::{CausalBackingStore, CausalState},
     transaction_outputs::unchanged_loaded_runtime_objects,
 };
 
@@ -53,7 +54,73 @@ pub trait SimulationInputLoader {
         input_object_kinds: &[InputObjectKind],
         receiving_object_refs: &[ObjectRef],
         epoch_id: EpochId,
+        causal_view: Option<&CausalSimulationView<'_>>,
     ) -> SuiResult<(InputObjects, ReceivingObjects)>;
+}
+
+struct CausalAccountFundsRead<'a> {
+    state: &'a CausalState,
+    backing: &'a dyn AccountFundsRead,
+    is_visible: &'a (dyn Fn(&TransactionDigest) -> bool + Sync),
+}
+
+pub struct CausalSimulationView<'a> {
+    state: &'a CausalState,
+    transaction_is_checkpointed: &'a (dyn Fn(&TransactionDigest) -> bool + Sync),
+}
+
+impl<'a> CausalSimulationView<'a> {
+    pub(crate) fn new(
+        state: &'a CausalState,
+        transaction_is_checkpointed: &'a (dyn Fn(&TransactionDigest) -> bool + Sync),
+    ) -> Self {
+        Self {
+            state,
+            transaction_is_checkpointed,
+        }
+    }
+
+    pub(crate) fn state(&self) -> &CausalState {
+        self.state
+    }
+}
+
+impl AccountFundsRead for CausalAccountFundsRead<'_> {
+    fn get_latest_account_amount(
+        &self,
+        account: &sui_types::accumulator_root::AccumulatorObjId,
+    ) -> u128 {
+        self.state
+            .account_amount(
+                account,
+                self.backing.get_latest_account_amount(account),
+                self.is_visible,
+            )
+            .unwrap_or_default()
+    }
+
+    fn get_consistent_latest_account_amount_and_version(
+        &self,
+        account: &sui_types::accumulator_root::AccumulatorObjId,
+    ) -> (u128, sui_types::base_types::SequenceNumber) {
+        let (amount, version) = self
+            .backing
+            .get_consistent_latest_account_amount_and_version(account);
+        (
+            self.state
+                .account_amount(account, amount, self.is_visible)
+                .unwrap_or_default(),
+            version,
+        )
+    }
+
+    fn get_account_amount_at_version(
+        &self,
+        account: &sui_types::accumulator_root::AccumulatorObjId,
+        version: sui_types::base_types::SequenceNumber,
+    ) -> u128 {
+        self.backing.get_account_amount_at_version(account, version)
+    }
 }
 
 /// Simulate a transaction without committing its outputs.
@@ -73,12 +140,14 @@ pub fn simulate_transaction(
     backing_package_store: &(dyn BackingPackageStore + Send + Sync),
     executor: &(dyn Executor + Send + Sync),
     coin_reservation_resolver: &dyn CoinReservationResolverTrait,
-    account_funds_read: &dyn AccountFundsRead,
+    canonical_account_funds: &dyn AccountFundsRead,
     verifier_signing_config: &VerifierSigningConfig,
     bytecode_verifier_metrics: &Arc<BytecodeVerifierMetrics>,
     execution_metrics: &Arc<ExecutionMetrics>,
+    causal_view: Option<CausalSimulationView<'_>>,
 ) -> SuiResult<SimulateTransactionResult> {
     let dev_inspect = checks.disabled();
+    let causal_state = causal_view.as_ref().map(|view| view.state);
 
     // Reject coin reservations in gas payment when the execution engine
     // doesn't support them.
@@ -130,6 +199,15 @@ pub fn simulate_transaction(
     // Full validity check including gas budget and price.
     transaction.validity_check(&validity_check_context)?;
 
+    let causal_account_funds = causal_view.as_ref().map(|view| CausalAccountFundsRead {
+        state: view.state,
+        backing: canonical_account_funds,
+        is_visible: view.transaction_is_checkpointed,
+    });
+    let account_funds_read: &dyn AccountFundsRead = match &causal_account_funds {
+        Some(funds) => funds,
+        None => canonical_account_funds,
+    };
     let declared_withdrawals = pre_object_load_checks(
         &transaction,
         &[],
@@ -150,6 +228,7 @@ pub fn simulate_transaction(
         &input_object_kinds,
         &receiving_object_refs,
         validity_check_context.epoch,
+        causal_view.as_ref(),
     )?;
 
     // Add mock gas to input objects after loading (it doesn't exist in the store).
@@ -200,7 +279,13 @@ pub fn simulate_transaction(
         Some(errors) => ExecutionOrEarlyError::failed(errors, None),
     };
 
-    let tracking_store = TrackingBackingStore::new(backing_store);
+    let causal_backing_store =
+        causal_state.map(|state| CausalBackingStore::new(state, backing_store));
+    let simulation_store: &(dyn BackingStore + Send + Sync) = match &causal_backing_store {
+        Some(store) => store,
+        None => backing_store,
+    };
+    let tracking_store = TrackingBackingStore::new(simulation_store);
 
     // Clone inputs for potential retry if object funds check fails post-execution.
     let cloned_input_objects = checked_input_objects.clone();

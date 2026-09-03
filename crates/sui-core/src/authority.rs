@@ -9,6 +9,7 @@ use crate::accumulators::object_funds_checker::metrics::ObjectFundsCheckerMetric
 use crate::accumulators::transaction_rewriting::rewrite_transaction_for_coin_reservations;
 use crate::accumulators::unsettled_object_withdrawals::UnsettledObjectWithdrawals;
 use crate::accumulators::{self, AccumulatorSettlementTxBuilder};
+use crate::causal_state::CausalState;
 use crate::checkpoints::CheckpointBuilderError;
 use crate::checkpoints::CheckpointBuilderResult;
 use crate::congestion_tracker::CongestionTracker;
@@ -2428,17 +2429,49 @@ impl AuthorityState {
         checks: TransactionChecks,
         allow_mock_gas_coin: bool,
     ) -> SuiResult<SimulateTransactionResult> {
+        self.simulate_transaction_impl(transaction, checks, allow_mock_gas_coin, None)
+    }
+
+    pub(crate) fn simulate_transaction_with_causal_state(
+        &self,
+        transaction: TransactionData,
+        checks: TransactionChecks,
+        allow_mock_gas_coin: bool,
+        causal_state: &CausalState,
+    ) -> SuiResult<SimulateTransactionResult> {
+        self.simulate_transaction_impl(transaction, checks, allow_mock_gas_coin, Some(causal_state))
+    }
+
+    fn simulate_transaction_impl(
+        &self,
+        transaction: TransactionData,
+        checks: TransactionChecks,
+        allow_mock_gas_coin: bool,
+        causal_state: Option<&CausalState>,
+    ) -> SuiResult<SimulateTransactionResult> {
         if transaction.kind().is_system_tx() {
             return Err(SuiErrorKind::UnsupportedFeatureError {
                 error: "simulate does not support system transactions".to_string(),
             }
             .into());
         }
-
         let epoch_store = self.load_epoch_store_one_call_per_task();
         if !self.is_fullnode(&epoch_store) {
             return Err(SuiErrorKind::UnsupportedFeatureError {
                 error: "simulate is only supported on fullnodes".to_string(),
+            }
+            .into());
+        }
+        if let Some(state) = causal_state
+            && state.epoch() != epoch_store.epoch()
+        {
+            return Err(SuiErrorKind::UnsupportedFeatureError {
+                error: format!(
+                    "causal parent {} belongs to epoch {}, current epoch is {}",
+                    state.transaction(),
+                    state.epoch(),
+                    epoch_store.epoch(),
+                ),
             }
             .into());
         }
@@ -2458,6 +2491,17 @@ impl AuthorityState {
         let suggested_gas_price = self
             .congestion_tracker
             .get_suggested_gas_prices(&transaction);
+        let transaction_is_checkpointed = |digest: &TransactionDigest| {
+            self.get_checkpoint_cache()
+                .deprecated_get_transaction_checkpoint(digest)
+                .is_some()
+        };
+        let causal_view = causal_state.map(|state| {
+            crate::transaction_simulation::CausalSimulationView::new(
+                state,
+                &transaction_is_checkpointed,
+            )
+        });
 
         crate::transaction_simulation::simulate_transaction(
             transaction,
@@ -2479,6 +2523,7 @@ impl AuthorityState {
             &self.config.verifier_signing_config,
             &self.metrics.bytecode_verifier_metrics,
             &self.metrics.execution_metrics,
+            causal_view,
         )
     }
 

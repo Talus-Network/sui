@@ -5,8 +5,9 @@ use crate::{
     authority::{
         authority_per_epoch_store::CertLockGuard, shared_object_version_manager::AssignedVersions,
     },
+    causal_state::{CausalObject, CausalState},
     execution_cache::ObjectCacheRead,
-    transaction_simulation::SimulationInputLoader,
+    transaction_simulation::{CausalSimulationView, SimulationInputLoader},
 };
 use mysten_common::{ZipDebugEqIteratorExt, izip_debug_eq};
 use std::collections::BTreeMap;
@@ -46,6 +47,26 @@ impl TransactionInputLoader {
         receiving_objects: &[ObjectRef],
         epoch_id: EpochId,
     ) -> SuiResult<(InputObjects, ReceivingObjects)> {
+        self.read_objects_for_signing_with_causal_state(
+            input_object_kinds,
+            receiving_objects,
+            epoch_id,
+            None,
+        )
+    }
+
+    /// Read signing inputs from a finalized causal view before canonical state.
+    ///
+    /// An object present in the causal view never falls through to the cache.
+    /// Falling through on a version mismatch would resurrect the stale object
+    /// version that the finalized parent already consumed.
+    pub(crate) fn read_objects_for_signing_with_causal_state(
+        &self,
+        input_object_kinds: &[InputObjectKind],
+        receiving_objects: &[ObjectRef],
+        epoch_id: EpochId,
+        causal_state: Option<&CausalState>,
+    ) -> SuiResult<(InputObjects, ReceivingObjects)> {
         // Length of input_object_kinds have been checked via validity_check() for ProgrammableTransaction.
         let mut input_results = vec![None; input_object_kinds.len()];
         let mut object_refs = Vec::with_capacity(input_object_kinds.len());
@@ -55,6 +76,19 @@ impl TransactionInputLoader {
             match kind {
                 // Packages are loaded one at a time via the cache
                 InputObjectKind::MovePackage(id) => {
+                    if let Some(object) = causal_state.and_then(|state| state.object(id)) {
+                        let CausalObject::Live(object) = object else {
+                            return Err(SuiError::from(kind.object_not_found_error()));
+                        };
+                        if !object.is_package() {
+                            return Err(SuiError::from(kind.object_not_found_error()));
+                        }
+                        input_results[i] = Some(ObjectReadResult {
+                            input_object_kind: *kind,
+                            object: ObjectReadResultKind::Object(object.clone()),
+                        });
+                        continue;
+                    }
                     let Some(package) = self.cache.get_package_object(id)?.map(|o| o.into()) else {
                         return Err(SuiError::from(kind.object_not_found_error()));
                     };
@@ -65,6 +99,20 @@ impl TransactionInputLoader {
                 }
                 InputObjectKind::SharedMoveObject { .. } => {
                     let input_full_id = kind.full_object_id();
+
+                    if let Some(object) =
+                        causal_state.and_then(|state| state.object(&kind.object_id()))
+                    {
+                        let CausalObject::Live(object) = object else {
+                            return Err(SuiError::from(kind.object_not_found_error()));
+                        };
+                        if object.full_id() != input_full_id {
+                            return Err(SuiError::from(kind.object_not_found_error()));
+                        }
+                        input_results[i] =
+                            Some(ObjectReadResult::new(*kind, object.clone().into()));
+                        continue;
+                    }
 
                     // Load the most current version from the cache.
                     match self.cache.get_object(&kind.object_id()) {
@@ -95,6 +143,17 @@ impl TransactionInputLoader {
                     }
                 }
                 InputObjectKind::ImmOrOwnedMoveObject(objref) => {
+                    if let Some(object) = causal_state.and_then(|state| state.object(&objref.0)) {
+                        let CausalObject::Live(object) = object else {
+                            return Err(SuiError::from(kind.object_not_found_error()));
+                        };
+                        if object.compute_object_reference() != *objref {
+                            return Err(SuiError::from(kind.object_not_found_error()));
+                        }
+                        input_results[i] =
+                            Some(ObjectReadResult::new(*kind, object.clone().into()));
+                        continue;
+                    }
                     object_refs.push(*objref);
                     fetch_indices.push(i);
                 }
@@ -105,7 +164,7 @@ impl TransactionInputLoader {
             .cache
             .multi_get_objects_with_more_accurate_error_return(&object_refs)?;
         assert_eq!(objects.len(), object_refs.len());
-        for (index, object) in fetch_indices.into_iter().zip_debug_eq(objects.into_iter()) {
+        for (index, object) in fetch_indices.into_iter().zip_debug_eq(objects) {
             input_results[index] = Some(ObjectReadResult {
                 input_object_kind: input_object_kinds[index],
                 object: ObjectReadResultKind::Object(object),
@@ -113,7 +172,7 @@ impl TransactionInputLoader {
         }
 
         let receiving_results =
-            self.read_receiving_objects_for_signing(receiving_objects, epoch_id)?;
+            self.read_receiving_objects_for_signing(receiving_objects, epoch_id, causal_state)?;
 
         Ok((
             input_results
@@ -267,8 +326,14 @@ impl SimulationInputLoader for TransactionInputLoader {
         input_object_kinds: &[InputObjectKind],
         receiving_object_refs: &[ObjectRef],
         epoch_id: EpochId,
+        causal_view: Option<&CausalSimulationView<'_>>,
     ) -> SuiResult<(InputObjects, ReceivingObjects)> {
-        self.read_objects_for_signing(None, input_object_kinds, receiving_object_refs, epoch_id)
+        self.read_objects_for_signing_with_causal_state(
+            input_object_kinds,
+            receiving_object_refs,
+            epoch_id,
+            causal_view.map(CausalSimulationView::state),
+        )
     }
 }
 
@@ -278,11 +343,49 @@ impl TransactionInputLoader {
         &self,
         receiving_objects: &[ObjectRef],
         epoch_id: EpochId,
+        causal_state: Option<&CausalState>,
     ) -> SuiResult<ReceivingObjects> {
         let mut receiving_results = Vec::with_capacity(receiving_objects.len());
         for objref in receiving_objects {
             // Note: the digest is checked later in check_transaction_input
             let (object_id, version, _) = objref;
+
+            if let Some(state) = causal_state {
+                if let Some(object) = state.object(object_id) {
+                    tracing::debug!(
+                        causal_parent = %state.transaction(),
+                        %object_id,
+                        %version,
+                        retained_objects = state.object_count(),
+                        "Loading receiving object from causal state"
+                    );
+                    match object {
+                        CausalObject::Live(object)
+                            if object.compute_object_reference() == *objref =>
+                        {
+                            receiving_results.push(ReceivingObjectReadResult::new(
+                                *objref,
+                                object.clone().into(),
+                            ));
+                        }
+                        CausalObject::Live(_) | CausalObject::Removed(_) => {
+                            receiving_results.push(ReceivingObjectReadResult::new(
+                                *objref,
+                                ReceivingObjectReadResultKind::PreviouslyReceivedObject,
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
+                tracing::debug!(
+                    causal_parent = %state.transaction(),
+                    %object_id,
+                    %version,
+                    retained_objects = state.object_count(),
+                    "Causal state does not contain receiving object"
+                );
+            }
 
             // TODO: Add support for receiving consensus objects. For now this assumes fastpath.
             if self.cache.have_received_object_at_version(

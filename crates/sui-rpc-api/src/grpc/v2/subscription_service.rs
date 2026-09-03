@@ -21,7 +21,8 @@
 //! end: when the subscription actor drops a subscriber (lag or backpressure),
 //! the stream simply closes and the client reconnects, backfilling via List.
 
-use std::time::Instant;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use mysten_common::ZipDebugEqIteratorExt;
 use sui_inverted_index::BitmapQuery;
@@ -61,6 +62,43 @@ use crate::read_mask_defaults;
 use crate::subscription::SubscriptionKind;
 use crate::subscription::SubscriptionSpec;
 use crate::subscription::SubscriptionUpdate;
+
+const CAUSAL_STREAM_HEADER: &str = "x-sui-causal-stream";
+const CAUSAL_STREAM_HEARTBEAT: Duration = Duration::from_secs(10);
+
+fn requests_causal_stream(metadata: &tonic::metadata::MetadataMap) -> Result<bool, tonic::Status> {
+    match metadata.get(CAUSAL_STREAM_HEADER) {
+        None => Ok(false),
+        Some(value) if value == "true" => Ok(true),
+        Some(_) => Err(tonic::Status::invalid_argument(
+            "invalid causal stream metadata",
+        )),
+    }
+}
+
+fn validate_causal_stream_request(
+    request: &SubscribeTransactionsRequest,
+) -> Result<(), tonic::Status> {
+    if request.filter.is_some() {
+        return Err(tonic::Status::invalid_argument(
+            "causal finality streams do not support transaction filters",
+        ));
+    }
+    let Some(mask) = request.read_mask.as_ref() else {
+        return Err(tonic::Status::invalid_argument(
+            "causal finality streams require an explicit read mask",
+        ));
+    };
+    for path in &mask.paths {
+        let root = path.split('.').next().unwrap_or_default();
+        if !matches!(root, "digest" | "effects" | "events" | "objects") {
+            return Err(tonic::Status::invalid_argument(format!(
+                "causal finality stream cannot provide '{path}'"
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[tonic::async_trait]
 impl SubscriptionService for RpcService {
@@ -113,11 +151,74 @@ impl SubscriptionService for RpcService {
         &self,
         request: tonic::Request<SubscribeTransactionsRequest>,
     ) -> Result<tonic::Response<BoxStream<SubscribeTransactionsResponse>>, tonic::Status> {
+        let causal_stream = requests_causal_stream(request.metadata())?;
+        if causal_stream {
+            validate_causal_stream_request(request.get_ref())?;
+        }
         let request = request.into_inner();
         let read_mask = read_mask_defaults::validate_read_mask::<ExecutedTransaction>(
             request.read_mask,
             read_mask_defaults::TRANSACTION,
         )?;
+        if causal_stream {
+            let executor = self
+                .executor
+                .clone()
+                .ok_or_else(|| tonic::Status::unimplemented("no transaction executor"))?;
+            let service = self.clone();
+            let mut receiver = self.subscribe_causal_finality();
+            let response = Box::pin(async_stream::stream! {
+                let mut heartbeat = tokio::time::interval(CAUSAL_STREAM_HEARTBEAT);
+                let mut delivered = HashSet::new();
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = heartbeat.tick() => {
+                            // An empty frame distinguishes a healthy idle stream from a
+                            // transport that has stopped delivering response bodies.
+                            yield Ok(SubscribeTransactionsResponse::default());
+                        }
+                        received = receiver.recv() => {
+                            let digest = match received {
+                                Ok(digest) => digest,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    yield Err(tonic::Status::unavailable(format!(
+                                        "causal transaction stream skipped {skipped} updates"
+                                    )));
+                                    break;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            let Some(receipts) = executor.retained_causal_transactions(&digest) else {
+                                yield Err(tonic::Status::unavailable(
+                                    "causal transaction receipt is unavailable"
+                                ));
+                                break;
+                            };
+                            for receipt in receipts {
+                                let transaction = *receipt.effects.data().transaction_digest();
+                                if !delivered.insert(transaction) {
+                                    continue;
+                                }
+                                let mut response = SubscribeTransactionsResponse::default();
+                                response.transaction = Some(render_causal_transaction(
+                                    &service,
+                                    receipt,
+                                    &read_mask,
+                                ));
+                                yield Ok(response);
+                            }
+                        }
+                    }
+                }
+            });
+            let mut response = tonic::Response::new(response as BoxStream<_>);
+            response.metadata_mut().insert(
+                CAUSAL_STREAM_HEADER,
+                tonic::metadata::MetadataValue::from_static("true"),
+            );
+            return Ok(response);
+        }
         let query = compile_transaction_filter(self, request.filter.as_ref())?;
         let (mut receiver, stream_metrics) = register(
             self,
@@ -328,6 +429,53 @@ impl SubscriptionService for RpcService {
     }
 }
 
+/// Render one retained causal receipt without claiming checkpoint inclusion.
+fn render_causal_transaction(
+    service: &RpcService,
+    receipt: sui_types::transaction_driver_types::ExecuteTransactionResponseV3,
+    read_mask: &FieldMaskTree,
+) -> ExecutedTransaction {
+    let effects = receipt.effects.data();
+    let mut objects = sui_types::full_checkpoint_content::ObjectSet::default();
+    for object in receipt.output_objects.into_iter().flatten() {
+        objects.insert(object);
+    }
+
+    let events = read_mask
+        .subtree(ExecutedTransaction::EVENTS_FIELD)
+        .and_then(|mask| {
+            receipt
+                .events
+                .map(|events| service.render_events_to_proto(&events, &mask, &objects))
+        });
+    let rendered_effects = read_mask
+        .subtree(ExecutedTransaction::EFFECTS_FIELD)
+        .map(|mask| service.render_effects_to_proto(effects, &[], &objects, &mask));
+
+    let mut transaction = ExecutedTransaction::default();
+    transaction.digest = read_mask
+        .contains(ExecutedTransaction::DIGEST_FIELD)
+        .then(|| effects.transaction_digest().to_string());
+    transaction.effects = rendered_effects;
+    transaction.events = events;
+    transaction.objects = read_mask
+        .subtree(
+            ExecutedTransaction::path_builder()
+                .objects()
+                .objects()
+                .finish(),
+        )
+        .map(|mask| {
+            ProtoObjectSet::default().with_objects(
+                objects
+                    .iter()
+                    .map(|object| service.render_object_to_proto(object, &mask, &objects))
+                    .collect(),
+            )
+        });
+    transaction
+}
+
 /// Render a full `Checkpoint` message from live executed-checkpoint data,
 /// including the `transactions.balance_changes` special case that
 /// `merge_from` cannot fill (it needs the checkpoint's `ObjectSet`).
@@ -480,6 +628,60 @@ mod tests {
     use sui_types::test_checkpoint_data_builder::TestCheckpointBuilder;
 
     use super::*;
+
+    #[test]
+    fn causal_stream_metadata_is_explicit_and_strict() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        assert!(!requests_causal_stream(&metadata).unwrap());
+
+        metadata.insert(
+            CAUSAL_STREAM_HEADER,
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        assert!(requests_causal_stream(&metadata).unwrap());
+
+        metadata.insert(
+            CAUSAL_STREAM_HEADER,
+            tonic::metadata::MetadataValue::from_static("false"),
+        );
+        assert_eq!(
+            requests_causal_stream(&metadata).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn causal_stream_accepts_only_receipt_fields() {
+        let mut request = SubscribeTransactionsRequest::default();
+        assert_eq!(
+            validate_causal_stream_request(&request).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        request.read_mask = Some(prost_types::FieldMask {
+            paths: vec![
+                "digest".to_owned(),
+                "effects.bcs".to_owned(),
+                "events.events".to_owned(),
+                "objects.objects.contents".to_owned(),
+            ],
+        });
+        validate_causal_stream_request(&request).unwrap();
+
+        request.read_mask.as_mut().unwrap().paths = vec!["checkpoint".to_owned()];
+        assert_eq!(
+            validate_causal_stream_request(&request).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        request.read_mask.as_mut().unwrap().paths = vec!["digest".to_owned()];
+        request.filter = Some(TransactionFilter::default());
+        assert_eq!(
+            validate_causal_stream_request(&request).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
     #[test]
     fn initial_watermark_tick_covers_checkpoint_before_entry() {
         let options = QueryOptions::subscription();

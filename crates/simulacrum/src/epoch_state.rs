@@ -10,7 +10,7 @@ use sui_config::{
 };
 use sui_core::{
     accumulators::funds_read::AccountFundsRead,
-    transaction_simulation::{SimulationInputLoader, simulate_transaction},
+    transaction_simulation::{CausalSimulationView, SimulationInputLoader, simulate_transaction},
 };
 use sui_execution::Executor;
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
@@ -236,6 +236,7 @@ impl EpochState {
             verifier_signing_config,
             &self.bytecode_verifier_metrics,
             &self.execution_metrics,
+            None,
         )
     }
 }
@@ -287,6 +288,7 @@ impl<S: SimulatorStore> SimulationInputLoader for SimulatorInputLoader<'_, S> {
         input_object_kinds: &[InputObjectKind],
         receiving_object_refs: &[ObjectRef],
         _epoch_id: EpochId,
+        _causal_view: Option<&CausalSimulationView<'_>>,
     ) -> SuiResult<(InputObjects, ReceivingObjects)> {
         self.0.read_objects_for_synchronous_execution(
             transaction_digest,

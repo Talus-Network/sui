@@ -25,6 +25,8 @@ use sui_rpc::proto::sui::rpc::v2::ListTransactionsResponse;
 use sui_rpc::proto::sui::rpc::v2::ledger_service_server::LedgerService;
 use tonic::codegen::BoxStream;
 
+use super::checkpoint_wait;
+
 mod bitmap_scan;
 mod chunked_scan;
 mod event_scan;
@@ -51,9 +53,12 @@ impl LedgerService for RpcService {
         &self,
         _request: tonic::Request<GetServiceInfoRequest>,
     ) -> Result<tonic::Response<GetServiceInfoResponse>, tonic::Status> {
-        get_service_info::get_service_info(self)
-            .map(tonic::Response::new)
-            .map_err(Into::into)
+        let info = get_service_info::get_service_info(self).map_err(tonic::Status::from)?;
+        let mut response = tonic::Response::new(info);
+        if self.supports_checkpoint_wait() {
+            checkpoint_wait::mark_supported(&mut response);
+        }
+        Ok(response)
     }
 
     async fn get_object(

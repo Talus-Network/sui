@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+mod checkpoint_wait;
 pub mod ledger_service;
 pub use ledger_service::protocol_config_to_proto;
 mod move_package_service;
