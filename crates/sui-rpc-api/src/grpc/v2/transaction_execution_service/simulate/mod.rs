@@ -20,6 +20,7 @@ use sui_rpc::proto::sui::rpc::v2::SimulateTransactionRequest;
 use sui_rpc::proto::sui::rpc::v2::SimulateTransactionResponse;
 use sui_rpc::proto::sui::rpc::v2::Transaction;
 use sui_types::balance_change::derive_balance_changes_2;
+use sui_types::base_types::TransactionDigest;
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::error::SuiError;
 use sui_types::error::SuiErrorKind;
@@ -43,6 +44,7 @@ const GAS_COIN_SIZE_BYTES: u64 = 40;
 pub fn simulate_transaction(
     service: &RpcService,
     request: SimulateTransactionRequest,
+    causal_parent: Option<TransactionDigest>,
 ) -> Result<SimulateTransactionResponse> {
     let executor = service
         .executor
@@ -106,6 +108,8 @@ pub fn simulate_transaction(
         // transaction resolution
         _ => resolve::resolve_transaction(
             service,
+            executor.as_ref(),
+            causal_parent,
             transaction_proto,
             reference_gas_price,
             &protocol_config,
@@ -136,9 +140,8 @@ pub fn simulate_transaction(
                 // protection.
                 configure_transaction_validity(service, &protocol_config, &mut gasless_tx)?;
 
-                let simulation_result = executor
-                    .simulate_transaction(gasless_tx.clone(), checks, false)
-                    .map_err(simulation_error_to_rpc_error)?;
+                let simulation_result =
+                    simulate(executor, gasless_tx.clone(), checks, false, causal_parent)?;
 
                 if !is_gasless_post_execution_failure(simulation_result.effects.status()) {
                     transaction = gasless_tx;
@@ -169,13 +172,13 @@ pub fn simulate_transaction(
                 estimation_transaction.gas_data_mut().payment = Vec::new();
                 estimation_transaction.gas_data_mut().budget = protocol_config.max_tx_gas();
 
-                let simulation_result = executor
-                    .simulate_transaction(
-                        estimation_transaction,
-                        TransactionChecks::Enabled,
-                        true, /* allow mock gas coin */
-                    )
-                    .map_err(simulation_error_to_rpc_error)?;
+                let simulation_result = simulate(
+                    executor,
+                    estimation_transaction,
+                    TransactionChecks::Enabled,
+                    true,
+                    causal_parent,
+                )?;
 
                 let estimate = estimate_gas_budget_from_gas_cost(
                     simulation_result.effects.gas_cost_summary(),
@@ -220,9 +223,13 @@ pub fn simulate_transaction(
             restrict_transaction_proposers(service, &protocol_config, &mut transaction)?;
         }
 
-        executor
-            .simulate_transaction(transaction.clone(), checks, !perform_gas_selection)
-            .map_err(simulation_error_to_rpc_error)?
+        simulate(
+            executor,
+            transaction.clone(),
+            checks,
+            !perform_gas_selection,
+            causal_parent,
+        )?
     };
 
     let SimulateTransactionResult {
@@ -327,6 +334,36 @@ pub fn simulate_transaction(
         response.suggested_gas_price = suggested_gas_price;
     }
     Ok(response)
+}
+
+fn simulate(
+    executor: &std::sync::Arc<dyn sui_types::transaction_executor::TransactionExecutor>,
+    transaction: sui_types::transaction::TransactionData,
+    checks: TransactionChecks,
+    allow_mock_gas_coin: bool,
+    causal_parent: Option<TransactionDigest>,
+) -> Result<SimulateTransactionResult> {
+    let result = match causal_parent {
+        Some(parent) => executor.simulate_transaction_with_causal_parent(
+            transaction,
+            checks,
+            allow_mock_gas_coin,
+            parent,
+        ),
+        None => executor.simulate_transaction(transaction, checks, allow_mock_gas_coin),
+    };
+    result.map_err(|error| {
+        if causal_parent.is_some()
+            && matches!(
+                error.as_inner(),
+                SuiErrorKind::UnsupportedFeatureError { .. }
+            )
+        {
+            RpcError::new(tonic::Code::FailedPrecondition, error.to_string())
+        } else {
+            simulation_error_to_rpc_error(error)
+        }
+    })
 }
 
 fn simulation_error_to_rpc_error(error: SuiError) -> RpcError {

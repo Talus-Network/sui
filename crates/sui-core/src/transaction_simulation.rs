@@ -41,11 +41,12 @@ use crate::{
         transaction_rewriting::rewrite_transaction_for_coin_reservations,
     },
     authority::{DEV_INSPECT_GAS_COIN_VALUE, pre_object_load_checks},
+    causal_state::{CausalBackingStore, CausalState},
     transaction_outputs::unchanged_loaded_runtime_objects,
 };
 
 /// Load transaction inputs for simulation without preparing them for committed execution.
-pub trait SimulationInputLoader {
+pub(crate) trait SimulationInputLoader {
     /// Load the input and receiving objects at the state used for simulation.
     fn read_objects_for_simulation(
         &self,
@@ -53,6 +54,7 @@ pub trait SimulationInputLoader {
         input_object_kinds: &[InputObjectKind],
         receiving_object_refs: &[ObjectRef],
         epoch_id: EpochId,
+        causal_state: Option<&CausalState>,
     ) -> SuiResult<(InputObjects, ReceivingObjects)>;
 }
 
@@ -77,6 +79,7 @@ pub fn simulate_transaction(
     verifier_signing_config: &VerifierSigningConfig,
     bytecode_verifier_metrics: &Arc<BytecodeVerifierMetrics>,
     execution_metrics: &Arc<ExecutionMetrics>,
+    causal_state: Option<&CausalState>,
 ) -> SuiResult<SimulateTransactionResult> {
     let dev_inspect = checks.disabled();
 
@@ -142,6 +145,28 @@ pub fn simulate_transaction(
         coin_reservation_resolver,
         account_funds_read,
     )?;
+    if let Some(state) = causal_state {
+        for (account, (requested, _, _)) in &declared_withdrawals {
+            if transaction.is_gasless_transaction() && state.has_account_update(account) {
+                return Err(SuiErrorKind::UnsupportedFeatureError {
+                    error: format!(
+                        "causal simulation cannot prove the remaining gasless balance for {account}"
+                    ),
+                }
+                .into());
+            }
+            let visible = account_funds_read.get_latest_account_amount(account);
+            let available = state.conservative_account_amount(account, visible)?;
+            if available < *requested as u128 {
+                return Err(SuiErrorKind::UnsupportedFeatureError {
+                    error: format!(
+                        "causal address balance for {account} requires checkpoint verification"
+                    ),
+                }
+                .into());
+            }
+        }
+    }
     let address_funds: BTreeSet<_> = declared_withdrawals.keys().cloned().collect();
 
     let transaction_digest = transaction.digest();
@@ -150,6 +175,7 @@ pub fn simulate_transaction(
         &input_object_kinds,
         &receiving_object_refs,
         validity_check_context.epoch,
+        causal_state,
     )?;
 
     // Add mock gas to input objects after loading (it doesn't exist in the store).
@@ -200,7 +226,13 @@ pub fn simulate_transaction(
         Some(errors) => ExecutionOrEarlyError::failed(errors, None),
     };
 
-    let tracking_store = TrackingBackingStore::new(backing_store);
+    let causal_backing_store =
+        causal_state.map(|state| CausalBackingStore::new(state, backing_store));
+    let simulation_store: &(dyn BackingStore + Send + Sync) = match &causal_backing_store {
+        Some(store) => store,
+        None => backing_store,
+    };
+    let tracking_store = TrackingBackingStore::new(simulation_store);
 
     // Clone inputs for potential retry if object funds check fails post-execution.
     let cloned_input_objects = checked_input_objects.clone();

@@ -24,6 +24,7 @@ use sui_storage::write_path_pending_tx_log::WritePathPendingTransactionLog;
 use sui_types::base_types::TransactionDigest;
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::error::{ErrorCategory, SuiError, SuiErrorKind, SuiResult};
+use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::messages_grpc::{SubmitTxRequest, TxType};
 use sui_types::sui_system_state::SuiSystemState;
 use sui_types::transaction::{Transaction, TransactionData, VerifiedTransaction};
@@ -32,7 +33,9 @@ use sui_types::transaction_driver_types::{
     ExecuteTransactionResponseV3, FinalizedEffects, IsTransactionExecutedLocally,
     TransactionSubmissionError,
 };
-use sui_types::transaction_executor::{SimulateTransactionResult, TransactionChecks};
+use sui_types::transaction_executor::{
+    CausalObjectRead, SimulateTransactionResult, TransactionChecks,
+};
 use tokio::sync::broadcast::Receiver;
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{Instrument, debug, error_span, info, instrument, warn};
@@ -40,6 +43,7 @@ use tracing::{Instrument, debug, error_span, info, instrument, warn};
 use crate::authority::AuthorityState;
 use crate::authority_aggregator::AuthorityAggregator;
 use crate::authority_client::{AuthorityAPI, NetworkAuthorityClient};
+use crate::causal_state::{CausalObject, CausalStateCache};
 use crate::transaction_driver::{OnsiteReconfigObserver, ReconfigObserver};
 use crate::transaction_driver::{
     QuorumTransactionResponse, SubmitTransactionOptions, TransactionDriver, TransactionDriverError,
@@ -156,6 +160,7 @@ where
 
         let inner = Arc::new(Inner {
             validator_state,
+            causal_states: CausalStateCache::new(),
             pending_tx_log,
             metrics,
             transaction_driver,
@@ -335,6 +340,7 @@ where
 
 struct Inner<A: Clone> {
     validator_state: Arc<AuthorityState>,
+    causal_states: CausalStateCache,
     pending_tx_log: Arc<WritePathPendingTransactionLog>,
     metrics: Arc<TransactionOrchestratorMetrics>,
     transaction_driver: Arc<TransactionDriver<A>>,
@@ -822,7 +828,7 @@ where
         tx_digest: TransactionDigest,
         tx_type: TxType,
         metrics: &TransactionOrchestratorMetrics,
-    ) -> SuiResult {
+    ) -> SuiResult<CheckpointSequenceNumber> {
         metrics.local_execution_in_flight.inc();
         let _metrics_guard =
             scopeguard::guard(metrics.local_execution_in_flight.clone(), |in_flight| {
@@ -849,7 +855,7 @@ where
             epoch_store
                 .transactions_executed_in_checkpoint_notify(vec![tx_digest])
                 .await
-                .expect("db error waiting for transaction checkpointing");
+                .expect("db error waiting for transaction checkpointing")
         })
         .instrument(error_span!(
             "transaction_orchestrator::local_execution",
@@ -865,9 +871,16 @@ where
                 metrics.local_execution_timeout.inc();
                 Err(SuiErrorKind::TimeoutError.into())
             }
-            Ok(_) => {
+            Ok(checkpoints) => {
+                let [checkpoint] = checkpoints.as_slice() else {
+                    return Err(SuiErrorKind::Unknown(format!(
+                        "checkpoint wait for {tx_digest} returned {} results",
+                        checkpoints.len()
+                    ))
+                    .into());
+                };
                 metrics.local_execution_success.inc();
-                Ok(())
+                Ok(*checkpoint)
             }
         }
     }
@@ -996,6 +1009,11 @@ pub struct TransactionOrchestratorMetrics {
     background_retry_started: IntGauge,
     background_retry_attempts: IntCounterVec,
 
+    causal_requests: IntCounterVec,
+    causal_cache_entries: IntGauge,
+    causal_cache_weight_bytes: IntGauge,
+    causal_cache_evictions: IntGauge,
+
     request_latency: HistogramVec,
     local_execution_latency: HistogramVec,
     settlement_finality_latency: HistogramVec,
@@ -1118,6 +1136,31 @@ impl TransactionOrchestratorMetrics {
                 registry,
             )
             .unwrap(),
+            causal_requests: register_int_counter_vec_with_registry!(
+                "tx_orchestrator_causal_requests",
+                "Causal execution and simulation requests grouped by route and outcome",
+                &["route", "outcome"],
+                registry,
+            )
+            .unwrap(),
+            causal_cache_entries: register_int_gauge_with_registry!(
+                "tx_orchestrator_causal_cache_entries",
+                "Finalized causal transaction deltas retained by this node",
+                registry,
+            )
+            .unwrap(),
+            causal_cache_weight_bytes: register_int_gauge_with_registry!(
+                "tx_orchestrator_causal_cache_weight_bytes",
+                "Accounted bytes retained by the finalized causal state cache",
+                registry,
+            )
+            .unwrap(),
+            causal_cache_evictions: register_int_gauge_with_registry!(
+                "tx_orchestrator_causal_cache_evictions",
+                "Finalized causal transaction deltas evicted since node start",
+                registry,
+            )
+            .unwrap(),
             request_latency: register_histogram_vec_with_registry!(
                 "tx_orchestrator_request_latency",
                 "Time spent in processing one Transaction Orchestrator request",
@@ -1164,6 +1207,136 @@ where
         self.execute_transaction_v3(request, client_addr).await
     }
 
+    async fn execute_transaction_with_causal_parent(
+        &self,
+        mut request: ExecuteTransactionRequestV3,
+        client_addr: Option<std::net::SocketAddr>,
+        causal_parent: Option<TransactionDigest>,
+    ) -> Result<ExecuteTransactionResponseV3, TransactionSubmissionError> {
+        let _parent_pin = match causal_parent {
+            Some(parent) => Some(self.inner.causal_states.pin(parent).ok_or_else(|| {
+                self.inner
+                    .metrics
+                    .causal_requests
+                    .with_label_values(&["execute", "parent_unavailable"])
+                    .inc();
+                TransactionSubmissionError::CausalViewUnavailable(format!(
+                    "causal parent {parent} is unavailable on this node"
+                ))
+            })?),
+            None => None,
+        };
+
+        request.include_input_objects = true;
+        request.include_output_objects = true;
+        let response = self.execute_transaction_v3(request, client_addr).await?;
+        let recorded = match self.inner.causal_states.record(causal_parent, &response) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                self.inner
+                    .metrics
+                    .causal_requests
+                    .with_label_values(&["execute", "invalid_receipt"])
+                    .inc();
+                return Err(TransactionSubmissionError::TransactionDriverInternalError(
+                    error,
+                ));
+            }
+        };
+        let cache = self.inner.causal_states.stats();
+        self.inner
+            .metrics
+            .causal_cache_entries
+            .set(cache.entries.min(i64::MAX as usize) as i64);
+        self.inner
+            .metrics
+            .causal_cache_weight_bytes
+            .set(cache.weight_bytes.min(i64::MAX as u64) as i64);
+        self.inner
+            .metrics
+            .causal_cache_evictions
+            .set(cache.evictions.min(i64::MAX as u64) as i64);
+        if !recorded {
+            self.inner
+                .metrics
+                .causal_requests
+                .with_label_values(&["execute", "record_rejected"])
+                .inc();
+            // Execution is already final. An internal error keeps clients from
+            // treating this as a safe rejection and submitting another digest.
+            return Err(TransactionSubmissionError::TransactionDriverInternalError(
+                SuiError::from("finalized causal state could not be retained"),
+            ));
+        }
+        self.inner
+            .metrics
+            .causal_requests
+            .with_label_values(&["execute", "recorded"])
+            .inc();
+        Ok(response)
+    }
+
+    fn supports_checkpoint_wait(&self) -> bool {
+        true
+    }
+
+    async fn wait_for_transaction_checkpoint(
+        &self,
+        transaction: TransactionDigest,
+        is_consensus_transaction: bool,
+    ) -> SuiResult<CheckpointSequenceNumber> {
+        let tx_type = if is_consensus_transaction {
+            TxType::SharedObject
+        } else {
+            TxType::SingleWriter
+        };
+        Inner::<A>::wait_for_finalized_tx_executed_locally_with_timeout(
+            &self.inner.validator_state,
+            transaction,
+            tx_type,
+            &self.inner.metrics,
+        )
+        .await
+    }
+
+    fn retained_causal_transaction(
+        &self,
+        transaction: &TransactionDigest,
+    ) -> Option<ExecuteTransactionResponseV3> {
+        self.inner
+            .causal_states
+            .get(transaction)
+            .map(|state| state.receipt())
+    }
+
+    fn read_object_at_causal_parent(
+        &self,
+        causal_parent: TransactionDigest,
+        object_id: sui_types::base_types::ObjectID,
+    ) -> Result<CausalObjectRead, SuiError> {
+        if let Some(state) = self.inner.causal_states.get(&causal_parent) {
+            self.inner
+                .metrics
+                .causal_requests
+                .with_label_values(&["resolve", "retained"])
+                .inc();
+            return Ok(match state.object(&object_id) {
+                Some(CausalObject::Live(object)) => CausalObjectRead::Live(object.clone()),
+                Some(CausalObject::Removed(_)) => CausalObjectRead::Removed,
+                None => CausalObjectRead::Unchanged,
+            });
+        }
+        self.inner
+            .metrics
+            .causal_requests
+            .with_label_values(&["resolve", "parent_unavailable"])
+            .inc();
+        Err(SuiErrorKind::UnsupportedFeatureError {
+            error: format!("causal parent {causal_parent} is unavailable on this node"),
+        }
+        .into())
+    }
+
     fn simulate_transaction(
         &self,
         transaction: TransactionData,
@@ -1173,6 +1346,40 @@ where
         self.inner
             .validator_state
             .simulate_transaction(transaction, checks, allow_mock_gas_coin)
+    }
+
+    fn simulate_transaction_with_causal_parent(
+        &self,
+        transaction: TransactionData,
+        checks: TransactionChecks,
+        allow_mock_gas_coin: bool,
+        causal_parent: TransactionDigest,
+    ) -> Result<SimulateTransactionResult, SuiError> {
+        if let Some(state) = self.inner.causal_states.get(&causal_parent) {
+            self.inner
+                .metrics
+                .causal_requests
+                .with_label_values(&["simulate", "retained"])
+                .inc();
+            return self
+                .inner
+                .validator_state
+                .simulate_transaction_with_causal_state(
+                    transaction,
+                    checks,
+                    allow_mock_gas_coin,
+                    state.as_ref(),
+                );
+        }
+        self.inner
+            .metrics
+            .causal_requests
+            .with_label_values(&["simulate", "parent_unavailable"])
+            .inc();
+        Err(SuiErrorKind::UnsupportedFeatureError {
+            error: format!("causal parent {causal_parent} is unavailable on this node"),
+        }
+        .into())
     }
 }
 

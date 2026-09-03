@@ -140,6 +140,7 @@ impl From<sui_types::transaction_driver_types::TransactionSubmissionError> for R
                 RpcError::new(Code::InvalidArgument, message)
             }
             TransactionDriverInternalError(err) => RpcError::new(Code::Internal, err.to_string()),
+            CausalViewUnavailable(reason) => RpcError::new(Code::FailedPrecondition, reason),
             ObjectsDoubleUsed { conflicting_txes } => {
                 let new_map = conflicting_txes
                     .into_iter()

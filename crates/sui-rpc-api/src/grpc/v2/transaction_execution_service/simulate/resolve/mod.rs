@@ -18,7 +18,7 @@ use sui_rpc::proto::sui::rpc::v2::Transaction;
 use sui_sdk_types::Address;
 use sui_sdk_types::Argument;
 use sui_sdk_types::Command;
-use sui_types::base_types::ObjectRef;
+use sui_types::base_types::{ObjectID, ObjectRef, TransactionDigest};
 use sui_types::coin_reservation::ParsedObjectRefWithdrawal;
 use sui_types::move_package::MovePackage;
 use sui_types::transaction::CallArg;
@@ -30,16 +30,62 @@ use sui_types::transaction::Reservation;
 use sui_types::transaction::TransactionData;
 use sui_types::transaction::WithdrawFrom;
 use sui_types::transaction::WithdrawalTypeArg;
+use sui_types::transaction_executor::{CausalObjectRead, TransactionExecutor};
 use tap::Pipe;
 
 mod literal;
 
+/// Object view shared by structured transaction resolution and simulation.
+///
+/// Objects changed by the causal chain come from the retained view. Objects
+/// untouched by that chain come from canonical storage. A retained removal
+/// never falls back to an older canonical value.
+struct ResolutionObjectView<'a> {
+    service: &'a RpcService,
+    executor: &'a dyn TransactionExecutor,
+    causal_parent: Option<TransactionDigest>,
+}
+
+impl ResolutionObjectView<'_> {
+    fn get_object(&self, object_id: Address) -> Result<sui_types::object::Object> {
+        if let Some(parent) = self.causal_parent {
+            let object_id_internal: ObjectID = object_id.into();
+            let read = self
+                .executor
+                .read_object_at_causal_parent(parent, object_id_internal)
+                .map_err(|error| {
+                    RpcError::new(tonic::Code::FailedPrecondition, error.to_string())
+                })?;
+            match read {
+                CausalObjectRead::Live(object) => return Ok(object),
+                CausalObjectRead::Removed => {
+                    return Err(ObjectNotFoundError::new(object_id).into());
+                }
+                CausalObjectRead::Unchanged => {}
+            }
+        }
+
+        self.service
+            .reader
+            .inner()
+            .get_object(&ObjectID::from(object_id))
+            .ok_or_else(|| ObjectNotFoundError::new(object_id).into())
+    }
+}
+
 pub fn resolve_transaction(
     service: &RpcService,
+    executor: &dyn TransactionExecutor,
+    causal_parent: Option<TransactionDigest>,
     unresolved_transaction: &Transaction,
     reference_gas_price: u64,
     protocol_config: &ProtocolConfig,
 ) -> Result<TransactionData> {
+    let object_view = ResolutionObjectView {
+        service,
+        executor,
+        causal_parent,
+    };
     let sender = unresolved_transaction.sender().parse().map_err(|e| {
         FieldViolation::new("transaction.sender")
             .with_description(format!("invalid sender: {e}"))
@@ -69,9 +115,9 @@ pub fn resolve_transaction(
     // per-input scan, package fetch, or normalization runs.
     enforce_ptb_structural_limits(protocol_config, &ptb.inputs, &commands)?;
 
-    let mut called_packages = called_packages(service, protocol_config, &commands)?;
+    let mut called_packages = called_packages(&object_view, protocol_config, &commands)?;
     resolve_unresolved_transaction(
-        service,
+        &object_view,
         &mut called_packages,
         reference_gas_price,
         protocol_config.max_tx_gas(),
@@ -154,8 +200,8 @@ struct NormalizedPackage {
     normalized_modules: BTreeMap<String, normalized::Module<normalized::RcIdentifier>>,
 }
 
-pub(super) fn called_packages(
-    service: &RpcService,
+fn called_packages(
+    object_view: &ResolutionObjectView<'_>,
     protocol_config: &ProtocolConfig,
     commands: &[Command],
 ) -> Result<NormalizedPackages> {
@@ -178,11 +224,8 @@ pub(super) fn called_packages(
             continue;
         }
 
-        let package = service
-            .reader
-            .inner()
-            .get_object(&(move_call.package.into()))
-            .ok_or_else(|| ObjectNotFoundError::new(move_call.package))?
+        let package = object_view
+            .get_object(move_call.package)?
             .data
             .try_as_package()
             .ok_or_else(|| {
@@ -219,7 +262,7 @@ pub(super) fn called_packages(
 }
 
 fn resolve_unresolved_transaction(
-    service: &RpcService,
+    object_view: &ResolutionObjectView<'_>,
     called_packages: &mut NormalizedPackages,
     reference_gas_price: u64,
     max_gas_budget: u64,
@@ -233,7 +276,7 @@ fn resolve_unresolved_transaction(
         let gas_coins = unresolved_gas_payment
             .objects
             .iter()
-            .map(|unresolved| resolve_gas_object_reference(service, unresolved.try_into()?))
+            .map(|unresolved| resolve_gas_object_reference(object_view, unresolved.try_into()?))
             .collect::<Result<Vec<_>>>()?;
         let payment = gas_coins.iter().map(|(r, _)| *r).collect::<Vec<_>>();
         let max_gas_budget = if payment.is_empty() {
@@ -273,7 +316,7 @@ fn resolve_unresolved_transaction(
                 .with_reason(ErrorReason::FieldInvalid)
         })?
         .unwrap_or(sui_types::transaction::TransactionExpiration::None);
-    let ptb = resolve_ptb(service, called_packages, unresolved_inputs, commands)?;
+    let ptb = resolve_ptb(object_view, called_packages, unresolved_inputs, commands)?;
     Ok(TransactionData::V1(
         sui_types::transaction::TransactionDataV1 {
             kind: sui_types::transaction::TransactionKind::ProgrammableTransaction(ptb),
@@ -294,7 +337,7 @@ fn resolve_unresolved_transaction(
 /// unresolved reference (which `ParsedObjectRefWithdrawal` does not store).
 fn try_parse_coin_reservation(
     unresolved: &UnresolvedObjectReference,
-    service: &RpcService,
+    object_view: &ResolutionObjectView<'_>,
 ) -> Option<(
     ParsedObjectRefWithdrawal,
     sui_types::base_types::SequenceNumber,
@@ -310,30 +353,26 @@ fn try_parse_coin_reservation(
     let object_id: sui_types::base_types::ObjectID = unresolved.object_id.into();
     let version = sui_types::base_types::SequenceNumber::from_u64(unresolved.version.unwrap_or(0));
     let obj_ref = (object_id, version, object_digest);
-    let parsed = ParsedObjectRefWithdrawal::parse(&obj_ref, service.chain_id)?;
+    let parsed = ParsedObjectRefWithdrawal::parse(&obj_ref, object_view.service.chain_id)?;
     Some((parsed, version))
 }
 
 fn resolve_gas_object_reference(
-    service: &RpcService,
+    object_view: &ResolutionObjectView<'_>,
     unresolved_object_reference: UnresolvedObjectReference,
 ) -> Result<(ObjectRef, u64)> {
     // Coin reservation ObjectRefs don't exist in storage; pass them through
     // as-is when the digest identifies one.
     if let Some((parsed, version)) =
-        try_parse_coin_reservation(&unresolved_object_reference, service)
+        try_parse_coin_reservation(&unresolved_object_reference, object_view)
     {
         return Ok((
-            parsed.encode(version, service.chain_id),
+            parsed.encode(version, object_view.service.chain_id),
             parsed.reservation_amount(),
         ));
     }
 
-    let object = service
-        .reader
-        .inner()
-        .get_object(&(unresolved_object_reference.object_id.into()))
-        .ok_or_else(|| ObjectNotFoundError::new(unresolved_object_reference.object_id))?;
+    let object = object_view.get_object(unresolved_object_reference.object_id)?;
 
     let Ok(gas_coin) = sui_types::gas_coin::GasCoin::try_from(&object) else {
         return Err(FieldViolation::new("payment")
@@ -347,23 +386,39 @@ fn resolve_gas_object_reference(
 }
 
 fn resolve_object_reference(
-    service: &RpcService,
+    object_view: &ResolutionObjectView<'_>,
     unresolved_object_reference: UnresolvedObjectReference,
 ) -> Result<ObjectRef> {
     // Coin reservation ObjectRefs don't exist in storage; pass them through
     // as-is when the digest identifies one.
     if let Some((parsed, version)) =
-        try_parse_coin_reservation(&unresolved_object_reference, service)
+        try_parse_coin_reservation(&unresolved_object_reference, object_view)
     {
-        return Ok(parsed.encode(version, service.chain_id));
+        return Ok(parsed.encode(version, object_view.service.chain_id));
     }
 
-    let object = service
-        .reader
-        .inner()
-        .get_object(&(unresolved_object_reference.object_id.into()))
-        .ok_or_else(|| ObjectNotFoundError::new(unresolved_object_reference.object_id))?;
+    // A complete reference is already resolved. Preserve it so object loading
+    // and validation use the same state view as simulation. Reading it here
+    // would duplicate the input checks and can observe older canonical state
+    // than the snapshot selected for simulation.
+    if let Some(object_ref) = complete_object_reference(&unresolved_object_reference) {
+        return Ok(object_ref);
+    }
+
+    let object = object_view.get_object(unresolved_object_reference.object_id)?;
     resolve_object_reference_with_object(&object, unresolved_object_reference)
+}
+
+fn complete_object_reference(
+    unresolved_object_reference: &UnresolvedObjectReference,
+) -> Option<ObjectRef> {
+    let version = unresolved_object_reference.version?;
+    let digest = unresolved_object_reference.digest?;
+    Some((
+        unresolved_object_reference.object_id.into(),
+        sui_types::base_types::SequenceNumber::from_u64(version),
+        sui_types::digests::ObjectDigest::new(*digest.inner()),
+    ))
 }
 
 // Resolve an object reference against the provided object.
@@ -423,8 +478,8 @@ fn resolve_object_reference_with_object(
     Ok((id, v, d))
 }
 
-pub(super) fn resolve_ptb(
-    service: &RpcService,
+fn resolve_ptb(
+    object_view: &ResolutionObjectView<'_>,
     called_packages: &mut NormalizedPackages,
     unresolved_inputs: &[sui_rpc::proto::sui::rpc::v2::Input],
     commands: Vec<Command>,
@@ -437,7 +492,7 @@ pub(super) fn resolve_ptb(
     let inputs = unresolved_inputs
         .iter()
         .enumerate()
-        .map(|(arg_idx, arg)| resolve_arg(service, called_packages, &arg_uses, arg, arg_idx))
+        .map(|(arg_idx, arg)| resolve_arg(object_view, called_packages, &arg_uses, arg, arg_idx))
         .collect::<Result<_>>()?;
 
     ProgrammableTransaction {
@@ -448,7 +503,7 @@ pub(super) fn resolve_ptb(
 }
 
 fn resolve_arg(
-    service: &RpcService,
+    object_view: &ResolutionObjectView<'_>,
     called_packages: &mut NormalizedPackages,
     arg_uses: &ArgUses,
     arg: &sui_rpc::proto::sui::rpc::v2::Input,
@@ -490,7 +545,7 @@ fn resolve_arg(
             funds_withdrawal: None,
             literal: None,
         } => CallArg::Object(ObjectArg::ImmOrOwnedObject(resolve_object_reference(
-            service,
+            object_view,
             UnresolvedObjectReference {
                 object_id,
                 version,
@@ -509,7 +564,7 @@ fn resolve_arg(
             funds_withdrawal: None,
             literal: None,
         } => CallArg::Object(resolve_shared_input(
-            service,
+            object_view,
             called_packages,
             arg_uses,
             arg_idx,
@@ -527,7 +582,7 @@ fn resolve_arg(
             funds_withdrawal: None,
             literal: None,
         } => CallArg::Object(ObjectArg::Receiving(resolve_object_reference(
-            service,
+            object_view,
             UnresolvedObjectReference {
                 object_id,
                 version,
@@ -546,7 +601,7 @@ fn resolve_arg(
             funds_withdrawal: None,
             literal: None,
         } => CallArg::Object(resolve_object(
-            service,
+            object_view,
             called_packages,
             arg_uses,
             arg_idx,
@@ -606,7 +661,7 @@ fn resolve_arg(
 }
 
 fn resolve_object(
-    service: &RpcService,
+    object_view: &ResolutionObjectView<'_>,
     called_packages: &NormalizedPackages,
     arg_uses: &ArgUses,
     arg_idx: usize,
@@ -622,18 +677,13 @@ fn resolve_object(
         version,
         digest,
     };
-    if let Some((parsed, ver)) = try_parse_coin_reservation(&unresolved, service) {
+    if let Some((parsed, ver)) = try_parse_coin_reservation(&unresolved, object_view) {
         return Ok(ObjectArg::ImmOrOwnedObject(
-            parsed.encode(ver, service.chain_id),
+            parsed.encode(ver, object_view.service.chain_id),
         ));
     }
 
-    let id = object_id.into();
-    let object = service
-        .reader
-        .inner()
-        .get_object(&id)
-        .ok_or_else(|| ObjectNotFoundError::new(object_id))?;
+    let object = object_view.get_object(object_id)?;
 
     match object.owner() {
         sui_types::object::Owner::Immutable => resolve_object_reference_with_object(
@@ -676,18 +726,13 @@ fn resolve_object(
 }
 
 fn resolve_shared_input(
-    service: &RpcService,
+    object_view: &ResolutionObjectView<'_>,
     called_packages: &NormalizedPackages,
     arg_uses: &ArgUses,
     arg_idx: usize,
     object_id: Address,
 ) -> Result<ObjectArg> {
-    let id = object_id.into();
-    let object = service
-        .reader
-        .inner()
-        .get_object(&id)
-        .ok_or_else(|| ObjectNotFoundError::new(object_id))?;
+    let object = object_view.get_object(object_id)?;
     resolve_shared_input_with_object(called_packages, arg_uses, arg_idx, object)
 }
 
@@ -1025,7 +1070,29 @@ impl<'a> UnresolvedInput<'a> {
 mod tests {
     use super::*;
     use sui_types::base_types::ObjectID;
+    use sui_types::digests::ObjectDigest;
     use sui_types::object::Object;
+
+    #[test]
+    fn complete_reference_is_preserved_without_state_resolution() {
+        let id = ObjectID::random();
+        let version = 42;
+        let digest = ObjectDigest::random();
+        let unresolved = UnresolvedObjectReference {
+            object_id: sui_sdk_types::Address::new(id.into_bytes()),
+            version: Some(version),
+            digest: Some(sui_sdk_types::Digest::new(digest.into_inner())),
+        };
+
+        assert_eq!(
+            complete_object_reference(&unresolved),
+            Some((
+                id,
+                sui_types::base_types::SequenceNumber::from_u64(version),
+                digest,
+            ))
+        );
+    }
 
     #[test]
     fn version_mismatch_error_includes_object_id() {

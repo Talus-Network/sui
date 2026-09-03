@@ -14,6 +14,8 @@ use tap::Pipe;
 use tonic::server::NamedService;
 use tower::Service;
 
+const CAUSAL_FINALITY_CAPACITY: usize = 4_096;
+
 pub mod client;
 mod config;
 mod error;
@@ -72,11 +74,13 @@ pub struct RpcService {
     extra_routes: axum::Router,
     extra_service_names: Vec<&'static str>,
     extra_file_descriptor_sets: Vec<&'static [u8]>,
+    causal_finality: tokio::sync::broadcast::Sender<sui_types::base_types::TransactionDigest>,
 }
 
 impl RpcService {
     pub fn new(reader: Arc<dyn RpcStateReader>) -> Self {
         let chain_id = reader.get_chain_identifier().unwrap();
+        let (causal_finality, _) = tokio::sync::broadcast::channel(CAUSAL_FINALITY_CAPACITY);
         Self {
             reader: StateReader::new(reader),
             executor: None,
@@ -90,7 +94,27 @@ impl RpcService {
             extra_routes: axum::Router::new(),
             extra_service_names: Vec::new(),
             extra_file_descriptor_sets: Vec::new(),
+            causal_finality,
         }
+    }
+
+    pub(crate) fn publish_causal_finality(
+        &self,
+        transaction: sui_types::base_types::TransactionDigest,
+    ) {
+        let _ = self.causal_finality.send(transaction);
+    }
+
+    pub(crate) fn subscribe_causal_finality(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<sui_types::base_types::TransactionDigest> {
+        self.causal_finality.subscribe()
+    }
+
+    pub(crate) fn supports_checkpoint_wait(&self) -> bool {
+        self.executor
+            .as_ref()
+            .is_some_and(|executor| executor.supports_checkpoint_wait())
     }
 
     pub fn with_server_version(&mut self, server_version: ServerVersion) -> &mut Self {

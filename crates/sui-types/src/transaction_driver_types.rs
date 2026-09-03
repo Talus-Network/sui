@@ -26,6 +26,9 @@ pub const NON_RECOVERABLE_ERROR_MSG: &str =
 pub enum TransactionSubmissionError {
     #[error("TransactionDriver internal error: {0}.")]
     TransactionDriverInternalError(SuiError),
+    /// The node cannot prove the finalized parent view requested by the client.
+    #[error("Causal view unavailable: {0}")]
+    CausalViewUnavailable(String),
     #[error("Invalid user signature: {0}.")]
     InvalidUserSignature(SuiError),
     #[error(
@@ -79,6 +82,7 @@ impl TransactionSubmissionError {
     pub fn is_retriable(&self) -> bool {
         match self {
             Self::TransactionDriverInternalError { .. } => false,
+            Self::CausalViewUnavailable { .. } => false,
             Self::InvalidUserSignature { .. } => false,
             Self::ObjectsDoubleUsed { .. } => false,
             Self::TimeoutBeforeFinality => true,

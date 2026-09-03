@@ -280,6 +280,13 @@ impl From<Error> for ErrorObjectOwned {
                             None::<()>,
                         )
                     }
+                    TransactionSubmissionError::CausalViewUnavailable(reason) => {
+                        ErrorObject::owned(
+                            TRANSACTION_EXECUTION_CLIENT_ERROR_CODE,
+                            reason,
+                            None::<()>,
+                        )
+                    }
                     TransactionSubmissionError::SystemOverload { .. }
                     | TransactionSubmissionError::SystemOverloadRetryAfter { .. } => {
                         ErrorObject::owned(TRANSIENT_ERROR_CODE, err.to_string(), None::<()>)
@@ -430,6 +437,20 @@ mod tests {
             let expected_message = expect![
                 "Transaction failed to reach finality with transient error after 10 attempts."
             ];
+            expected_message.assert_eq(error_object.message());
+        }
+
+        #[test]
+        fn test_causal_view_unavailable() {
+            let transaction_driver_error = TransactionSubmissionError::CausalViewUnavailable(
+                "the finalized parent is not retained".to_string(),
+            );
+
+            let error_object: ErrorObjectOwned =
+                Error::TransactionSubmissionError(transaction_driver_error).into();
+            let expected_code = expect!["-32002"];
+            expected_code.assert_eq(&error_object.code().to_string());
+            let expected_message = expect!["the finalized parent is not retained"];
             expected_message.assert_eq(error_object.message());
         }
 
